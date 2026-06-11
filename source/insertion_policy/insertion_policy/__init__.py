@@ -1,9 +1,4 @@
-"""
-Python module serving as a project/extension template.
-"""
+"""insertion_policy — residual RL insertion-policy Isaac Lab extension."""
 
 # Register Gym environments.
 from .tasks import *
-
-# Register UI extensions.
-from .ui_extension_example import *

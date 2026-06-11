@@ -7,12 +7,12 @@ version = "0.1.0"
 category = "isaaclab"
 readme  = "README.md"
 
-title = "Extension Template"
-author = "Isaac Lab Project Developers"
-maintainer = "Isaac Lab Project Developers"
-description="Extension Template for Isaac Lab"
-repository = "https://github.com/isaac-sim/IsaacLabExtensionTemplate.git"
-keywords = ["extension", "template", "isaaclab"]
+title = "Insertion Policy"
+author = "Moreno Wälchli"
+maintainer = "Moreno Wälchli"
+description = "Residual RL last-centimeter insertion policy (KUKA iiwa), built on Isaac Lab Forge."
+repository = ""
+keywords = ["insertion", "residual-rl", "isaaclab", "forge"]
 
 [dependencies]
 "isaaclab" = {}
