@@ -4,11 +4,13 @@
 [![Isaac Lab](https://img.shields.io/badge/IsaacLab-2.3.2-silver)](https://isaac-sim.github.io/IsaacLab)
 [![Python](https://img.shields.io/badge/python-3.10-blue.svg)](https://docs.python.org/3/whatsnew/3.10.html)
 
-Master-thesis RL environment for the **last ~1 cm of a part insertion** on a **KUKA LBR iiwa**.
+Master-thesis RL environment for the **last ~1–5 cm of a part insertion** on a **KUKA LBR iiwa**.
 The policy is a **pure residual corrector**: the upstream pipeline (pose estimation → grasping →
 path planning) hands over a *pre-insert pose* and a *goal (seated) pose*, and the policy only
-corrects the accumulated upstream deviation (~3–7 mm, a few degrees). The thesis contribution is
-adding a **wrist RGB camera** for closed-loop visual feedback on top of the otherwise blind,
+corrects the accumulated upstream deviation (~3–7 mm laterally and up to **~20–25° in
+orientation**). Because the angular error is large, the policy keeps **6-DOF** corrections
+(position + orientation) — orientation is *not* dropped from the action. The thesis contribution
+is adding a **wrist RGB camera** for closed-loop visual feedback on top of the otherwise blind,
 state-based insertion policy (Fabrica).
 
 Built as an Isaac Lab extension on top of the **Forge** assembly env (Factory + force sensing +
@@ -20,8 +22,9 @@ pose-uncertainty), trained with **PPO (RL-Games)**.
 - ✅ Forge fork running: env `Isaac-Insertion-CoolingPeg-Direct-v0` (`InsertionEnv`) — socket-aware
   targeting, multi-socket reset, negative-L2 residual reward. Smoke test passes (Franka still in
   place; iiwa swap pending).
-- 🔄 Next: tune/verify reset geometry (pre-insert ~1 cm above socket), swap Franka → iiwa 7 +
-  parallel gripper, then train the state-only residual baseline.
+- 🔄 Next: tune/verify reset geometry (pre-insert up to ~5 cm above socket, up to ~20–25°
+  misalignment); move to an **orientation-aware reward** (multi-keypoint, not single-point neg-L2);
+  swap Franka → iiwa 7 + parallel gripper; then train the state-only residual baseline.
 
 ## Layout
 
