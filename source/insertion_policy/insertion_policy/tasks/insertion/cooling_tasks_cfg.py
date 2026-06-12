@@ -51,10 +51,18 @@ class CoolingInsert(FactoryTask):
     screw_shaft_length: float = 0.0175
     # Reward shaping (pure-residual: negative L2 to socket target + seat bonus).
     success_bonus: float = 1.0
+    success_orientation_threshold: float = 0.1745  # rad, about 10deg shaft-axis error
 
-    # Robot start, relative to the fixed-asset tip (socket opening).  # TODO-tune for the screw/socket
-    hand_init_pos: list = [0.0, 0.0, 0.020]
-    hand_init_pos_noise: list = [0.02, 0.02, 0.01]
+    # Angular pre-insert error injected at reset: the grasped screw is tilted about its shaft tip
+    # (tip stays over the socket mouth) by a uniform angle in [0, this], matching the ~20-25 deg
+    # upstream orientation uncertainty. 0.0 disables it (recovers the vertical-only reset).
+    pre_insert_tilt_max_deg: float = 25.0
+
+    # Robot start, relative to the fixed-asset tip (socket opening). The screw shaft tip sits
+    # roughly 30mm below the fingertip in the current Franka grasp, so this gives about 1-5cm of
+    # shaft-tip clearance above the socket opening.
+    hand_init_pos: list = [0.0, 0.0, 0.063]
+    hand_init_pos_noise: list = [0.007, 0.007, 0.020]
     hand_init_orn: list = [3.1416, 0.0, 0.0]
     hand_init_orn_noise: list = [0.0, 0.0, 0.785]
 
@@ -106,7 +114,10 @@ class CoolingInsert(FactoryTask):
 
 @configclass
 class ForgeCoolingInsert(CoolingInsert, ForgeTask):
-    contact_penalty_scale: float = 0.2
+    # Contact-force penalty in the reward: OFF by default so the pure neg-L2 residual reward is
+    # used (matches the validated learnability run). Set >0 (Forge uses 0.05-0.2) to penalize
+    # over-force for sim-to-real; re-tune against the neg-L2 magnitude when enabling.
+    contact_penalty_scale: float = 0.0
 
 
 @configclass

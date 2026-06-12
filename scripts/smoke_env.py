@@ -57,9 +57,29 @@ def main() -> None:
         emit(f"GEOM env0: screw_origin(held_pos)={[round(x,4) for x in u.held_pos[0].tolist()]}")
         emit(f"GEOM env0: fingertip={[round(x,4) for x in u.fingertip_midpoint_pos[0].tolist()]}")
         emit(f"GEOM env0: shaft_tip ABOVE socket_bottom by z = {(hb[0,2]-sb[2]).item():+.4f} m")
-        emit(f"GEOM env0: shaft_tip ABOVE socket_opening by z = {(hb[0,2]-so[2]).item():+.4f} m  (want ~+0.010 pre-insert)")
+        emit(
+            f"GEOM env0: shaft_tip ABOVE socket_opening by z = {(hb[0,2]-so[2]).item():+.4f} m  "
+            "(want +0.010..+0.050 pre-insert)"
+        )
         xy = ((hb[0,0]-sb[0])**2 + (hb[0,1]-sb[1])**2) ** 0.5
         emit(f"GEOM env0: shaft_tip<->socket xy offset = {xy.item():.4f} m")
+        if hasattr(u, "_keypoint_distances"):
+            kp_dist, tip_dist = u._keypoint_distances()
+            shaft_axis_error = torch.rad2deg(u._shaft_axis_error())
+            emit(f"GEOM env0: keypoint_mean_dist = {kp_dist[0].item():.4f} m")
+            emit(f"GEOM env0: tip_dist = {tip_dist[0].item():.4f} m")
+            emit(f"GEOM env0: shaft_axis_error = {shaft_axis_error[0].item():.2f} deg")
+            # Distribution across all envs: tilt should now span ~0..pre_insert_tilt_max_deg, while
+            # the tip stays near the socket mouth (xy offset driven by lateral noise, not the tilt).
+            xy_all = torch.linalg.vector_norm(u.fixed_pos[:, 0:2] - hb[:, 0:2], dim=1) * 1000.0
+            emit(
+                f"GEOM all-{args_cli.num_envs}-envs: shaft_axis_error deg min/mean/max = "
+                f"{shaft_axis_error.min().item():.2f}/{shaft_axis_error.mean().item():.2f}/{shaft_axis_error.max().item():.2f}"
+            )
+            emit(
+                f"GEOM all-{args_cli.num_envs}-envs: tip<->socket xy offset mm min/mean/max = "
+                f"{xy_all.min().item():.1f}/{xy_all.mean().item():.1f}/{xy_all.max().item():.1f}"
+            )
     except Exception as e:
         emit(f"GEOM diag skipped: {e}")
 
