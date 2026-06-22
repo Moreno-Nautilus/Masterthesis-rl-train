@@ -38,12 +38,22 @@ def main() -> None:
 
     emit(f"task={args_cli.task} num_envs={args_cli.num_envs}")
     env_cfg = parse_env_cfg(args_cli.task, device=args_cli.device, num_envs=args_cli.num_envs)
+    # Vision variant: dump a rendered RGB/depth frame to /tmp to sanity-check the wrist mount pose.
+    if hasattr(env_cfg, "write_image_to_file"):
+        env_cfg.write_image_to_file = True
     env = gym.make(args_cli.task, cfg=env_cfg)
     emit(f"created env OK | action_space={env.action_space} obs_space={env.observation_space}")
 
     obs, _ = env.reset()
     obs_t = obs["policy"] if isinstance(obs, dict) else obs
     emit(f"reset OK | obs['policy'] shape={tuple(obs_t.shape)}")
+    if isinstance(obs, dict) and "image" in obs:
+        img = obs["image"]
+        emit(f"reset OK | obs['image'] shape={tuple(img.shape)} dtype={img.dtype}")
+        rgb, depth = img[..., :3], img[..., 3]
+        emit(f"  rgb   min/mean/max = {rgb.min():.3f}/{rgb.mean():.3f}/{rgb.max():.3f}")
+        emit(f"  depth min/mean/max = {depth.min():.3f}/{depth.mean():.3f}/{depth.max():.3f}")
+        emit("  wrote /tmp/wrist_rgb.png and /tmp/wrist_depth.png")
 
     # --- geometry diagnostic (env 0, relative to its env origin) ---
     try:
@@ -80,8 +90,23 @@ def main() -> None:
                 f"GEOM all-{args_cli.num_envs}-envs: tip<->socket xy offset mm min/mean/max = "
                 f"{xy_all.min().item():.1f}/{xy_all.mean().item():.1f}/{xy_all.max().item():.1f}"
             )
+        # Camera-pose diagnostic: where is the wrist cam and is it aimed at the socket?
+        if getattr(u, "_tiled_camera", None) is not None:
+            fq = u.fingertip_midpoint_quat[0]
+            emit(f"CAM env0: fingertip_quat (wxyz) = {[round(x,4) for x in fq.tolist()]}")
+            cam_pos = (u._tiled_camera.data.pos_w[0] - u.scene.env_origins[0])
+            cam_qw = u._tiled_camera.data.quat_w_world[0]
+            emit(f"CAM env0: cam_pos = {[round(x,4) for x in cam_pos.tolist()]}")
+            emit(f"CAM env0: cam_quat_w_world (wxyz) = {[round(x,4) for x in cam_qw.tolist()]}")
+            # world convention forward = +X; check alignment with direction cam->socket_opening.
+            import isaacsim.core.utils.torch as tu
+            fwd = tu.quat_apply(cam_qw.unsqueeze(0), torch.tensor([[1.0, 0.0, 0.0]], device=cam_qw.device))[0]
+            to_tgt = (so - cam_pos); to_tgt = to_tgt / (to_tgt.norm() + 1e-9)
+            cos = float((fwd / (fwd.norm() + 1e-9)) @ to_tgt)
+            emit(f"CAM env0: forward(+X)={[round(x,3) for x in fwd.tolist()]} | dir->socket={[round(x,3) for x in to_tgt.tolist()]} | cos={cos:.3f} (want ~1)")
     except Exception as e:
-        emit(f"GEOM diag skipped: {e}")
+        import traceback
+        emit(f"GEOM diag skipped: {e}\n{traceback.format_exc()}")
 
     n_act = env.action_space.shape[1] if len(env.action_space.shape) > 1 else env.unwrapped.cfg.action_space
     for i in range(args_cli.steps):

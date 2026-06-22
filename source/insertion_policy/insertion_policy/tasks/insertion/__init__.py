@@ -13,3 +13,15 @@ gym.register(
         "rl_games_cfg_entry_point": "isaaclab_tasks.direct.forge.agents:rl_games_ppo_cfg.yaml",
     },
 )
+
+# Vision variant: same env class, but the cfg adds a wrist RGB-D camera and the agent uses the
+# hybrid CNN+proprio rl_games network. Run training/eval with --enable_cameras.
+gym.register(
+    id="Isaac-Insertion-CoolingPeg-Vision-Direct-v0",
+    entry_point=f"{__name__}.insertion_env:InsertionEnv",
+    disable_env_checker=True,
+    kwargs={
+        "env_cfg_entry_point": f"{__name__}.cooling_tasks_cfg:ForgeTaskCoolingInsertCameraCfg",
+        "rl_games_cfg_entry_point": f"{__name__}.agents:rl_games_camera_ppo_cfg.yaml",
+    },
+)

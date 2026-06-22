@@ -9,10 +9,11 @@ Two jobs on top of Forge:
    from ``self.fixed_pos``, they all become socket-centric automatically. Multi-socket: each env
    samples one of ``cfg_task.socket_offsets_local`` at reset.
 
-2. Pure-residual reward (per supervisor). Reward = multi-keypoint negative L2 from the screw to
-   the target seated pose, replacing Factory's centered-socket keypoint reward. The first keypoint
-   is the shaft tip and the rest run up the screw axis, so tilt is penalized even when the tip is
-   close to the socket bottom.
+2. Pure-residual reward (per supervisor). Reward = multi-keypoint squashing kernel (Factory/
+   IndustReal: dense, bounded, smooth near the goal) on the distance from the screw to the target
+   seated pose, replacing Factory's centered-socket keypoint geometry. The first keypoint is the
+   shaft tip and the rest run up the screw axis, so tilt is penalized even when the tip is close to
+   the socket bottom. A binary seat bonus is added on top.
 
 The fixed_pos socket frame is the socket BOTTOM; with CoolingBase.height = socket depth and
 base_height = 0, Factory's "tip" lands at the socket opening (entry) and the target stays at the
@@ -22,12 +23,18 @@ bottom — matching peg-insert semantics with the screw's shaft tip as the held 
 import math
 
 import carb
+import gymnasium as gym
 import torch
 
 import isaacsim.core.utils.torch as torch_utils
 
 import isaaclab.sim as sim_utils
+from isaaclab.assets import Articulation
+from isaaclab.sensors import TiledCamera
+from isaaclab.sim.spawners.from_files import GroundPlaneCfg, spawn_ground_plane
+from isaaclab.utils.assets import ISAAC_NUCLEUS_DIR
 
+from isaaclab_tasks.direct.factory import factory_utils
 from isaaclab_tasks.direct.forge.forge_env import ForgeEnv
 
 from .cooling_tasks_cfg import ForgeTaskCoolingInsertCfg
@@ -38,6 +45,18 @@ class InsertionEnv(ForgeEnv):
 
     def __init__(self, cfg: ForgeTaskCoolingInsertCfg, render_mode: str | None = None, **kwargs):
         super().__init__(cfg, render_mode, **kwargs)
+
+        # Vision variant: a wrist RGB-D camera adds an "image" observation group alongside Forge's
+        # "policy" (proprio) and "critic" (state) groups. The rl_games wrapper consumes it via
+        # obs_groups={"obs": ["policy", "image"], "states": ["critic"]} + concate_obs_groups=False.
+        self._has_camera = getattr(self.cfg, "tiled_camera", None) is not None
+        if self._has_camera:
+            h, w, c = self.cfg.image_height, self.cfg.image_width, self.cfg.image_channels
+            self.single_observation_space["image"] = gym.spaces.Box(low=0.0, high=1.0, shape=(h, w, c))
+            # Camera eye offset in the fingertip frame; the world pose (look-at) is recomputed each step.
+            self._cam_offset_pos = torch.tensor(
+                self.cfg.wrist_cam_offset_pos, device=self.device, dtype=torch.float32
+            ).repeat(self.num_envs, 1)
 
         # Socket offsets (socket BOTTOM, base-local frame); each env holds the active one.
         self._socket_table = torch.tensor(
@@ -59,6 +78,48 @@ class InsertionEnv(ForgeEnv):
         self._reward_keypoint_offsets[:, 2] = torch.linspace(
             0.0, self.cfg_task.held_asset_cfg.height, self.cfg_task.num_keypoints, device=self.device
         )
+
+    # --- scene (adds the wrist camera for the vision variant) -------------------------------
+    def _setup_scene(self):
+        """Factory's scene plus a wrist-mounted TiledCamera (vision variant only).
+
+        Mirrors ``FactoryEnv._setup_scene`` but instantiates the camera BEFORE
+        ``clone_environments`` so the per-env camera prims are created under each cloned robot.
+        When the cfg has no ``tiled_camera`` (the state-obs task), this is just Factory's setup.
+        (We override rather than call super because the camera must exist before the clone, which
+        the parent performs internally; the cooling task never uses the gear-mesh assets.)
+        """
+        spawn_ground_plane(prim_path="/World/ground", cfg=GroundPlaneCfg(), translation=(0.0, 0.0, -1.05))
+        table_cfg = sim_utils.UsdFileCfg(
+            usd_path=f"{ISAAC_NUCLEUS_DIR}/Props/Mounts/SeattleLabTable/table_instanceable.usd"
+        )
+        table_cfg.func(
+            "/World/envs/env_.*/Table", table_cfg, translation=(0.55, 0.0, 0.0), orientation=(0.70711, 0.0, 0.0, 0.70711)
+        )
+
+        self._robot = Articulation(self.cfg.robot)
+        self._fixed_asset = Articulation(self.cfg_task.fixed_asset)
+        self._held_asset = Articulation(self.cfg_task.held_asset)
+
+        self._tiled_camera = None
+        if getattr(self.cfg, "tiled_camera", None) is not None:
+            # NOTE: this Isaac Sim build's usdrt lacks the ``hierarchy`` submodule that Isaac Lab's
+            # Fabric world-pose path needs, so the cfg disables Fabric (use_fabric=False) -> the
+            # camera's xform view reads poses via the USD XformCache path instead. See cfg.__post_init__.
+            self._tiled_camera = TiledCamera(self.cfg.tiled_camera)
+
+        self.scene.clone_environments(copy_from_source=False)
+        if self.device == "cpu":
+            self.scene.filter_collisions()
+
+        self.scene.articulations["robot"] = self._robot
+        self.scene.articulations["fixed_asset"] = self._fixed_asset
+        self.scene.articulations["held_asset"] = self._held_asset
+        if self._tiled_camera is not None:
+            self.scene.sensors["tiled_camera"] = self._tiled_camera
+
+        light_cfg = sim_utils.DomeLightCfg(intensity=2000.0, color=(0.75, 0.75, 0.75))
+        light_cfg.func("/World/Light", light_cfg)
 
     # --- socket selection -------------------------------------------------------------------
     def _sample_sockets(self, env_ids):
@@ -160,6 +221,27 @@ class InsertionEnv(ForgeEnv):
         )
         self.fixed_pos = socket_pos
         self.fixed_pos_obs_frame[:] = self._socket_opening_pos()
+        self._update_camera_pose()
+
+    def _update_camera_pose(self):
+        """Drive the wrist camera each step (it is not parented to the robot).
+
+        Eye = fingertip position + a rigid offset expressed in the fingertip frame (so the camera
+        rides the gripper at an oblique side mount); it looks AT the active socket opening. Looking
+        at the socket gives a stable, occlusion-free oblique view of the shaft entering the hole --
+        the pre-insert lateral/angular error stays visible as the shaft's offset/tilt in the image.
+        Guarded so the state-obs task and the parent __init__'s early calls are unaffected.
+        """
+        if getattr(self, "_tiled_camera", None) is None:
+            return
+        # Eye: rigid position offset on the wrist (orientation comes from the look-at).
+        eye = self.fingertip_midpoint_pos + torch_utils.quat_apply(
+            self.fingertip_midpoint_quat, self._cam_offset_pos
+        )
+        target = self.fixed_pos_obs_frame  # active socket opening (entry)
+        self._tiled_camera.set_world_poses_from_view(
+            eye + self.scene.env_origins, target + self.scene.env_origins
+        )
 
     def _socket_opening_pos(self):
         """World position of the active socket opening/entry frame."""
@@ -206,7 +288,7 @@ class InsertionEnv(ForgeEnv):
         axis_cos = torch.clamp(torch.sum(held_axis * socket_axis, dim=1), -1.0, 1.0)
         return torch.acos(axis_cos)
 
-    # --- success + reward (pure residual, neg-L2) -------------------------------------------
+    # --- success + reward (pure residual, squashing kernel) ---------------------------------
     def _get_curr_successes(self, success_threshold, check_rot=False):
         held_base_pos, _ = self._held_base_pose()
         target = self.fixed_pos  # socket bottom
@@ -223,9 +305,24 @@ class InsertionEnv(ForgeEnv):
         shaft_axis_error = self._shaft_axis_error()
         curr_successes = self._get_curr_successes(self.cfg_task.success_threshold)
 
-        rew_buf = -keypoint_dist + self.cfg_task.success_bonus * curr_successes.float()
+        # Multi-scale squashing kernel 1/(exp(a*d)+b+exp(-a*d)) on the mean keypoint distance:
+        # each scale peaks (bounded) at d=0 and decays smoothly. baseline (small a) shapes the whole
+        # approach; coarse/fine (large a) sharpen the gradient near the seated pose. This replaces the
+        # unbounded neg-L2 + binary-dominated signal with the dense bounded reward Factory/IndustReal
+        # use, while keeping our orientation-aware shaft-tip->top keypoints (so tilt still costs).
+        a0, b0 = self.cfg_task.keypoint_coef_baseline
+        a1, b1 = self.cfg_task.keypoint_coef_coarse
+        a2, b2 = self.cfg_task.keypoint_coef_fine
+        kp_baseline = factory_utils.squashing_fn(keypoint_dist, a0, b0)
+        kp_coarse = factory_utils.squashing_fn(keypoint_dist, a1, b1)
+        kp_fine = factory_utils.squashing_fn(keypoint_dist, a2, b2)
+
+        rew_buf = kp_baseline + kp_coarse + kp_fine + self.cfg_task.success_bonus * curr_successes.float()
 
         log_dict = {
+            "kp_baseline": kp_baseline,
+            "kp_coarse": kp_coarse,
+            "kp_fine": kp_fine,
             "neg_keypoint_l2": -keypoint_dist,
             "neg_tip_l2": -tip_dist,
             "shaft_axis_error": shaft_axis_error,
@@ -246,3 +343,36 @@ class InsertionEnv(ForgeEnv):
         self.prev_actions = self.actions.clone()
         self._log_factory_metrics(log_dict, curr_successes)
         return rew_buf
+
+    # --- observations (adds the RGB-D image group for the vision variant) -------------------
+    def _get_observations(self):
+        obs = super()._get_observations()  # {"policy": proprio, "critic": state}
+        if getattr(self, "_has_camera", False):
+            obs["image"] = self._get_camera_image()
+        return obs
+
+    def _get_camera_image(self):
+        """Wrist RGB-D as a (num_envs, H, W, 4) tensor: normalized RGB (3) + normalized depth (1).
+
+        RGB is scaled to [0,1] and mean-subtracted per image (as in Isaac Lab's camera examples);
+        depth has inf (no-hit) zeroed and is scaled by the camera far-clip into ~[0,1]. The CNN in
+        the hybrid network consumes this directly (it permutes HWC->CHW).
+        """
+        out = self._tiled_camera.data.output
+        rgb_raw = out["rgb"][..., :3].float() / 255.0
+        rgb = rgb_raw - torch.mean(rgb_raw, dim=(1, 2), keepdim=True)
+
+        depth = out["depth"].clone()
+        depth[~torch.isfinite(depth)] = 0.0
+        far = float(self.cfg.tiled_camera.spawn.clipping_range[1])
+        depth = torch.clamp(depth, 0.0, far) / far
+        if depth.dim() == 3:
+            depth = depth.unsqueeze(-1)
+
+        if getattr(self.cfg, "write_image_to_file", False):
+            from isaaclab.sensors import save_images_to_file
+
+            save_images_to_file(rgb_raw, "/tmp/wrist_rgb.png")
+            save_images_to_file(depth, "/tmp/wrist_depth.png")
+
+        return torch.cat([rgb, depth], dim=-1)

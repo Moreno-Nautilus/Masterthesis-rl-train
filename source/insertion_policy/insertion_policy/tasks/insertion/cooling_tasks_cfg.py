@@ -7,6 +7,7 @@ TODO-tune are approximate for first bring-up and refined once the env steps clea
 
 import isaaclab.sim as sim_utils
 from isaaclab.assets import ArticulationCfg
+from isaaclab.sensors import TiledCameraCfg
 from isaaclab.utils import configclass
 
 from isaaclab_tasks.direct.factory.factory_tasks_cfg import FactoryTask
@@ -125,3 +126,52 @@ class ForgeTaskCoolingInsertCfg(ForgeEnvCfg):
     task_name = "peg_insert"  # matches task.name (Factory behavior-selector); see CoolingInsert
     task = ForgeCoolingInsert()
     episode_length_s = 10.0
+
+
+@configclass
+class ForgeTaskCoolingInsertCameraCfg(ForgeTaskCoolingInsertCfg):
+    """Vision variant: adds a wrist-mounted RGB-D camera to the validated state-obs task.
+
+    Everything geometric/reward/tilt is inherited unchanged; we only add a TiledCamera parented
+    to the Franka wrist (panda_hand) and the image-obs metadata. The state-obs task above is left
+    untouched so the validated pipeline stays available for ablations. Train with --enable_cameras.
+    """
+
+    # RGB-D render resolution (downsampled small CNN regime; D405 native is higher). 4 channels =
+    # RGB (3) + depth (1), stacked in InsertionEnv._get_camera_image.
+    image_height: int = 64
+    image_width: int = 64
+    image_channels: int = 4
+    # Stage-1 debug: dump a rendered RGB/depth frame to disk to sanity-check the mount pose.
+    write_image_to_file: bool = False
+
+    # Wrist camera. A standalone per-env prim whose world pose is driven every step to follow the
+    # fingertip (InsertionEnv._update_camera_pose), rather than parented under the articulation link
+    # -- parenting a camera under the moving robot trips Isaac's Fabric-hierarchy pose resolution.
+    # The camera rides a fixed offset from the fingertip frame, defined below.
+    tiled_camera: TiledCameraCfg = TiledCameraCfg(
+        prim_path="/World/envs/env_.*/wrist_cam",
+        offset=TiledCameraCfg.OffsetCfg(pos=(0.0, 0.0, 0.0), rot=(1.0, 0.0, 0.0, 0.0), convention="world"),
+        data_types=["rgb", "depth"],
+        spawn=sim_utils.PinholeCameraCfg(
+            # Far clip 0.3m: the insertion view is all within ~5-20cm, so this clips distant
+            # background and lets _get_camera_image's depth/far normalization use the full range.
+            focal_length=18.0, focus_distance=400.0, horizontal_aperture=20.955, clipping_range=(0.01, 0.3)
+        ),
+        width=64,
+        height=64,
+    )
+    # Camera EYE position in the fingertip-midpoint frame (orientation comes from a look-at on the
+    # active socket opening, see InsertionEnv._update_camera_pose). An oblique side mount: offset to
+    # the side and above the fingertip so the camera sees the shaft entering the socket without the
+    # screw head occluding it. Tuned in the Stage-1 render sanity check (keep the camera->socket
+    # working distance > the D405 ~7cm min depth). At nominal grasp local x->world x, local z->-world z.
+    wrist_cam_offset_pos: tuple = (-0.06, 0.0, -0.03)  # 6cm to the side, 3cm above the fingertip
+
+    def __post_init__(self):
+        # This Isaac Sim build's usdrt has no ``hierarchy`` submodule, so Isaac Lab's Fabric
+        # world-pose path (used by the camera's xform view) crashes. Disable Fabric for this task so
+        # pose reads use the USD XformCache path instead. (Only the vision task pays this cost; the
+        # state-obs task keeps Fabric.)
+        super().__post_init__() if hasattr(super(), "__post_init__") else None
+        self.sim.use_fabric = False

@@ -35,5 +35,5 @@ _repo
 _build
 .lastformat
 
-# Personal notes (kept local, not published)
+# Personal notes 
 /DECISIONS.md
