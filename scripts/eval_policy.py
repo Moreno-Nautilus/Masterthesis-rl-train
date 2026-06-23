@@ -259,6 +259,21 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
     with open(args_cli.report, "w") as f:
         f.write(text + "\n")
 
+    # Also persist a permanent copy in the checkpoint's run dir (the --report path defaults to /tmp,
+    # which is overwritten every eval and lost on reboot). Tied to the checkpoint + timestamped.
+    try:
+        from datetime import datetime as _dt
+
+        ckpt_abs = os.path.abspath(resume_path)
+        run_dir = os.path.dirname(os.path.dirname(ckpt_abs))  # .../<run>/nn/<ckpt>.pth -> .../<run>
+        stem = os.path.splitext(os.path.basename(ckpt_abs))[0]
+        perm = os.path.join(run_dir, f"eval_{stem}_{_dt.now():%Y%m%d_%H%M%S}.txt")
+        with open(perm, "w") as f:
+            f.write(text + "\n")
+        print(f"[INFO]: eval report also saved to: {perm}")
+    except Exception as exc:  # never let report-saving break an eval
+        print(f"[WARN]: could not save per-run eval report: {exc}")
+
     env.close()
 
 

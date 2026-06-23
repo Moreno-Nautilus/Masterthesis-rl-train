@@ -75,6 +75,12 @@ class CoolingInsert(FactoryTask):
     # Held asset noise in the gripper.
     held_asset_pos_noise: list = [0.003, 0.0, 0.003]
     held_asset_rot_init: float = 0.0
+    # Grasp misalignment: the screw is not perfectly aligned in the gripper. A random shaft-axis
+    # tilt in [0, this] (deg) about a random horizontal axis is baked into the grasp at reset, so the
+    # TRUE shaft pose differs from what the fingertip-based proprio obs implies. The actor cannot
+    # observe this (held pose is critic-only/privileged) -> it must be inferred from vision. Distinct
+    # from pre_insert_tilt (a known commanded arm pose); this is unknown grasp error. 0.0 disables it.
+    grasp_misalign_max_deg: float = 5.0
 
     # Reward keypoint coefficients (kept from PegInsert; revisit for head-flush success).
     keypoint_coef_baseline: list = [5, 4]
@@ -137,13 +143,18 @@ class ForgeTaskCoolingInsertCameraCfg(ForgeTaskCoolingInsertCfg):
     untouched so the validated pipeline stays available for ablations. Train with --enable_cameras.
     """
 
-    # RGB-D render resolution (downsampled small CNN regime; D405 native is higher). 4 channels =
-    # RGB (3) + depth (1), stacked in InsertionEnv._get_camera_image.
-    image_height: int = 64
-    image_width: int = 64
+    # RGB-D render resolution. 160px @ a ~6cm zoomed view => ~0.37mm/px (~2.7 px/mm), which
+    # oversamples the ~1mm alignment threshold (Nyquist: need >=2 px/mm to resolve 1mm). 4 channels =
+    # RGB (3) + depth (1), stacked in InsertionEnv._get_camera_image. Render is ~2x slower than 64px.
+    image_height: int = 160
+    image_width: int = 160
     image_channels: int = 4
     # Stage-1 debug: dump a rendered RGB/depth frame to disk to sanity-check the mount pose.
     write_image_to_file: bool = False
+    # Ablation: feed the policy a BLANK (zeroed) image instead of the rendered one. Same network +
+    # camera/render overhead, but the CNN gets no signal -> isolates whether the image CONTENT
+    # contributes (blank ~= full means the image isn't helping). Off by default.
+    blank_image: bool = False
 
     # Wrist camera. A standalone per-env prim whose world pose is driven every step to follow the
     # fingertip (InsertionEnv._update_camera_pose), rather than parented under the articulation link
@@ -154,12 +165,14 @@ class ForgeTaskCoolingInsertCameraCfg(ForgeTaskCoolingInsertCfg):
         offset=TiledCameraCfg.OffsetCfg(pos=(0.0, 0.0, 0.0), rot=(1.0, 0.0, 0.0, 0.0), convention="world"),
         data_types=["rgb", "depth"],
         spawn=sim_utils.PinholeCameraCfg(
-            # Far clip 0.3m: the insertion view is all within ~5-20cm, so this clips distant
-            # background and lets _get_camera_image's depth/far normalization use the full range.
-            focal_length=18.0, focus_distance=400.0, horizontal_aperture=20.955, clipping_range=(0.01, 0.3)
+            # focal_length=42mm zooms to a ~6cm-wide view at the ~12cm camera->socket distance
+            # (focal = distance*aperture/view_width = 120*20.955/60 ~= 42), so the socket + a
+            # tilt-swung shaft fill the frame at ~2.7 px/mm. Verify framing with a render check before
+            # the long run (working distance shifts with pose). Far clip 0.3m clips distant background.
+            focal_length=42.0, focus_distance=400.0, horizontal_aperture=20.955, clipping_range=(0.01, 0.3)
         ),
-        width=64,
-        height=64,
+        width=160,
+        height=160,
     )
     # Camera EYE position in the fingertip-midpoint frame (orientation comes from a look-at on the
     # active socket opening, see InsertionEnv._update_camera_pose). An oblique side mount: offset to
@@ -168,10 +181,20 @@ class ForgeTaskCoolingInsertCameraCfg(ForgeTaskCoolingInsertCfg):
     # working distance > the D405 ~7cm min depth). At nominal grasp local x->world x, local z->-world z.
     wrist_cam_offset_pos: tuple = (-0.06, 0.0, -0.03)  # 6cm to the side, 3cm above the fingertip
 
+    # Domain randomization (vision-specific): per-episode camera eye-position jitter (meters, stddev)
+    # modelling mount / hand-eye-calibration uncertainty for sim-to-real. 0.0 = OFF -- keep off for
+    # the first clean vision baseline (so we can tell whether vision helps), then enable for the
+    # sim-to-real / robustness runs. Dynamics DR (friction, mass, dead-zone) is already active via
+    # Forge's EventCfg; appearance DR (per-env lights / textures) needs per-env lights + GPU iteration
+    # and is deferred to the sim-to-real phase.
+    cam_pos_jitter: float = 0.0
+
     def __post_init__(self):
-        # This Isaac Sim build's usdrt has no ``hierarchy`` submodule, so Isaac Lab's Fabric
-        # world-pose path (used by the camera's xform view) crashes. Disable Fabric for this task so
-        # pose reads use the USD XformCache path instead. (Only the vision task pays this cost; the
-        # state-obs task keeps Fabric.)
+        # Keep Fabric ENABLED (GPU PhysX is stable on Fabric; disabling it caused CUDA-700 crashes /
+        # hangs in vision runs). This build's usdrt lacks the `hierarchy` submodule that Isaac Lab's
+        # Fabric world-pose path needs, but we route ONLY the camera's xform view to the USD pose path
+        # via a targeted monkeypatch in insertion_env.py (physics keeps Fabric). See that patch.
         super().__post_init__() if hasattr(super(), "__post_init__") else None
-        self.sim.use_fabric = False
+        # Render once per env step (decimation=8) instead of once per physics substep — 8x less render
+        # work; all the policy needs.
+        self.sim.render_interval = self.decimation

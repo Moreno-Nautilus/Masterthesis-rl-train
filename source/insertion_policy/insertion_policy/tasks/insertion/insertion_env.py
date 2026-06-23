@@ -39,6 +39,47 @@ from isaaclab_tasks.direct.forge.forge_env import ForgeEnv
 
 from .cooling_tasks_cfg import ForgeTaskCoolingInsertCfg
 
+# --- Fabric/usdrt workaround (keep Fabric ON for physics; route only the camera to USD poses) -----
+# This Isaac Sim build's usdrt lacks the `hierarchy` submodule, so Isaac Lab's Fabric world-pose path
+# (XformPrimView._get_world_poses_fabric -> _initialize_fabric -> usdrt.hierarchy) crashes whenever a
+# camera reads/writes its pose. Disabling Fabric globally "fixes" that but makes GPU PhysX unstable
+# (CUDA-700 crashes / hangs in vision runs). Instead we keep Fabric ENABLED (stable physics) and force
+# ONLY XformPrimView (used by cameras / xform-sensors, NOT the physics articulation views) onto the
+# USD XformCache pose path, which needs no usdrt.hierarchy. Physics is untouched.
+from isaaclab.sim.views import XformPrimView as _XformPrimView  # noqa: E402
+
+if not getattr(_XformPrimView, "_insertion_usd_pose_patch", False):
+    _orig_xpv_init = _XformPrimView.__init__
+
+    def _xpv_init_usd_poses(self, *args, **kwargs):
+        _orig_xpv_init(self, *args, **kwargs)
+        self._use_fabric = False  # USD pose path (no usdrt.hierarchy); physics keeps Fabric
+
+    _XformPrimView.__init__ = _xpv_init_usd_poses
+    _XformPrimView._insertion_usd_pose_patch = True
+
+# --- rl_games dict-obs input-normalization fix --------------------------------------------------
+# rl_games normalizes dict observations with torch.jit.script(RunningMeanStdObs(obs_shape)), but this
+# rl_games/torch version can't infer the Dict[str,Tensor] input type when scripting -> compile error
+# ("'Tensor' object has no attribute 'items'"), so normalize_input=True crashes our hybrid
+# (proprio+image) dict obs at model build. The EAGER module works fine; only the JIT compile fails.
+# We intercept torch.jit.script for that one class and return it un-scripted, so we can normalize the
+# proprio + privileged critic state (which Forge needs; force obs are large) while the image stays
+# pre-normalized in-env. Everything else still scripts normally.
+import torch as _torch  # noqa: E402
+from rl_games.algos_torch.running_mean_std import RunningMeanStdObs as _RMSObs  # noqa: E402
+
+if not getattr(_torch.jit, "_insertion_rmsobs_patch", False):
+    _orig_jit_script = _torch.jit.script
+
+    def _jit_script_skip_rmsobs(obj, *args, **kwargs):
+        if isinstance(obj, _RMSObs):
+            return obj  # eager; TorchScript can't infer the Dict input type in this rl_games version
+        return _orig_jit_script(obj, *args, **kwargs)
+
+    _torch.jit.script = _jit_script_skip_rmsobs
+    _torch.jit._insertion_rmsobs_patch = True
+
 
 class InsertionEnv(ForgeEnv):
     cfg: ForgeTaskCoolingInsertCfg
@@ -57,6 +98,8 @@ class InsertionEnv(ForgeEnv):
             self._cam_offset_pos = torch.tensor(
                 self.cfg.wrist_cam_offset_pos, device=self.device, dtype=torch.float32
             ).repeat(self.num_envs, 1)
+            # Per-episode camera extrinsics jitter (DR; resampled at reset, zero when cam_pos_jitter=0).
+            self._cam_jitter = torch.zeros((self.num_envs, 3), device=self.device, dtype=torch.float32)
 
         # Socket offsets (socket BOTTOM, base-local frame); each env holds the active one.
         self._socket_table = torch.tensor(
@@ -138,6 +181,32 @@ class InsertionEnv(ForgeEnv):
         # absent. Add it now by tilting the grasped screw about its shaft tip.
         if hasattr(self, "_socket_table"):
             self._apply_pre_insert_tilt(env_ids)
+        # Resample per-episode camera extrinsics jitter (DR; no-op when cam_pos_jitter == 0).
+        if getattr(self, "_has_camera", False) and self.cfg.cam_pos_jitter > 0.0:
+            self._cam_jitter[env_ids] = self.cfg.cam_pos_jitter * torch.randn(
+                (len(env_ids), 3), device=self.device
+            )
+
+    def get_handheld_asset_relative_pose(self):
+        """Add random rotational grasp misalignment to Factory's (identity) peg grasp.
+
+        Factory grasps the peg perfectly aligned with the fingertip frame. Real grasps are not: the
+        screw sits slightly tilted in the jaws. We bake a uniform shaft-axis tilt in
+        [0, grasp_misalign_max_deg] about a random horizontal axis of the grasp frame into the
+        relative quat, so the TRUE screw pose deviates from the fingertip-based estimate by an amount
+        the actor cannot observe (held pose is privileged/critic-only) -- it must be recovered from
+        vision. Resampled every reset. Independent of the pre-insert tilt (a known commanded pose).
+        """
+        held_asset_relative_pos, held_asset_relative_quat = super().get_handheld_asset_relative_pose()
+        max_deg = getattr(self.cfg_task, "grasp_misalign_max_deg", 0.0)
+        if max_deg > 0.0:
+            n = self.num_envs
+            mag = math.radians(max_deg) * torch.rand(n, device=self.device)
+            az = 2.0 * math.pi * torch.rand(n, device=self.device)
+            axis = torch.stack([torch.cos(az), torch.sin(az), torch.zeros_like(az)], dim=1)
+            misalign_quat = torch_utils.quat_from_angle_axis(mag, axis)
+            held_asset_relative_quat = torch_utils.quat_mul(misalign_quat, held_asset_relative_quat)
+        return held_asset_relative_pos, held_asset_relative_quat
 
     def _apply_pre_insert_tilt(self, env_ids):
         """Inject the angular pre-insert error (the upstream orientation uncertainty).
@@ -234,9 +303,9 @@ class InsertionEnv(ForgeEnv):
         """
         if getattr(self, "_tiled_camera", None) is None:
             return
-        # Eye: rigid position offset on the wrist (orientation comes from the look-at).
+        # Eye: rigid position offset on the wrist (+ per-episode DR jitter), look-at the socket.
         eye = self.fingertip_midpoint_pos + torch_utils.quat_apply(
-            self.fingertip_midpoint_quat, self._cam_offset_pos
+            self.fingertip_midpoint_quat, self._cam_offset_pos + self._cam_jitter
         )
         target = self.fixed_pos_obs_frame  # active socket opening (entry)
         self._tiled_camera.set_world_poses_from_view(
@@ -319,6 +388,16 @@ class InsertionEnv(ForgeEnv):
 
         rew_buf = kp_baseline + kp_coarse + kp_fine + self.cfg_task.success_bonus * curr_successes.float()
 
+        # Restore Forge's success-prediction term that our override otherwise drops: train action[:,6]
+        # to predict whether the insertion is currently successful. The penalty scale ramps from 0 to
+        # 1 only once a delay_until_ratio fraction of envs have succeeded (so it doesn't fight early
+        # learning), matching ForgeEnv._get_rewards. Needed before sim-to-real (the policy's done-signal).
+        policy_success_pred = (self.actions[:, 6] + 1) / 2  # [-1,1] -> [0,1]
+        success_pred_error = (curr_successes.float() - policy_success_pred).abs()
+        if curr_successes.float().mean() >= self.cfg_task.delay_until_ratio:
+            self.success_pred_scale = 1.0
+        rew_buf = rew_buf - self.success_pred_scale * success_pred_error
+
         log_dict = {
             "kp_baseline": kp_baseline,
             "kp_coarse": kp_coarse,
@@ -326,6 +405,7 @@ class InsertionEnv(ForgeEnv):
             "neg_keypoint_l2": -keypoint_dist,
             "neg_tip_l2": -tip_dist,
             "shaft_axis_error": shaft_axis_error,
+            "success_pred_error": success_pred_error,
             "success": curr_successes.float(),
         }
 
@@ -358,6 +438,11 @@ class InsertionEnv(ForgeEnv):
         depth has inf (no-hit) zeroed and is scaled by the camera far-clip into ~[0,1]. The CNN in
         the hybrid network consumes this directly (it permutes HWC->CHW).
         """
+        if getattr(self.cfg, "blank_image", False):
+            # Ablation: zeroed image (camera still renders; the policy just gets no visual signal).
+            h, w, c = self.cfg.image_height, self.cfg.image_width, self.cfg.image_channels
+            return torch.zeros((self.num_envs, h, w, c), device=self.device)
+
         out = self._tiled_camera.data.output
         rgb_raw = out["rgb"][..., :3].float() / 255.0
         rgb = rgb_raw - torch.mean(rgb_raw, dim=(1, 2), keepdim=True)

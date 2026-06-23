@@ -39,10 +39,13 @@ params:
       activation: relu
       initializer:
         name: default
+      # 4 conv layers for the 160px input: 160 ->39 ->18 ->16 ->7  => 7x7x64 = 3136 features
+      # (a 3-layer Nature CNN would leave 16x16x64=16384, bloating the first LSTM layer).
       convs:
         - { filters: 32, kernel_size: 8, strides: 4, padding: 0 }
         - { filters: 64, kernel_size: 4, strides: 2, padding: 0 }
         - { filters: 64, kernel_size: 3, strides: 1, padding: 0 }
+        - { filters: 64, kernel_size: 3, strides: 2, padding: 0 }
 
     mlp:
       units: [512, 128, 64]
@@ -72,7 +75,7 @@ params:
     multi_gpu: False
     ppo: True
     mixed_precision: True
-    normalize_input: False
+    normalize_input: True   # normalize proprio + privileged state (Forge needs it; force obs are large-magnitude). rl_games RunningMeanStdObs normalizes each dict key; the image is already pre-normalized in-env so this only re-standardizes it gently.
     normalize_value: True
     value_bootstrap: True
     num_actors: 128
@@ -109,7 +112,7 @@ params:
       lr_schedule: adaptive
       kl_threshold: 0.008
       clip_value: True
-      normalize_input: False
+      normalize_input: True   # critic sees the privileged state vector — normalize it (see policy note above)
       truncate_grads: True
 
       network:
