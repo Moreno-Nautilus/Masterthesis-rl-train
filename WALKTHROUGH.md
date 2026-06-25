@@ -4,7 +4,7 @@ _An overview for the repo: what this project is, how it's built, what we've foun
 where we stand. For install/run commands see [README.md](README.md); for the running design log see
 the (local) `DECISIONS.md`._
 
-_Last updated: 2026-06-23._
+_Last updated: 2026-06-25._
 
 ---
 
@@ -41,9 +41,13 @@ the policy cannot observe from proprioception, which is precisely what vision sh
   - `Isaac-Insertion-CoolingPeg-Vision-Direct-v0` — **state + wrist RGB-D image**.
 - **What `InsertionEnv` adds** (`source/insertion_policy/.../tasks/insertion/`):
   - **Socket-aware, multi-socket targeting** (sockets are off-center on the plate).
-  - **Realistic reset:** shaft tip 1–5 cm above the socket opening, ±7 mm lateral.
+  - **Realistic reset:** shaft tip 1–5 cm above the socket opening, **±8 mm** lateral.
   - **Pre-insert tilt injection** (up to ~25°, about the shaft tip) — the upstream orientation error.
-  - **Grasp misalignment** (≤5°, random, baked into the grasp) — unobservable by proprioception.
+  - **Grasp misalignment** (up to **10°**, baked into the grasp, about the **finger pressing axis** —
+    the only way a cylinder can tip between flat pads) — unobservable by proprioception.
+  - **Domain randomization:** camera-pose jitter (5 mm eye + 2° roll) and moderate proprio/force
+    observation noise (0.5 mm / 0.5° / larger F/T) on the actor — so the comparison is fair (real
+    proprio is noisy) and the policy survives a real feed. Appearance DR (lights/textures) is deferred.
   - **Orientation-aware reward:** a multi-keypoint **squashing kernel** (dense, bounded, smooth near
     the goal) + a binary seat bonus + FORGE's success-prediction term.
   - **Success:** centered (<2.5 mm) **and** seated (z within ~0.25× socket depth) **and** aligned
@@ -52,6 +56,12 @@ the policy cannot observe from proprioception, which is precisely what vision sh
   vector and fed through an **LSTM + MLP** policy (custom rl_games network `insertion_hybrid`). The
   critic is asymmetric (sees the privileged state). Encoder is a small end-to-end CNN — **not**
   DINOv2 (too heavy for the on-policy loop; DINOv2 stays in the offline pose pipeline).
+  - **Rigid wrist mount (sim-to-real-valid):** the camera is bolted to the gripper — a fixed pose
+    (position + pointing + roll) in the fingertip frame, never re-aimed at the true socket. Earlier it
+    used a privileged look-at that centred the socket and pinned roll to world-up; that was a transfer
+    killer and is fixed. Mounted at ~45° azimuth so the shaft's grasp tilt is visible (a side mount
+    foreshortens it; a top-down mount lets the gripper occlude the hole). Provisional until the custom
+    gripper, then re-derived.
 
 ---
 
@@ -72,6 +82,14 @@ geometry **strengthens** the vision motivation rather than being a flaw.
 ---
 
 ## 4. Results so far
+
+> **2026-06-25 (later) — the env was then hardened; the numbers below are now the *easy* baseline.**
+> After the bug fixes we made the env transfer-valid and realistic: **rigid** wrist camera (no more
+> privileged look-at), grasp misalignment raised to **10°** and corrected to tip about the finger
+> pressing axis, lateral **±8 mm**, camera-pose + proprio/force **domain randomization** on. The
+> 94.5 / 95.5 % below were measured at **5° grasp, a non-physical look-at camera, and no DR** — so they
+> are superseded *again*. The honest state-vs-vision verdict on the hardened env is **pending** (training
+> deferred, not yet launched). See `DECISIONS.md` §12.
 
 > **2026-06-25 — two sim bugs invalidated all earlier results.** A wrist-POV rollout review revealed
 > the screw was never properly gripped and the base slid on the table. After fixing both, **every
@@ -172,22 +190,25 @@ the env bugs, not fusion.
 
 ## 7. Current status & next steps
 
-**Status:** with the grasp + base bugs fixed, the corrected env is **largely solved at 5° grasp
-misalignment** — proprioception **94.5%**, vision **95.5%** (a tie). The vision pipeline (160 px RGB-D,
-CNN+LSTM, fusion FC) trains stably end-to-end. The open question is no longer "does vision work" but
-"is vision *needed*."
+**Status:** the **honest test environment is built and verified** (rigid 45° wrist cam, grasp tilt about
+the pressing axis at 10°, ±8 mm lateral, 25° pre-insert tilt, camera-pose + proprio/force DR — see
+`DECISIONS.md` §12). It supersedes the earlier setup that gave the 94.5 / 95.5 % tie (that ran at 5° with
+a non-physical look-at camera and no DR). **Training on the hardened env is deferred (not yet launched)**;
+nothing is committed. The question to answer next is the decision-relevant one: *is vision actually needed*
+once the grasp error is realistic, the camera is honest, and proprioception is noisy?
 
 **Immediate next steps (in order):**
-1. **Grasp-error comparison at the realistic 10° (and 15°):** re-run state vs vision at
-   `env.grasp_misalign_max_deg=10`. If proprioception drops while vision holds → vision is needed; if
-   both stay ~95% → the blind policy suffices. This is the decision-relevant test.
-2. **Rigid (physical) camera mount** — replace the non-physical look-at (which centres the true socket)
-   with a fixed wrist mount, for sim-to-real validity (and possibly a better signal).
-3. **Domain randomization on** (appearance + camera-pose jitter) so the CNN survives the real D405 feed.
-4. If vision proves its worth → the **ablation matrix** (state / +vision / +force / +vision+force).
+1. **Launch the batched run** (deferred pending go-ahead): `state_hardened_1` (128 envs) →
+   `vision_hardened_1` (64 envs), **1000 iterations**, fresh names so the watchdog doesn't resume the old
+   look-at checkpoints. One overnight chain.
+2. **Eval 512-ep on the hardened env** → the honest verdict. If proprioception drops while vision holds →
+   vision is genuinely needed; if both stay high → the blind policy suffices.
+3. **Branch on the verdict:** vision wins → add **appearance DR** (lights/textures) for the sim-to-real
+   push, then the ablation matrix (state / +vision / +force / +vision+force); tie/state wins → reconsider
+   whether the camera earns its keep before investing further in vision.
 
-**Then:** KUKA iiwa + custom parallel-gripper swap (once the gripper is built — the grasp offset will
-be re-tuned for it); sim-to-real transfer.
+**Then:** KUKA iiwa + custom parallel-gripper swap (once the gripper is built — the grasp offset *and* the
+camera mount azimuth will be re-derived for it); sim-to-real transfer; final Isaac Sim 4.5.0 install.
 
 ---
 

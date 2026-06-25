@@ -9,9 +9,7 @@ The policy is a **pure residual corrector**: the upstream pipeline (pose estimat
 path planning) hands over a *pre-insert pose* and a *goal (seated) pose*, and the policy only
 corrects the accumulated upstream deviation (~3–7 mm laterally and up to **~20–25° in
 orientation**). Because the angular error is large, the policy keeps **6-DOF** corrections
-(position + orientation) — orientation is *not* dropped from the action. The thesis contribution
-is adding a **wrist RGB-D camera** for closed-loop visual feedback on top of the otherwise blind,
-state-based insertion policy (Fabrica).
+(position + orientation) — orientation is *not* dropped from the action.
 
 Built as an Isaac Lab extension on top of the **Forge** assembly env (Factory + force sensing +
 pose-uncertainty), trained with **PPO (RL-Games)**.
@@ -33,10 +31,16 @@ pose-uncertainty), trained with **PPO (RL-Games)**.
   base **heavy + high-friction** (effectively glued). **Both policies then jumped from ~35% to ~95%**
   (state **94.5%**, vision **95.5%** over 512 eps) → the grasp/base bugs, not task difficulty, were
   the real bottleneck. **All earlier success numbers are superseded.**
-- 🔄 Now: at 5° grasp misalignment vision *ties* proprioception (no headroom left). Next is the
-  decision-relevant test — re-run state vs vision at **10°/15° grasp error** (the realistic range) to
-  see whether the camera is actually needed; then rigid camera mount (sim-to-real), domain
-  randomization, and the Franka → iiwa 7 + parallel-gripper swap.
+- ✅ **Hardened test env (2026-06-25):** the 94.5/95.5 tie above was at 5° grasp + a non-physical
+  look-at camera + no DR, so it's the *easy* baseline. Rebuilt the env to be transfer-valid and
+  realistic: **rigid** wrist camera bolted to the gripper (fixed pose/roll, no privileged look-at; ~45°
+  azimuth so the grasp tilt isn't foreshortened), grasp misalignment raised to **10°** and corrected to
+  tip about the **finger pressing axis**, lateral **±8 mm**, plus camera-pose + moderate proprio/force
+  **domain randomization** (a fair comparison needs noisy proprio too). See `DECISIONS.md` §12.
+- 🔄 Now: **training on the hardened env is deferred (not yet launched)**, nothing committed. Next: launch
+  `state_hardened_1` → `vision_hardened_1` (1000 it, fresh names), then 512-ep eval = the honest
+  *is-the-camera-needed* verdict. Then (if vision wins) appearance DR + sim-to-real; then the
+  Franka → iiwa 7 + parallel-gripper swap (re-tunes the grasp offset *and* the camera mount).
 
 > **Parts note:** the cooling parts are chamfer-free 3D-printed test parts (12 mm shaft into a 14 mm
 > socket, 1 mm clearance). Precise lateral alignment — not chamfer-funneling — is the binding
@@ -87,7 +91,7 @@ OMNI_KIT_ACCEPT_EULA=YES python scripts/<script>.py
 | `overnight_chain.sh`      | Runs two `auto_resume_train.sh` jobs back-to-back on one GPU (e.g. state baseline → vision), freeing the GPU between them. `setsid bash scripts/overnight_chain.sh >log 2>&1 &` |
 | `eval_policy.py`          | Load a checkpoint, run N episodes, bin success by reset tilt / lateral offset |
 | `render_wrist_rollout.py` | Render a checkpoint rollout as video — `--view wrist` (the RGB-D POV) or `--view scene` (close third-person), following one env |
-| `viz_camera.py`           | Dump the wrist-cam POV + a third-person scene shot at reset (zero-action; for camera/grasp geometry checks) |
+| `viz_camera.py`           | Dump the wrist-cam POV + third-person shot at reset (zero-action; camera/grasp geometry checks). Prints fingertip-local aim, realized grasp tilt, and the finger pressing axis. Overrides: `--cam_offset --cam_aim --focal --cam_jitter --cam_roll --grasp_deg` (compare mounts / exaggerate the tilt) |
 | `plot_training.py`        | TensorBoard events → `progress.png` (reward/success curves; CPU-only, safe during training) |
 | `list_envs.py`            | List registered Isaac Lab task IDs |
 
@@ -105,8 +109,9 @@ OMNI_KIT_ACCEPT_EULA=YES python scripts/train.py \
 # Vision policy (wrist RGB-D + CNN). NOTE: requires --enable_cameras; run at 64 envs (128 = PhysX crash).
 # For any unattended run prefer the watchdog (auto --experience + auto-resume through crashes):
 setsid bash scripts/auto_resume_train.sh my_vision_run \
-  Isaac-Insertion-CoolingPeg-Vision-Direct-v0 64 500 >my_vision_run.log 2>&1 &
-# (extra hydra overrides via EXTRA_OVERRIDES, e.g. EXTRA_OVERRIDES="env.grasp_misalign_max_deg=10")
+  Isaac-Insertion-CoolingPeg-Vision-Direct-v0 64 1000 >my_vision_run.log 2>&1 &
+# Realistic ranges (grasp 10°, ±8 mm, 25° tilt) + DR are now the cfg DEFAULTS (see DECISIONS.md §12);
+# override per-run via EXTRA_OVERRIDES, e.g. EXTRA_OVERRIDES="env.cam_pos_jitter=0.0 env.cam_rot_jitter_deg=0.0"
 
 # Evaluate (add --enable_cameras for the vision task)
 OMNI_KIT_ACCEPT_EULA=YES python scripts/eval_policy.py \
@@ -114,8 +119,9 @@ OMNI_KIT_ACCEPT_EULA=YES python scripts/eval_policy.py \
   --experience "$KIT" --checkpoint logs/rl_games/Forge/<run>/nn/Forge.pth
 ```
 
-Logs/checkpoints land in `logs/rl_games/Forge/<run>/` (`nn/Forge.pth` = best by mean reward). Runs
-plateau by ~200–300 iterations, so 500 is plenty. Eval writes a timestamped report next to the checkpoint.
+Logs/checkpoints land in `logs/rl_games/Forge/<run>/` (`nn/Forge.pth` = best by mean reward). On the
+old easy env runs plateaued by ~200–300 it; the hardened env (10° grasp + DR + obs noise) is harder, so
+use **~1000 it**. Eval writes a timestamped report next to the checkpoint.
 
 > **Vision/GPU note:** the vision task keeps PhysX on Fabric (GPU-stable) but routes only the
 > camera's pose view to the USD path, working around a missing `usdrt.hierarchy` in this Isaac Sim
@@ -130,4 +136,4 @@ pre-commit run --all-files
 
 ---
 
-_README last updated: 2026-06-22._
+_README last updated: 2026-06-25._

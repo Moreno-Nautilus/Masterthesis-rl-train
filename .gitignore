@@ -39,3 +39,6 @@ _build
 *.mp4
 *.png
 *.log
+/renders
+/logs
+/outputs

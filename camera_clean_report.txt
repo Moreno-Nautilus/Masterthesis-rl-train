@@ -1,0 +1,12 @@
+wrote /tmp/scene_view.png (third-person), /tmp/wrist_rgb.png + /tmp/wrist_depth.png (wrist POV)
+GEOM env0 (rel env origin): wrist_cam=[0.0, 0.0, 0.0]
+  fingertip=[0.591, 0.012, 0.113]  shaft_tip=[0.591, 0.012, 0.095]
+  socket_opening=[-2.407, 3.009, 0.032]
+  wrist_cam -> socket distance = 385.4 cm
+  wrist obs image shape = (16, 160, 160, 4)
+FINGERTIP-LOCAL (mean over 16 envs +/- std):
+  socket_opening_local mean=[0.0009, 0.0008, 0.0468] std=[0.0051, 0.0051, 0.0174]
+  shaft_tip_local      mean=[-0.0005, 0.0, 0.0169] std=[0.0025, 0.0, 0.0015]
+  cam_eye_local        mean=[-0.5527, -0.1129, 0.0786]
+GRASP MISALIGN realized (shaft vs gripper axis, deg): mean=4.93 std=4.24 min=0.06 max=13.53 (cfg max=10.0)
+FINGER PRESSING AXIS in fingertip frame (mean unit vec): [-0.0, -1.0, 0.0]

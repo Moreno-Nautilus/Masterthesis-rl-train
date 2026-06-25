@@ -11,7 +11,7 @@ from isaaclab.sensors import TiledCameraCfg
 from isaaclab.utils import configclass
 
 from isaaclab_tasks.direct.factory.factory_tasks_cfg import FactoryTask
-from isaaclab_tasks.direct.forge.forge_env_cfg import ForgeEnvCfg
+from isaaclab_tasks.direct.forge.forge_env_cfg import ForgeEnvCfg, ForgeObsRandCfg
 from isaaclab_tasks.direct.forge.forge_tasks_cfg import ForgeTask
 
 from .assets_cfg import CoolingBase, CoolingScrew
@@ -59,11 +59,11 @@ class CoolingInsert(FactoryTask):
     # upstream orientation uncertainty. 0.0 disables it (recovers the vertical-only reset).
     pre_insert_tilt_max_deg: float = 25.0
 
-    # Robot start, relative to the fixed-asset tip (socket opening). The screw shaft tip sits
-    # roughly 30mm below the fingertip in the current Franka grasp, so this gives about 1-5cm of
-    # shaft-tip clearance above the socket opening.
+    # Robot start, relative to the fixed-asset tip (socket opening). This is the FINGERTIP target:
+    # nominally 6.3cm above the socket, with +/-2cm z noise -> fingertip starts about 4.3-8.3cm
+    # above the opening. The screw shaft tip is lower because it hangs below the fingertip.
     hand_init_pos: list = [0.0, 0.0, 0.063]
-    hand_init_pos_noise: list = [0.007, 0.007, 0.020]
+    hand_init_pos_noise: list = [0.008, 0.008, 0.020]  # lateral +/-8mm (realistic upstream target)
     hand_init_orn: list = [3.1416, 0.0, 0.0]
     hand_init_orn_noise: list = [0.0, 0.0, 0.785]
 
@@ -80,7 +80,7 @@ class CoolingInsert(FactoryTask):
     # TRUE shaft pose differs from what the fingertip-based proprio obs implies. The actor cannot
     # observe this (held pose is critic-only/privileged) -> it must be inferred from vision. Distinct
     # from pre_insert_tilt (a known commanded arm pose); this is unknown grasp error. 0.0 disables it.
-    grasp_misalign_max_deg: float = 5.0
+    grasp_misalign_max_deg: float = 10.0  # realistic upstream grasp error (was 5.0 for the old A/B)
 
     # Reward keypoint coefficients (kept from PegInsert; revisit for head-flush success).
     keypoint_coef_baseline: list = [5, 4]
@@ -133,6 +133,26 @@ class ForgeTaskCoolingInsertCfg(ForgeEnvCfg):
     task = ForgeCoolingInsert()
     episode_length_s = 10.0
 
+    # Proprio/observation noise (actor-side only; the critic keeps the clean privileged state). Forge
+    # applies this in _compute_intermediate_values -> the policy sees noisy_fingertip_pos/quat/force.
+    # Forge's defaults are LIGHT (0.25mm / 0.1deg); bump to MODERATE so the state-vs-vision comparison
+    # is fair: real proprioception is noisy, and a clean signal would flatter the state policy on a
+    # cue it won't have on hardware. Velocity noise is free (ee_lin/ang vel are finite-differenced from
+    # the noisy fingertip pose). F/T is the genuinely noisy channel, so its noise is the largest.
+    # Shared by both tasks (the vision cfg subclasses this). Re-tune from measured hardware noise later.
+    obs_rand: ForgeObsRandCfg = ForgeObsRandCfg(
+        fingertip_pos=0.0005,    # 0.5 mm stddev (was 0.25 mm)
+        fingertip_rot_deg=0.5,   # 0.5 deg stddev (was 0.1 deg)
+        ft_force=2.0,            # larger force-sensor noise (was 1.0)
+    )
+
+    # Actor-side socket/goal observation error. Factory's inherited fixed_asset_pos noise is Gaussian
+    # (~1mm stddev by default), which makes the state policy's target estimate too clean for the
+    # upstream pose-estimation error. Use bounded per-episode uniform noise instead: x/y are lateral
+    # target error "up to 8mm"; z is smaller because the base is table-supported, but nonzero for
+    # pose-estimation/table-height/calibration error.
+    fixed_asset_pos_obs_noise_bound: list = [0.008, 0.008, 0.002]
+
 
 @configclass
 class ForgeTaskCoolingInsertCameraCfg(ForgeTaskCoolingInsertCfg):
@@ -165,33 +185,49 @@ class ForgeTaskCoolingInsertCameraCfg(ForgeTaskCoolingInsertCfg):
         offset=TiledCameraCfg.OffsetCfg(pos=(0.0, 0.0, 0.0), rot=(1.0, 0.0, 0.0, 0.0), convention="world"),
         data_types=["rgb", "depth"],
         spawn=sim_utils.PinholeCameraCfg(
-            # focal_length=42mm zooms to a ~6cm-wide view at the ~12cm camera->socket distance
-            # (focal = distance*aperture/view_width = 120*20.955/60 ~= 42), so the socket + a
-            # tilt-swung shaft fill the frame at ~2.7 px/mm. Verify framing with a render check before
-            # the long run (working distance shifts with pose). Far clip 0.3m clips distant background.
-            focal_length=42.0, focus_distance=400.0, horizontal_aperture=20.955, clipping_range=(0.01, 0.3)
+            # focal_length=28mm -> ~41deg FOV (2*atan(aperture/2/focal)). Wider than the old 42mm so
+            # BOTH the shaft tip and the socket opening fit in frame (they subtend ~17deg apart from
+            # the oblique mount) with margin for lateral/tilt/approach drift. The old narrow 42mm
+            # centred only the hole and clipped the hovering shaft -- losing the grasp-misalignment cue.
+            # ~8-9cm working distance, ~2.5 px/mm. Far clip 0.3m clips distant background. Verify framing
+            # with a render check (viz_camera) before the long run; working distance shifts with pose.
+            focal_length=28.0, focus_distance=400.0, horizontal_aperture=20.955, clipping_range=(0.01, 0.3)
         ),
         width=160,
         height=160,
     )
-    # Camera EYE position in the fingertip-midpoint frame (orientation comes from a look-at on the
-    # active socket opening, see InsertionEnv._update_camera_pose). An oblique side mount: offset to
-    # the side and above the fingertip so the camera sees the shaft entering the socket without the
-    # screw head occluding it. Tuned in the Stage-1 render sanity check (keep the camera->socket
-    # working distance > the D405 ~7cm min depth). At nominal grasp local x->world x, local z->-world z.
-    wrist_cam_offset_pos: tuple = (-0.06, 0.0, -0.03)  # 6cm to the side, 3cm above the fingertip
+    # RIGID wrist mount ("GoPro on the wrist"): the camera EYE, AIM POINT, and full ORIENTATION are
+    # fixed in the fingertip-midpoint frame, so the camera is bolted to the gripper and never re-aims
+    # (see InsertionEnv._update_camera_pose). Oblique mount at ~45deg azimuth (equal -x,-y offset) and
+    # ~37deg off vertical: the -y component looks roughly PERPENDICULAR to the grasp-tilt plane so the
+    # shaft's grasp-misalignment tilt is visible (not foreshortened), while the -x component keeps the
+    # gripper profile thin enough to avoid occluding the hole. The Franka pressing axis is fingertip
+    # +y; RE-DERIVE this azimuth for the custom gripper (viz_camera prints the pressing axis + framing).
+    # Keep the camera->socket working distance > the D405 ~7cm min depth. Verify framing with a render.
+    wrist_cam_offset_pos: tuple = (-0.041, -0.041, -0.045)  # eye: ~45deg azimuth, ~6cm out, 4.5cm back
+    # Aim point in the fingertip frame: the INSERTION REGION between the shaft tip (z_local~0.018) and
+    # the nominal socket opening (z_local~0.058, measured mean over envs via viz_camera) -- aiming at
+    # the gap keeps BOTH the shaft and the hole in frame, so the shaft's tilt/offset (the grasp-
+    # misalignment cue) is visible alongside the socket-drift (lateral) cue. The camera points here
+    # RIGIDLY (wrist-fixed); both drift off-centre under error -- the transfer-valid cues. NOT the true
+    # socket (that was the old non-physical look-at, which also clipped the shaft out the top).
+    wrist_cam_look_target_pos: tuple = (0.0, 0.0, 0.033)
 
     # Optional third-person debug camera, set only by scripts/viz_camera.py to render the scene from
     # outside (to see how the wrist cam is mounted). None in training -> zero impact.
     scene_camera: TiledCameraCfg | None = None
 
-    # Domain randomization (vision-specific): per-episode camera eye-position jitter (meters, stddev)
-    # modelling mount / hand-eye-calibration uncertainty for sim-to-real. 0.0 = OFF -- keep off for
-    # the first clean vision baseline (so we can tell whether vision helps), then enable for the
-    # sim-to-real / robustness runs. Dynamics DR (friction, mass, dead-zone) is already active via
-    # Forge's EventCfg; appearance DR (per-env lights / textures) needs per-env lights + GPU iteration
-    # and is deferred to the sim-to-real phase.
-    cam_pos_jitter: float = 0.0
+    # Domain randomization (vision-specific): per-episode camera eye-position jitter (meters, stddev),
+    # sampled at reset, modelling mount / hand-eye-calibration uncertainty for sim-to-real. Via the
+    # rigid-mount look-at toward the fixed aim point it also tilts the optical axis slightly, so it is
+    # a combined position+angle mount perturbation. ON (5mm) for the hardened realistic batch.
+    # Dynamics DR (friction, mass, dead-zone) is already active via Forge's EventCfg; appearance DR
+    # (per-env lights / textures) needs per-env lights + GPU iteration and is a later sim-to-real pass.
+    cam_pos_jitter: float = 0.005
+    # Per-episode camera ROLL jitter about the optical axis (deg, stddev), sampled at reset. Models
+    # mount/bracket roll-calibration error on top of the rigid mount. Small -- the mount is rigid, this
+    # is just realistic uncertainty (NOT the old world-up roll artifact, which has been removed).
+    cam_rot_jitter_deg: float = 2.0
 
     def __post_init__(self):
         # Keep Fabric ENABLED (GPU PhysX is stable on Fabric; disabling it caused CUDA-700 crashes /

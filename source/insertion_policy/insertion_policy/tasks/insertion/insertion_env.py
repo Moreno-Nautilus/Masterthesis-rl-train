@@ -94,12 +94,30 @@ class InsertionEnv(ForgeEnv):
         if self._has_camera:
             h, w, c = self.cfg.image_height, self.cfg.image_width, self.cfg.image_channels
             self.single_observation_space["image"] = gym.spaces.Box(low=0.0, high=1.0, shape=(h, w, c))
-            # Camera eye offset in the fingertip frame; the world pose (look-at) is recomputed each step.
+            # Rigid wrist mount: a FIXED eye offset AND a FIXED aim point, both in the fingertip frame.
             self._cam_offset_pos = torch.tensor(
                 self.cfg.wrist_cam_offset_pos, device=self.device, dtype=torch.float32
             ).repeat(self.num_envs, 1)
-            # Per-episode camera extrinsics jitter (DR; resampled at reset, zero when cam_pos_jitter=0).
+            self._cam_look_local = torch.tensor(
+                self.cfg.wrist_cam_look_target_pos, device=self.device, dtype=torch.float32
+            ).repeat(self.num_envs, 1)
+            # FIXED camera orientation in the fingertip frame -> a truly rigid mount (roll locked to the
+            # gripper, NOT world-up). Replicate Isaac's look-at basis (OpenGL: -z forward, +y up; R
+            # columns = camera x,y,z) from the fixed eye->aim direction, with a gripper-fixed "up" =
+            # fingertip -z (which maps to world-up at the nominal downward grasp, so renders stay upright
+            # while the roll now rides the gripper). The world pose each step = quat_mul(ft_quat, this).
+            from isaaclab.utils.math import quat_from_matrix
+            eye0, aim0 = self._cam_offset_pos[0], self._cam_look_local[0]
+            up0 = torch.tensor([0.0, 0.0, -1.0], device=self.device)
+            zc = -torch.nn.functional.normalize(aim0 - eye0, dim=0, eps=1e-5)
+            xc = torch.nn.functional.normalize(torch.cross(up0, zc, dim=0), dim=0, eps=1e-5)
+            yc = torch.nn.functional.normalize(torch.cross(zc, xc, dim=0), dim=0, eps=1e-5)
+            cam_R = torch.stack([xc, yc, zc], dim=1)  # columns = camera x,y,z axes (fingertip frame)
+            self._cam_offset_quat = quat_from_matrix(cam_R.unsqueeze(0)).repeat(self.num_envs, 1)
+            self._cam_roll_axis = torch.tensor([0.0, 0.0, 1.0], device=self.device).repeat(self.num_envs, 1)
+            # Per-episode camera extrinsics jitter (DR; resampled at reset; zero when the cfg knob is 0).
             self._cam_jitter = torch.zeros((self.num_envs, 3), device=self.device, dtype=torch.float32)
+            self._cam_roll_jitter = torch.zeros((self.num_envs,), device=self.device, dtype=torch.float32)
 
         # Socket offsets (socket BOTTOM, base-local frame); each env holds the active one.
         self._socket_table = torch.tensor(
@@ -184,15 +202,28 @@ class InsertionEnv(ForgeEnv):
         if hasattr(self, "_socket_table"):
             self._sample_sockets(env_ids)
         super().randomize_initial_state(env_ids)
+        # Replace Factory's inherited Gaussian fixed-asset observation noise with bounded upstream
+        # socket/goal pose error. This is actor-side only: the critic still receives clean fixed_pos.
+        # The physical reset offset is separate (cfg_task.hand_init_pos_noise).
+        obs_noise_bound = getattr(self.cfg, "fixed_asset_pos_obs_noise_bound", None)
+        if obs_noise_bound is not None:
+            bound = torch.tensor(obs_noise_bound, device=self.device, dtype=torch.float32)
+            sample = 2.0 * torch.rand((len(env_ids), 3), device=self.device) - 1.0
+            self.init_fixed_pos_obs_noise[env_ids] = sample * bound
         # Forge's reset leaves the screw vertical (yaw noise only), so the upstream angular error is
         # absent. Add it now by tilting the grasped screw about its shaft tip.
         if hasattr(self, "_socket_table"):
             self._apply_pre_insert_tilt(env_ids)
-        # Resample per-episode camera extrinsics jitter (DR; no-op when cam_pos_jitter == 0).
-        if getattr(self, "_has_camera", False) and self.cfg.cam_pos_jitter > 0.0:
-            self._cam_jitter[env_ids] = self.cfg.cam_pos_jitter * torch.randn(
-                (len(env_ids), 3), device=self.device
-            )
+        # Resample per-episode camera extrinsics jitter (camera-pose DR; no-ops when the knobs are 0).
+        if getattr(self, "_has_camera", False):
+            if self.cfg.cam_pos_jitter > 0.0:
+                self._cam_jitter[env_ids] = self.cfg.cam_pos_jitter * torch.randn(
+                    (len(env_ids), 3), device=self.device
+                )
+            if self.cfg.cam_rot_jitter_deg > 0.0:
+                self._cam_roll_jitter[env_ids] = math.radians(self.cfg.cam_rot_jitter_deg) * torch.randn(
+                    (len(env_ids),), device=self.device
+                )
 
     def get_handheld_asset_relative_pose(self):
         """Grip the screw HEAD between the fingerpads, then add the rotational grasp misalignment.
@@ -219,9 +250,17 @@ class InsertionEnv(ForgeEnv):
         max_deg = getattr(self.cfg_task, "grasp_misalign_max_deg", 0.0)
         if max_deg > 0.0:
             n = self.num_envs
-            mag = math.radians(max_deg) * torch.rand(n, device=self.device)
-            az = 2.0 * math.pi * torch.rand(n, device=self.device)
-            axis = torch.stack([torch.cos(az), torch.sin(az), torch.zeros_like(az)], dim=1)
+            # Physical grasp tilt: a cylindrical head between flat parallel pads can only tip ABOUT THE
+            # FINGER PRESSING AXIS (the pads' closing direction), flopping the shaft in the plane
+            # perpendicular to it. Tipping toward/away from a pad FACE is blocked by the flat pad. The
+            # Franka closes along the fingertip-frame Y axis (measured pressing axis ~= [0,-1,0] in the
+            # fingertip frame), so we tilt about Y by a signed angle in [-max, max]. The old code tilted
+            # about a random horizontal axis, which (a) included the blocked toward-pad direction and
+            # (b) wasted part of the rotation as harmless roll about the shaft. RE-MEASURE the pressing
+            # axis for the custom gripper (viz_camera prints it).
+            mag = math.radians(max_deg) * (2.0 * torch.rand(n, device=self.device) - 1.0)
+            axis = torch.zeros((n, 3), device=self.device)
+            axis[:, 1] = 1.0  # fingertip-frame Y = finger pressing/closing axis
             misalign_quat = torch_utils.quat_from_angle_axis(mag, axis)
             held_asset_relative_quat = torch_utils.quat_mul(misalign_quat, held_asset_relative_quat)
         return held_asset_relative_pos, held_asset_relative_quat
@@ -311,24 +350,36 @@ class InsertionEnv(ForgeEnv):
         self._update_camera_pose()
 
     def _update_camera_pose(self):
-        """Drive the wrist camera each step (it is not parented to the robot).
+        """Drive the wrist camera each step as a RIGID wrist mount (a "GoPro bolted to the wrist").
 
-        Eye = fingertip position + a rigid offset expressed in the fingertip frame (so the camera
-        rides the gripper at an oblique side mount); it looks AT the active socket opening. Looking
-        at the socket gives a stable, occlusion-free oblique view of the shaft entering the hole --
-        the pre-insert lateral/angular error stays visible as the shaft's offset/tilt in the image.
-        Guarded so the state-obs task and the parent __init__'s early calls are unaffected.
+        BOTH the eye and the aim point are fixed offsets in the fingertip frame, so the camera is
+        bolted to the gripper: it translates and rotates with the wrist and NEVER re-aims. Its world
+        pose depends only on the wrist pose -- it uses NO privileged knowledge of the true socket
+        location. (The earlier version aimed at the real socket, which kept the socket artificially
+        centered and could not transfer to hardware.) Under lateral/tilt/grasp error the wrist -- and
+        the camera with it -- move while the socket stays put in the world, so the socket appears
+        displaced/tilted in the image; that drift IS the cue the policy reads.
+
+        Orientation is a FIXED offset quaternion composed with the live gripper quaternion, so ALL
+        three rotation axes (including ROLL) ride the gripper -- unlike a look-at, which would pin the
+        roll to world-up and let the gripper spin in the image as the wrist yaws/tilts.
+
+        Camera-pose DR (both sampled at reset): _cam_jitter shifts the eye (hand-eye/mount position
+        error); _cam_roll_jitter rolls the camera a few degrees about its optical axis (mount roll-
+        calibration error). Guarded so the state-obs task and the parent __init__'s early calls are
+        unaffected.
         """
         if getattr(self, "_tiled_camera", None) is None:
             return
-        # Eye: rigid position offset on the wrist (+ per-episode DR jitter), look-at the socket.
-        eye = self.fingertip_midpoint_pos + torch_utils.quat_apply(
-            self.fingertip_midpoint_quat, self._cam_offset_pos + self._cam_jitter
-        )
-        target = self.fixed_pos_obs_frame  # active socket opening (entry)
-        self._tiled_camera.set_world_poses_from_view(
-            eye + self.scene.env_origins, target + self.scene.env_origins
-        )
+        ft_pos, ft_quat = self.fingertip_midpoint_pos, self.fingertip_midpoint_quat
+        # Eye: fixed offset in the fingertip frame (+ DR position jitter) -> rides the wrist rigidly.
+        eye = ft_pos + torch_utils.quat_apply(ft_quat, self._cam_offset_pos + self._cam_jitter)
+        # Orientation: gripper quat * fixed mount quat * (DR roll about the optical axis).
+        roll_quat = torch_utils.quat_from_angle_axis(self._cam_roll_jitter, self._cam_roll_axis)
+        cam_quat = torch_utils.quat_mul(torch_utils.quat_mul(ft_quat, self._cam_offset_quat), roll_quat)
+        # cam_quat is built in the OpenGL camera convention (-z forward, +y up; see _cam_offset_quat),
+        # so declare it -- the default "ros" would re-convert and corrupt the orientation.
+        self._tiled_camera.set_world_poses(eye + self.scene.env_origins, cam_quat, convention="opengl")
 
     def _socket_opening_pos(self):
         """World position of the active socket opening/entry frame."""
