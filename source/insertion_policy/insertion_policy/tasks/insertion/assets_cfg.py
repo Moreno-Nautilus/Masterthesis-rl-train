@@ -34,3 +34,8 @@ class CoolingBase(FixedAssetCfg):
     # Factory "tip" land at the socket opening (entry), and base_height=0 keeps target = bottom.
     height = 0.0175  # socket depth (bottom -> opening)
     base_height = 0.0
+    # Heavy + high-friction so insertion/jamming contact forces can't slide the base on the table
+    # ("glued" in practice). Kept dynamic (not kinematic) so it stays a valid articulation and is
+    # still randomized into place each reset. The screw is ~6g, so 10kg is effectively immovable.
+    mass = 10.0
+    friction = 1.0

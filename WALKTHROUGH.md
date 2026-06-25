@@ -73,48 +73,86 @@ geometry **strengthens** the vision motivation rather than being a flaw.
 
 ## 4. Results so far
 
+> **2026-06-25 — two sim bugs invalidated all earlier results.** A wrist-POV rollout review revealed
+> the screw was never properly gripped and the base slid on the table. After fixing both, **every
+> policy jumped from ~35% to ~95%.** The numbers below are the current, valid ones; the old broken-env
+> numbers (state 36.5–48%, vision 13.9–34.8%) are kept only for history at the end of this section.
+
 | Run | Obs | Training | Eval (success) |
 |---|---|---|---|
-| `squash_state_256` | state | 5000 ep (converges ~1000–1500) | **48% overall** |
-| `vision_full_1` | state + 64 px RGB-D | 1500 ep | **13.9% overall** |
-| `state_grasp_1` | state + grasp error | 800 ep | _in progress — the fair reference_ |
+| `state_fixed_1` | proprioception only | 500 ep | **94.5%** |
+| `vision_fuse_1` | proprio + **160 px** RGB-D, fused (FC→128) | 500 ep | **95.5%** |
 
-**State baseline (48%)** — clean monotonic degradation with error magnitude (e.g. 68% at 0–5° tilt →
-11% at >25°; 58% at 0–3 mm lateral → 19% at >10 mm). Note this baseline **predates grasp
-misalignment**, so it is not a fair comparator for the vision policy (see below).
+**The grasp/base bugs were the real bottleneck — not task difficulty.** Two issues, both in the
+provisional Franka setup:
+- **The screw was not actually gripped.** Factory's peg-grasp offset (`relative_z = height −
+  fingerpad_length`) assumes the part's origin is at its *base*. Our screw's origin is at the
+  head/shaft *shoulder* and it's two-diameter (20 mm head / 12 mm shaft), so the screw was placed ~one
+  shaft-length too low: the gripper closed on empty air and the screw merely *dangled* below the
+  fingers (held by friction, never re-pinned), free to wobble and slip. Fix: grip the **head** as the
+  graspable cylinder.
+- **The 50 g base slid** under the jamming forces of a chamfer-free 1 mm-clearance insertion. Fix:
+  make it **heavy (10 kg) + high-friction** — effectively glued, while still randomized into place each
+  reset (a kinematic body breaks the articulation wrapper; `fix_root_link` would kill the placement
+  randomization).
 
-**Vision (13.9%) — currently *under*performs the state baseline.** This is an honest negative result
-that we have diagnosed:
-- Reward plateaued at ~56 (the state policy reaches ~127), and success is roughly flat across error
-  bins — even an *easy* start (tip within 3 mm) only seats ~18%.
-- The network wiring is correct (audited; the CNN receives the image and trains).
-- **Most likely root cause — the image is too coarse to resolve the task.** At 64 px the camera sees
-  a ~14 cm-wide view ⇒ **~2.2 mm/pixel**, while the task needs ~1 mm precision ⇒ sub-pixel ⇒ the CNN
-  *cannot see* the alignment error. So the policy falls back to proprioception, which — with the new
-  unobservable grasp error — is *harder* than the original state task. Hence ~14%.
+With a screw that's actually held and a base that doesn't move, the insertion task is **highly
+solvable**: the proprioception-only policy reaches **94.5%**, robust across the whole tilt/lateral range
+(≈94% even at 15–25° tilt and 7–10 mm lateral), dropping only at the extremes.
 
-**Fix applied, test queued:** camera bumped to **160 px at a ~6 cm zoomed view ⇒ ~0.37 mm/pixel
-(~2.7 px/mm)**, comfortably oversampling the 1 mm threshold (Nyquist). The next experiment is the
-**160 px vision run vs. a blank-image control** (identical network, zeroed image) to prove whether a
-*resolvable* image beats proprioception.
+**Vision ties proprioception — it does not beat it.** `vision_fuse_1` = **95.5%** vs **94.5%** is a tie
+within noise (binomial SE ≈ ±1 % over 512 episodes, single seed each). The fusion FC (project the 3136
+CNN features → 128 before concatenating with the 24 proprio dims) works as intended, but **at the
+current 5° grasp misalignment there's simply no headroom left for vision to add** — proprioception with
+a firm grasp already absorbs a 5° in-jaw tilt. The unobservable error vision was built to handle is, at
+5°, too small to matter.
+
+**What this means / next.** The decision-relevant question is now whether vision helps at the *realistic*
+grasp uncertainty (~10°, vs the 5° we trained at): re-run the state-vs-vision pair at
+`grasp_misalign_max_deg = 10` (and maybe 15). If proprioception *drops* while vision *holds*, the camera
+is genuinely needed; if both stay ~95%, the blind policy suffices. This directly answers "do we need
+vision at all," and takes priority over fusion micro-tuning (the earlier "fusion is the bottleneck"
+hypothesis was wrong — the broken env was).
+
+<details><summary><b>Superseded (broken-env) results, for history</b></summary>
+
+| Run | Obs | Eval |
+|---|---|---|
+| `squash_state_256` | state, no grasp error | 48% |
+| `state_grasp_1` | state + grasp error | 36.5% |
+| `vision_full_1` | 64 px RGB-D + grasp error | 13.9% (image too coarse) |
+| `vision_160_1` | 160 px RGB-D + grasp error | 34.8% |
+| `vision_blank_1` | 160 px arch, image zeroed | 8.8% |
+
+These trained with the dangling grasp + sliding base. The 64 px → 160 px resolution fix (Nyquist for
+the 1 mm task) was real and still applies. The "fusion drowns proprio / vision is image-only" diagnosis
+from the blank-image control motivated the fusion FC we kept — but the dominant limiter turned out to be
+the env bugs, not fusion.
+</details>
 
 ---
 
 ## 5. Key decisions & findings
 
-1. **Reward = squashing kernel, not negative-L2.** Dense, bounded, smooth near the goal; +15 eval
-   points over the earlier neg-L2 reward (state policy 33% → 48%).
-2. **Grasp misalignment is part of the task.** It is unobservable from proprioception, so it is the
-   core justification for vision — and it makes a fair comparison require re-running the state
-   baseline *with* it (`state_grasp_1`, in progress).
-3. **Chamfer-free physics ⇒ lateral precision is the bottleneck** (Section 3). Not an asset bug.
-4. **Camera resolution must satisfy Nyquist for the 1 mm task** (Section 4) — the single most
-   important lesson from the first vision run. Framing (mm/pixel on the insertion region), not raw
-   sensor megapixels, is what matters.
-5. **Input normalization with dict (image+vector) obs is a red herring / pitfall.** Disabling it
-   plateaus; enabling it crashes rl_games (TorchScript can't compile its dict normalizer) and, once
-   patched to run eager, *destabilizes* training by normalizing pixels. We normalize the image
-   in-env and leave proprio handling conservative.
+1. **Validate the grasp before trusting any number.** The single biggest lesson: a custom part with a
+   non-base origin silently broke Factory's grasp formula, so the screw was never really held — and it
+   capped *every* result at ~35% until found. Watch a rollout; don't trust success curves alone.
+2. **Reward = squashing kernel, not negative-L2.** Dense, bounded, smooth near the goal (a clear gain
+   over the earlier neg-L2 reward on the state policy).
+3. **Grasp misalignment is part of the task** and unobservable from proprioception — the core
+   justification for vision. But at **5° it's too small to matter** once the grasp is firm (state and
+   vision both ~95%); the realistic ~10° is the test that decides whether vision is needed.
+4. **Chamfer-free physics ⇒ lateral precision is the bottleneck** (Section 3). Not an asset bug. (It
+   also made the *base* slide until pinned by mass+friction.)
+5. **Camera resolution must satisfy Nyquist for the 1 mm task** (Section 4) — 64 px (~2.2 mm/px) was
+   sub-pixel and useless; 160 px (~2.7 px/mm) is resolvable. Framing (mm/pixel on the insertion
+   region), not raw megapixels, is what matters.
+6. **Fuse image + proprio at comparable width.** The hybrid net concatenated 3136 CNN dims with 24
+   proprio dims (proprio drowned); a `Linear(3136→128)+ReLU` before the concat fixes the imbalance.
+   (Helpful in principle, but not what was capping results — the env bugs were.)
+7. **Input normalization with dict (image+vector) obs is a pitfall.** Enabling it crashes rl_games
+   (TorchScript can't compile its dict normalizer); patched to run eager. We normalize the image
+   in-env.
 
 ---
 
@@ -134,20 +172,22 @@ that we have diagnosed:
 
 ## 7. Current status & next steps
 
-**Status:** the full vision pipeline is implemented and trains stably; the state baseline is strong
-(48%); the first 64 px vision policy under-performs and we have a well-supported diagnosis (image
-resolution) plus an implemented fix (160 px).
+**Status:** with the grasp + base bugs fixed, the corrected env is **largely solved at 5° grasp
+misalignment** — proprioception **94.5%**, vision **95.5%** (a tie). The vision pipeline (160 px RGB-D,
+CNN+LSTM, fusion FC) trains stably end-to-end. The open question is no longer "does vision work" but
+"is vision *needed*."
 
 **Immediate next steps (in order):**
-1. Finish `state_grasp_1` → the **fair proprio-only reference** under grasp error.
-2. Quick render-framing check of the 160 px camera.
-3. **160 px vision run + blank-image control** → the decisive test: does a resolvable image beat
-   proprioception?
-4. If yes → the full **ablation matrix** (state / +vision / +force / +vision+force).
+1. **Grasp-error comparison at the realistic 10° (and 15°):** re-run state vs vision at
+   `env.grasp_misalign_max_deg=10`. If proprioception drops while vision holds → vision is needed; if
+   both stay ~95% → the blind policy suffices. This is the decision-relevant test.
+2. **Rigid (physical) camera mount** — replace the non-physical look-at (which centres the true socket)
+   with a fixed wrist mount, for sim-to-real validity (and possibly a better signal).
+3. **Domain randomization on** (appearance + camera-pose jitter) so the CNN survives the real D405 feed.
+4. If vision proves its worth → the **ablation matrix** (state / +vision / +force / +vision+force).
 
-**Then (thesis roadmap):** path-centric observation transform (SE(3)-equivariant generalization);
-domain randomization for sim-to-real; KUKA iiwa + parallel-gripper swap (once the robot is in hand);
-sim-to-real transfer with PLAI.
+**Then:** KUKA iiwa + custom parallel-gripper swap (once the gripper is built — the grasp offset will
+be re-tuned for it); sim-to-real transfer.
 
 ---
 

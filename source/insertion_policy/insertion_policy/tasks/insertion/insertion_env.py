@@ -146,10 +146,15 @@ class InsertionEnv(ForgeEnv):
 
         self._tiled_camera = None
         if getattr(self.cfg, "tiled_camera", None) is not None:
-            # NOTE: this Isaac Sim build's usdrt lacks the ``hierarchy`` submodule that Isaac Lab's
-            # Fabric world-pose path needs, so the cfg disables Fabric (use_fabric=False) -> the
-            # camera's xform view reads poses via the USD XformCache path instead. See cfg.__post_init__.
+            # NOTE: this Isaac Sim build's usdrt lacks the ``hierarchy`` submodule Isaac Lab's Fabric
+            # world-pose path needs. We keep Fabric ON (GPU-stable physics) and monkeypatch only the
+            # camera's XformPrimView to the USD pose path (see top of file), so the camera works.
             self._tiled_camera = TiledCamera(self.cfg.tiled_camera)
+
+        # Optional third-person debug camera (only set by scripts/viz_camera.py; None in training).
+        self._scene_camera = None
+        if getattr(self.cfg, "scene_camera", None) is not None:
+            self._scene_camera = TiledCamera(self.cfg.scene_camera)
 
         self.scene.clone_environments(copy_from_source=False)
         if self.device == "cpu":
@@ -160,6 +165,8 @@ class InsertionEnv(ForgeEnv):
         self.scene.articulations["held_asset"] = self._held_asset
         if self._tiled_camera is not None:
             self.scene.sensors["tiled_camera"] = self._tiled_camera
+        if self._scene_camera is not None:
+            self.scene.sensors["scene_camera"] = self._scene_camera
 
         light_cfg = sim_utils.DomeLightCfg(intensity=2000.0, color=(0.75, 0.75, 0.75))
         light_cfg.func("/World/Light", light_cfg)
@@ -188,16 +195,27 @@ class InsertionEnv(ForgeEnv):
             )
 
     def get_handheld_asset_relative_pose(self):
-        """Add random rotational grasp misalignment to Factory's (identity) peg grasp.
+        """Grip the screw HEAD between the fingerpads, then add the rotational grasp misalignment.
 
-        Factory grasps the peg perfectly aligned with the fingertip frame. Real grasps are not: the
-        screw sits slightly tilted in the jaws. We bake a uniform shaft-axis tilt in
-        [0, grasp_misalign_max_deg] about a random horizontal axis of the grasp frame into the
-        relative quat, so the TRUE screw pose deviates from the fingertip-based estimate by an amount
-        the actor cannot observe (held pose is privileged/critic-only) -- it must be recovered from
-        vision. Resampled every reset. Independent of the pre-insert tilt (a known commanded pose).
+        Position fix. Factory's peg formula sets ``relative_pos.z = held_height - fingerpad_length``,
+        which assumes the asset ORIGIN is at its BASE. Our cooling_screw origin is at the head/shaft
+        SHOULDER, with the shaft (``screw_shaft_length``) hanging below it -- so the formula places
+        the screw ~one shaft-length too low and the gripper closes on empty air below the head (the
+        screw then only dangles, wobbles, and can slip out). We instead grip the HEAD treated as the
+        graspable cylinder (its base = the shoulder = our origin), so ``relative_pos.z =
+        head_height - fingerpad_length`` with ``head_height = full_height - screw_shaft_length``.
+
+        Misalignment. Factory grasps the peg perfectly aligned. Real grasps are not: the screw sits
+        slightly tilted in the jaws. We tilt the shaft OFF the finger-pointing direction by a uniform
+        angle in [0, grasp_misalign_max_deg] about a random horizontal axis (the shaft axis no longer
+        points straight along the gripper), so the TRUE screw pose deviates from the fingertip-based
+        estimate by an amount the actor cannot observe (held pose is privileged/critic-only) -- it
+        must be recovered from vision. Resampled every reset. Independent of the pre-insert tilt.
         """
         held_asset_relative_pos, held_asset_relative_quat = super().get_handheld_asset_relative_pose()
+        # Grip the head, not below it (correct for the shoulder-origin, two-diameter screw).
+        head_height = self.cfg_task.held_asset_cfg.height - self.cfg_task.screw_shaft_length
+        held_asset_relative_pos[:, 2] = head_height - self.cfg_task.robot_cfg.franka_fingerpad_length
         max_deg = getattr(self.cfg_task, "grasp_misalign_max_deg", 0.0)
         if max_deg > 0.0:
             n = self.num_envs

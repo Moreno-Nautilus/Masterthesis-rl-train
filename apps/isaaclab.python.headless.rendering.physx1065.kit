@@ -1,0 +1,110 @@
+[package]
+title = "Isaac Lab Python Headless Camera (Pinned PhysX 106.5)"
+description = "Headless Isaac Lab camera app with PhysX/Fabric pinned to matching 106.5.3 builds."
+version = "2.3.2"
+keywords = ["experience", "app", "isaaclab", "python", "camera", "minimal"]
+
+[dependencies]
+"isaaclab.python.headless" = {}
+
+# The local Kit cache currently contains a stale omni.physx.fabric 106.3.2 alongside PhysX 106.5.x.
+# Pin the core PhysX stack to a matched 106.5.3 set so SimulationContext can acquire Fabric.
+"omni.physx" = { version = "106.5.3", exact = true }
+"omni.physics.tensors" = { version = "106.5.3", exact = true }
+"omni.physx.tensors" = { version = "106.5.3", exact = true }
+"omni.physx.fabric" = { version = "106.5.3", exact = true }
+
+"omni.replicator.core" = {}
+"omni.kit.material.library" = {}
+"omni.kit.viewport.rtx" = {}
+
+[settings.isaaclab]
+cameras_enabled = true
+
+[settings]
+app.versionFile = "${exe-path}/VERSION"
+app.folder = "${exe-path}/"
+app.name = "Isaac-Sim"
+app.version = "4.5.0"
+app.enableStdoutOutput = false
+isaac.startup.ros_bridge_extension = ""
+
+rtx.translucency.enabled = false
+rtx.reflections.enabled = false
+rtx.indirectDiffuse.enabled = false
+rtx-transient.dlssg.enabled = false
+rtx.directLighting.sampledLighting.enabled = true
+rtx.directLighting.sampledLighting.samplesPerPixel = 1
+rtx.sceneDb.ambientLightIntensity = 1.0
+rtx.pathtracing.maxSamplesPerLaunch = 1000000
+rtx.viewTile.limit = 1000000
+rtx.raytracing.cached.enabled = false
+rtx.ambientOcclusion.enabled = false
+rtx.post.dlss.execMode = 0
+
+exts."omni.renderer.core".present.enabled = false
+renderer.multiGpu.maxGpuCount = 1
+omni.replicator.asyncRendering = false
+app.updateOrder.checkForHydraRenderComplete = 1000
+app.renderer.waitIdle = true
+app.hydraEngine.waitIdle = true
+app.audio.enabled = false
+app.vulkan = true
+app.profilerBackend = "nvtx"
+exts."omni.replicator.core".Orchestrator.enabled = false
+
+[settings.exts."omni.kit.registry.nucleus"]
+registries = [
+    { name = "kit/default", url = "https://ovextensionsprod.blob.core.windows.net/exts/kit/prod/106/shared" },
+    { name = "kit/sdk", url = "https://ovextensionsprod.blob.core.windows.net/exts/kit/prod/sdk/${kit_version_short}/${kit_git_hash}" },
+    { name = "kit/community", url = "https://dw290v42wisod.cloudfront.net/exts/kit/community" },
+]
+
+[settings.app.extensions]
+skipPublishVerification = true
+registryEnabled = true
+
+[settings.app.python]
+interceptSysStdOutput = false
+logSysStdOutput = false
+
+[settings.app.renderer]
+skipWhileMinimized = false
+sleepMsOnFocus = 0
+sleepMsOutOfFocus = 0
+
+[settings.physics]
+updateToUsd = false
+updateParticlesToUsd = false
+updateVelocitiesToUsd = false
+updateForceSensorsToUsd = false
+outputVelocitiesLocalSpace = false
+useFastCache = false
+visualizationDisplayJoints = false
+fabricUpdateTransformations = false
+fabricUpdateVelocities = false
+fabricUpdateForceSensors = false
+fabricUpdateJointStates = false
+
+[settings.app.exts]
+folders = [
+    "/home/moreno/isaaclab/apps/isaacsim_4_5",
+    "/home/moreno/isaaclab/source",
+    "${exe-path}/exts",
+    "${exe-path}/extscore",
+    "${exe-path}/../exts",
+    "${exe-path}/../extsDeprecated",
+    "${exe-path}/../extscache",
+    "${exe-path}/../extsPhysics",
+    "${exe-path}/../isaacsim/exts",
+    "${exe-path}/../isaacsim/extsDeprecated",
+    "${exe-path}/../isaacsim/extscache",
+    "${exe-path}/../isaacsim/extsPhysics",
+    "${app}",
+    "${app}/../../source",
+]
+
+[settings]
+persistent.isaac.asset_root.default = "http://omniverse-content-production.s3-us-west-2.amazonaws.com/Assets/Isaac/4.5"
+persistent.isaac.asset_root.cloud = "http://omniverse-content-production.s3-us-west-2.amazonaws.com/Assets/Isaac/4.5"
+persistent.isaac.asset_root.nvidia = "http://omniverse-content-production.s3-us-west-2.amazonaws.com/Assets/Isaac/4.5"

@@ -22,13 +22,21 @@ pose-uncertainty), trained with **PPO (RL-Games)**.
 - ✅ **State-obs task** `Isaac-Insertion-CoolingPeg-Direct-v0` (`InsertionEnv`): socket-aware
   multi-socket targeting, realistic pre-insert reset (1–5 cm clearance), pre-insert tilt injection
   (up to ~25°), random grasp misalignment, orientation-aware **multi-keypoint squashing-kernel
-  reward** + alignment success (<10°). Trained with PPO/RL-Games → **48% overall** success on the
-  tilt/lateral sweep.
+  reward** + alignment success (<10°).
 - ✅ **Vision task** `Isaac-Insertion-CoolingPeg-Vision-Direct-v0`: wrist **RGB-D** TiledCamera +
   hybrid observation (proprio + image) fed to a custom **CNN + LSTM** rl_games network
-  (`insertion_hybrid`), trained end-to-end. Trains stably and the reward improves.
-- 🔄 Now: full vision training run + eval sweep vs the state baseline; then path-centric obs,
-  domain randomization, and the Franka → iiwa 7 + parallel-gripper swap.
+  (`insertion_hybrid`), with the CNN features projected to 128 dims before fusing with proprio so
+  proprio isn't drowned. Trained end-to-end.
+- ✅ **Corrected-env rebaseline (2026-06-25):** two sim bugs found & fixed — the screw was not
+  actually gripped (Factory's peg-grasp offset mis-placed our shoulder-origin two-diameter screw, so
+  it dangled/slipped), and the 50 g base slid under contact. Fixes: grip the screw **head**; make the
+  base **heavy + high-friction** (effectively glued). **Both policies then jumped from ~35% to ~95%**
+  (state **94.5%**, vision **95.5%** over 512 eps) → the grasp/base bugs, not task difficulty, were
+  the real bottleneck. **All earlier success numbers are superseded.**
+- 🔄 Now: at 5° grasp misalignment vision *ties* proprioception (no headroom left). Next is the
+  decision-relevant test — re-run state vs vision at **10°/15° grasp error** (the realistic range) to
+  see whether the camera is actually needed; then rigid camera mount (sim-to-real), domain
+  randomization, and the Franka → iiwa 7 + parallel-gripper swap.
 
 > **Parts note:** the cooling parts are chamfer-free 3D-printed test parts (12 mm shaft into a 14 mm
 > socket, 1 mm clearance). Precise lateral alignment — not chamfer-funneling — is the binding
@@ -75,7 +83,11 @@ OMNI_KIT_ACCEPT_EULA=YES python scripts/<script>.py
 | `test_part_physics.py`    | Drop-test: confirm the screw seats in a socket (SDF collision sane) |
 | `smoke_env.py`            | Instantiate the env, reset, step; prints obs/reward + reset geometry (dumps wrist frames for the vision task) |
 | `train.py`                | Train with RL-Games (registers our tasks + the `insertion_hybrid` net) |
+| `auto_resume_train.sh`    | Watchdog wrapper for `train.py`: passes the `--experience` kit, auto-resumes from the latest checkpoint through PhysX crashes/stalls until `--max_iterations`. Use this for any unattended run. |
+| `overnight_chain.sh`      | Runs two `auto_resume_train.sh` jobs back-to-back on one GPU (e.g. state baseline → vision), freeing the GPU between them. `setsid bash scripts/overnight_chain.sh >log 2>&1 &` |
 | `eval_policy.py`          | Load a checkpoint, run N episodes, bin success by reset tilt / lateral offset |
+| `render_wrist_rollout.py` | Render a checkpoint rollout as video — `--view wrist` (the RGB-D POV) or `--view scene` (close third-person), following one env |
+| `viz_camera.py`           | Dump the wrist-cam POV + a third-person scene shot at reset (zero-action; for camera/grasp geometry checks) |
 | `plot_training.py`        | TensorBoard events → `progress.png` (reward/success curves; CPU-only, safe during training) |
 | `list_envs.py`            | List registered Isaac Lab task IDs |
 
@@ -83,24 +95,27 @@ OMNI_KIT_ACCEPT_EULA=YES python scripts/<script>.py
 
 ```bash
 conda activate isaaclab
+KIT=$PWD/apps/isaaclab.python.headless.rendering.physx1065.kit   # physx-pinned experience (see GPU note)
 
-# State-obs policy
+# State-obs policy (128 envs)
 OMNI_KIT_ACCEPT_EULA=YES python scripts/train.py \
-  --task Isaac-Insertion-CoolingPeg-Direct-v0 --num_envs 128 --headless \
-  --max_iterations 1500 agent.params.config.full_experiment_name=my_state_run
+  --task Isaac-Insertion-CoolingPeg-Direct-v0 --num_envs 128 --headless --experience "$KIT" \
+  --max_iterations 500 agent.params.config.full_experiment_name=my_state_run
 
-# Vision policy (wrist RGB-D + CNN). NOTE: requires --enable_cameras.
-OMNI_KIT_ACCEPT_EULA=YES python scripts/train.py \
-  --task Isaac-Insertion-CoolingPeg-Vision-Direct-v0 --num_envs 128 --headless --enable_cameras \
-  --max_iterations 1500 agent.params.config.full_experiment_name=my_vision_run
+# Vision policy (wrist RGB-D + CNN). NOTE: requires --enable_cameras; run at 64 envs (128 = PhysX crash).
+# For any unattended run prefer the watchdog (auto --experience + auto-resume through crashes):
+setsid bash scripts/auto_resume_train.sh my_vision_run \
+  Isaac-Insertion-CoolingPeg-Vision-Direct-v0 64 500 >my_vision_run.log 2>&1 &
+# (extra hydra overrides via EXTRA_OVERRIDES, e.g. EXTRA_OVERRIDES="env.grasp_misalign_max_deg=10")
 
 # Evaluate (add --enable_cameras for the vision task)
 OMNI_KIT_ACCEPT_EULA=YES python scripts/eval_policy.py \
   --task Isaac-Insertion-CoolingPeg-Direct-v0 --num_envs 128 --num_episodes 512 --headless \
-  --checkpoint logs/rl_games/Forge/<run>/nn/Forge.pth
+  --experience "$KIT" --checkpoint logs/rl_games/Forge/<run>/nn/Forge.pth
 ```
 
-Logs/checkpoints land in `logs/rl_games/Forge/<run>/` (`nn/Forge.pth` = best by mean reward).
+Logs/checkpoints land in `logs/rl_games/Forge/<run>/` (`nn/Forge.pth` = best by mean reward). Runs
+plateau by ~200–300 iterations, so 500 is plenty. Eval writes a timestamped report next to the checkpoint.
 
 > **Vision/GPU note:** the vision task keeps PhysX on Fabric (GPU-stable) but routes only the
 > camera's pose view to the USD path, working around a missing `usdrt.hierarchy` in this Isaac Sim

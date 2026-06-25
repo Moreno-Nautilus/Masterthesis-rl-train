@@ -181,6 +181,10 @@ class ForgeTaskCoolingInsertCameraCfg(ForgeTaskCoolingInsertCfg):
     # working distance > the D405 ~7cm min depth). At nominal grasp local x->world x, local z->-world z.
     wrist_cam_offset_pos: tuple = (-0.06, 0.0, -0.03)  # 6cm to the side, 3cm above the fingertip
 
+    # Optional third-person debug camera, set only by scripts/viz_camera.py to render the scene from
+    # outside (to see how the wrist cam is mounted). None in training -> zero impact.
+    scene_camera: TiledCameraCfg | None = None
+
     # Domain randomization (vision-specific): per-episode camera eye-position jitter (meters, stddev)
     # modelling mount / hand-eye-calibration uncertainty for sim-to-real. 0.0 = OFF -- keep off for
     # the first clean vision baseline (so we can tell whether vision helps), then enable for the

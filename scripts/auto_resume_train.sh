@@ -14,7 +14,9 @@ TASK="${2:?task id}"
 ENVS="${3:?num_envs}"
 MAX="${4:?max_iterations}"
 SEED="${5:-}"                       # optional: checkpoint to warm-start the first attempt
+EXTRA="${EXTRA_OVERRIDES:-}"        # optional extra hydra overrides, e.g. EXTRA_OVERRIDES="env.blank_image=true"
 PY=/home/moreno/miniconda3/envs/isaaclab/bin/python
+EXPERIENCE="${EXPERIENCE:-/home/moreno/Masterthesis-rl-train/apps/isaaclab.python.headless.rendering.physx1065.kit}"
 NN_DIR="logs/rl_games/Forge/${NAME}/nn"
 LOG="/tmp/${NAME}.log"              # current attempt's stdout (overwritten each attempt)
 MASTER="/tmp/${NAME}_master.log"    # watchdog audit trail (persists)
@@ -30,7 +32,12 @@ free_gpu(){
   done
 }
 
-log "=== auto-resume start: name=$NAME task=$TASK envs=$ENVS max=$MAX seed=${SEED:-none} ==="
+EXPERIENCE_ARGS=()
+if [ -n "$EXPERIENCE" ]; then
+  EXPERIENCE_ARGS=(--experience "$EXPERIENCE")
+fi
+
+log "=== auto-resume start: name=$NAME task=$TASK envs=$ENVS max=$MAX seed=${SEED:-none} experience=${EXPERIENCE:-default} ==="
 for attempt in $(seq 1 "$MAX_ATTEMPTS"); do
   # pick the newest checkpoint to resume from (own run first, else the seed on attempt 1)
   CKPT=$(ls -t "$NN_DIR"/last_*.pth "$NN_DIR"/Forge.pth 2>/dev/null | head -1)
@@ -42,8 +49,8 @@ for attempt in $(seq 1 "$MAX_ATTEMPTS"); do
   # epoch 1 and is re-paid on every resume (SIGKILL never warms the cache) — it broke the watchdog
   # (killed mid-compile every attempt). Eager mode is a bit slower but starts fast and deterministically.
   OMNI_KIT_ACCEPT_EULA=YES TORCHDYNAMO_DISABLE=1 PYTHONUNBUFFERED=1 "$PY" scripts/train.py --task "$TASK" \
-    --num_envs "$ENVS" --headless --enable_cameras --max_iterations "$MAX" \
-    agent.params.config.full_experiment_name="$NAME" $RESUME > "$LOG" 2>&1 &
+    --num_envs "$ENVS" --headless --enable_cameras "${EXPERIENCE_ARGS[@]}" --max_iterations "$MAX" \
+    agent.params.config.full_experiment_name="$NAME" $RESUME $EXTRA > "$LOG" 2>&1 &
   TPID=$!
   log "launched train pid $TPID"
 

@@ -4,6 +4,12 @@ rl_games' stock builders are image-only (``A2CBuilder`` runs the CNN over the wh
 image+reward+last_action (``A2CResnetBuilder``); neither fuses a CNN with a separate proprio
 vector. This builder does, so the wrist RGB-D camera can be trained end-to-end with the policy.
 
+The CNN's flattened features are passed through a small projection FC (``cnn.fc_size``, default
+128) with a ReLU before being concatenated with the proprio vector. Without it the raw 3136 CNN
+dims swamp the ~24 proprio dims (proprio becomes <1% of the fused input and is effectively ignored);
+the projection brings the two branches to comparable width so the downstream LSTM/MLP can actually
+use proprio.
+
 It consumes the Dict observations produced by the Isaac Lab rl_games wrapper when
 ``concate_obs_groups=False`` (see ``rl_games_camera_ppo_cfg.yaml``): the policy network sees
 ``{"policy": <proprio>, "image": <H,W,C>}`` and the asymmetric central-value network sees
@@ -71,16 +77,26 @@ class InsertionHybridBuilder(A2CBuilder):
                 with torch.no_grad():
                     cnn_out = self._make_cnn(c, convs)(torch.zeros(1, c, h, w)).flatten(1).shape[1]
 
-            # Build the rest of the net as a flat (cnn_out + proprio)-vector net: strip 'cnn' so the
+            # Project the (large) CNN feature vector down before fusing with proprio, so proprio is
+            # not drowned. With no image (the critic) there is no projection. Plain ints only here.
+            self._cnn_out = cnn_out
+            self._proj_dim = int((cnn_params or {}).get("fc_size", 128)) if self._image_key is not None else 0
+
+            # Build the rest of the net as a flat (proj + proprio)-vector net: strip 'cnn' so the
             # parent does not build its own CNN, and pass the fused feature dim as the input shape.
             parent_params = copy.deepcopy(params)
             parent_params.pop("cnn", None)
             parent_kwargs = dict(kwargs)
-            parent_kwargs["input_shape"] = (cnn_out + proprio_dim,)
+            parent_kwargs["input_shape"] = (self._proj_dim + proprio_dim,)
             super().__init__(parent_params, **parent_kwargs)
 
-            # Now that nn.Module is initialized, build the real CNN that forward() will use.
-            self._image_cnn = self._make_cnn(image_chw[0], convs) if self._image_key is not None else None
+            # Now that nn.Module is initialized, build the real CNN + projection FC that forward() uses.
+            if self._image_key is not None:
+                self._image_cnn = self._make_cnn(image_chw[0], convs)
+                self._image_proj = nn.Sequential(nn.Linear(self._cnn_out, self._proj_dim), nn.ReLU())
+            else:
+                self._image_cnn = None
+                self._image_proj = None
 
         @staticmethod
         def _make_cnn(in_channels, convs):
@@ -101,7 +117,7 @@ class InsertionHybridBuilder(A2CBuilder):
             feat = torch.cat(proprio, dim=1) if proprio else None
             if self._image_cnn is not None:
                 img = obs[self._image_key].permute(0, 3, 1, 2).contiguous()  # BHWC -> BCHW
-                cnn_feat = self._image_cnn(img).flatten(1)
+                cnn_feat = self._image_proj(self._image_cnn(img).flatten(1))  # 3136 -> proj_dim
                 feat = cnn_feat if feat is None else torch.cat([cnn_feat, feat], dim=1)
             fused = dict(obs_dict)
             fused["obs"] = feat

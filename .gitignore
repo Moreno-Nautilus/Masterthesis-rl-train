@@ -35,5 +35,7 @@ _repo
 _build
 .lastformat
 
-# Personal notes 
 /DECISIONS.md
+*.mp4
+*.png
+*.log
