@@ -85,6 +85,12 @@ class InsertionEnv(ForgeEnv):
     cfg: ForgeTaskCoolingInsertCfg
 
     def __init__(self, cfg: ForgeTaskCoolingInsertCfg, render_mode: str | None = None, **kwargs):
+        # Appearance-DR bookkeeping must exist BEFORE super().__init__(): the base ctor builds the
+        # scene (-> _setup_part_materials, which records shader paths here) and may trigger an early
+        # reset, both before our camera branch below runs.
+        self._appearance_shader_paths = {}  # {"screw": shader_path, "base": shader_path}
+        self._material_dr_failed = False
+        self._light_dr_failed = False
         super().__init__(cfg, render_mode, **kwargs)
 
         # Vision variant: a wrist RGB-D camera adds an "image" observation group alongside Forge's
@@ -94,6 +100,13 @@ class InsertionEnv(ForgeEnv):
         if self._has_camera:
             h, w, c = self.cfg.image_height, self.cfg.image_width, self.cfg.image_channels
             self.single_observation_space["image"] = gym.spaces.Box(low=0.0, high=1.0, shape=(h, w, c))
+            # Privileged labels for the auxiliary vision heads (actor-UNOBSERVABLE; never fed to the
+            # policy): signed grasp tilt (1) + true shaft-tip->socket-opening gap in the fingertip frame
+            # (3). Routed to the policy net as its own obs group and sliced out there for the aux loss.
+            self._aux_label_dim = 4
+            self.single_observation_space["aux_label"] = gym.spaces.Box(
+                low=-float("inf"), high=float("inf"), shape=(self._aux_label_dim,)
+            )
             # Rigid wrist mount: a FIXED eye offset AND a FIXED aim point, both in the fingertip frame.
             self._cam_offset_pos = torch.tensor(
                 self.cfg.wrist_cam_offset_pos, device=self.device, dtype=torch.float32
@@ -118,6 +131,17 @@ class InsertionEnv(ForgeEnv):
             # Per-episode camera extrinsics jitter (DR; resampled at reset; zero when the cfg knob is 0).
             self._cam_jitter = torch.zeros((self.num_envs, 3), device=self.device, dtype=torch.float32)
             self._cam_roll_jitter = torch.zeros((self.num_envs,), device=self.device, dtype=torch.float32)
+            # Per-env photometric image-augmentation params (appearance DR; resampled per reset). Init
+            # to the IDENTITY so each term is a no-op until its cfg knob enables it. Broadcast over H,W:
+            # gain/brightness/contrast are per-channel (...,1,1,3); gamma is per-image (...,1,1,1).
+            self._photo_gain = torch.ones((self.num_envs, 1, 1, 3), device=self.device)
+            self._photo_brightness = torch.zeros((self.num_envs, 1, 1, 3), device=self.device)
+            self._photo_contrast = torch.ones((self.num_envs, 1, 1, 3), device=self.device)
+            self._photo_gamma = torch.ones((self.num_envs, 1, 1, 1), device=self.device)
+            self._cam_log_counter = 0  # drives the periodic training image gallery (cam_log_interval)
+            # NOTE: _appearance_shader_paths / _material_dr_failed / _light_dr_failed are initialized at
+            # the TOP of __init__ (before super), and _setup_part_materials populates the shader paths
+            # during super().__init__() -- do NOT re-init them here or that binding would be wiped.
 
         # Socket offsets (socket BOTTOM, base-local frame); each env holds the active one.
         self._socket_table = torch.tensor(
@@ -189,6 +213,81 @@ class InsertionEnv(ForgeEnv):
         light_cfg = sim_utils.DomeLightCfg(intensity=2000.0, color=(0.75, 0.75, 0.75))
         light_cfg.func("/World/Light", light_cfg)
 
+        # Appearance DR (vision variant): PER-ENV matte materials on the parts + a directional key
+        # light, both randomized per reset (_randomize_part_materials / _randomize_scene_light). The
+        # dome above is the ambient fill; the key light adds the directional shadows/specular a dome
+        # can't. Fail-safe: any error in setup disables that layer; image-space DR still runs.
+        if getattr(self.cfg, "tiled_camera", None) is not None:
+            if getattr(self.cfg, "randomize_part_materials", False):
+                self._setup_part_materials()
+            self._setup_key_light()
+
+    def _setup_part_materials(self):
+        """Bind a PER-ENV matte PreviewSurface to each env's screw and base (best-effort).
+
+        ``bind_visual_material`` takes a CONCRETE prim path (no regex), and cloned env prims are
+        instanceable proxies that can't carry a per-prim binding, so we mirror Isaac Lab's
+        ``randomize_visual_color`` recipe: expand the env-regex with ``find_matching_prim_paths``, flip
+        each matched prim un-instanceable, then bind its OWN material (``@apply_nested`` -> reaches the
+        visual mesh). Per-env (not one shared material) so colours vary WITHIN a batch -> the policy
+        sees many filament colours at once, not just one per episode. Shader paths are stored per env
+        (sorted by env index) so _randomize_part_materials can give screw_i and base_i a correlated
+        colour. Wrapped so any failure cleanly disables material DR.
+        """
+        try:
+            import re
+
+            import isaacsim.core.utils.prims as prim_utils
+
+            base_color = tuple(getattr(self.cfg, "material_base_color", (0.45, 0.45, 0.5)))
+            rough_lo = float(getattr(self.cfg, "material_roughness_range", (0.4, 0.9))[0])
+            metallic = float(getattr(self.cfg, "material_metallic", 0.0))
+
+            def _env_idx(path):
+                m = re.search(r"/env_(\d+)/", path)
+                return int(m.group(1)) if m else 0
+
+            shaders = {"screw": [], "base": []}
+            for key, env_prim in (("screw", "HeldAsset"), ("base", "FixedAsset")):
+                paths = sorted(
+                    sim_utils.find_matching_prim_paths(f"/World/envs/env_.*/{env_prim}"), key=_env_idx
+                )
+                if not paths:
+                    raise RuntimeError(f"no prims matched /World/envs/env_.*/{env_prim}")
+                for p in paths:
+                    mat_path = f"/World/Looks/{key}_mat_env{_env_idx(p)}"
+                    mat_cfg = sim_utils.PreviewSurfaceCfg(
+                        diffuse_color=base_color, roughness=rough_lo, metallic=metallic
+                    )
+                    mat_cfg.func(mat_path, mat_cfg)
+                    prim = prim_utils.get_prim_at_path(p)
+                    if prim and prim.IsValid() and prim.IsInstanceable():
+                        prim.SetInstanceable(False)  # per-prim material binding needs a non-instanced prim
+                    sim_utils.bind_visual_material(p, mat_path)
+                    shaders[key].append(f"{mat_path}/Shader")
+            self._appearance_shader_paths = shaders  # {"screw": [per-env...], "base": [per-env...]}
+        except Exception as exc:  # noqa: BLE001
+            carb.log_warn(f"[InsertionEnv] part-material DR setup failed, disabling it: {exc}")
+            self._material_dr_failed = True
+            self._appearance_shader_paths = {}
+
+    def _setup_key_light(self):
+        """Spawn a directional key light (DistantLight) whose direction is randomized per reset.
+
+        A DistantLight is infinite/parallel (like the sun): no position -> it lights every env
+        identically (no per-env brightness confound a positioned point light would add), but its
+        DIRECTION casts the moving shadows/specular highlights a dome cannot. Spawned with an initial
+        orientation so the xform op exists; _randomize_scene_light re-points it each reset. Best-effort.
+        """
+        try:
+            angle = float(getattr(self.cfg, "key_light_angle", 1.0))
+            inten = float(getattr(self.cfg, "key_light_intensity_range", (1000.0, 3000.0))[0])
+            key_cfg = sim_utils.DistantLightCfg(intensity=inten, color=(1.0, 1.0, 1.0), angle=angle)
+            key_cfg.func("/World/KeyLight", key_cfg, orientation=(0.966, 0.259, 0.0, 0.0))  # ~30deg tilt
+        except Exception as exc:  # noqa: BLE001
+            carb.log_warn(f"[InsertionEnv] key-light setup failed, disabling it: {exc}")
+            self._light_dr_failed = True
+
     # --- socket selection -------------------------------------------------------------------
     def _sample_sockets(self, env_ids):
         n = self._socket_table.shape[0]
@@ -224,6 +323,8 @@ class InsertionEnv(ForgeEnv):
                 self._cam_roll_jitter[env_ids] = math.radians(self.cfg.cam_rot_jitter_deg) * torch.randn(
                     (len(env_ids),), device=self.device
                 )
+            # Appearance DR: per-env photometric params + global scene material/light randomization.
+            self._randomize_appearance(env_ids)
 
     def get_handheld_asset_relative_pose(self):
         """Grip the screw HEAD between the fingerpads, then add the rotational grasp misalignment.
@@ -248,8 +349,8 @@ class InsertionEnv(ForgeEnv):
         head_height = self.cfg_task.held_asset_cfg.height - self.cfg_task.screw_shaft_length
         held_asset_relative_pos[:, 2] = head_height - self.cfg_task.robot_cfg.franka_fingerpad_length
         max_deg = getattr(self.cfg_task, "grasp_misalign_max_deg", 0.0)
+        n = self.num_envs
         if max_deg > 0.0:
-            n = self.num_envs
             # Physical grasp tilt: a cylindrical head between flat parallel pads can only tip ABOUT THE
             # FINGER PRESSING AXIS (the pads' closing direction), flopping the shaft in the plane
             # perpendicular to it. Tipping toward/away from a pad FACE is blocked by the flat pad. The
@@ -263,6 +364,13 @@ class InsertionEnv(ForgeEnv):
             axis[:, 1] = 1.0  # fingertip-frame Y = finger pressing/closing axis
             misalign_quat = torch_utils.quat_from_angle_axis(mag, axis)
             held_asset_relative_quat = torch_utils.quat_mul(misalign_quat, held_asset_relative_quat)
+        else:
+            mag = torch.zeros(n, device=self.device)
+        # Stash the per-episode signed grasp tilt (rad) as the label for the auxiliary grasp head. Set
+        # for ALL envs every reset (resets are synchronized), so it matches each env's current episode.
+        # This is the COMMANDED tilt; the realized angle drifts a little under gravity sag, which is
+        # acceptable noise for a representation-shaping aux target.
+        self._grasp_misalign_signed = mag
         return held_asset_relative_pos, held_asset_relative_quat
 
     def _apply_pre_insert_tilt(self, env_ids):
@@ -493,40 +601,239 @@ class InsertionEnv(ForgeEnv):
         self._log_factory_metrics(log_dict, curr_successes)
         return rew_buf
 
+    # --- appearance domain randomization (vision variant) -----------------------------------
+    def _randomize_appearance(self, env_ids):
+        """Per-reset appearance DR: per-env photometric params + per-env materials + scene lighting.
+
+        Photometric params (gain/brightness/contrast/gamma) are per-env GPU buffers consumed in
+        _get_camera_image. Part materials are PER-ENV (colour varies within the batch). The dome +
+        directional key light are scene-wide (one set per reset). All scene-USD writes are best-effort
+        and self-disable on error (the GPU photometric aug still runs).
+        """
+        cfg = self.cfg
+        m = len(env_ids)
+
+        def _half(width, shape):  # uniform in [-width, +width]
+            return (2.0 * torch.rand(shape, device=self.device) - 1.0) * width
+
+        if getattr(cfg, "photo_gain_rgb", 0.0) > 0.0:
+            self._photo_gain[env_ids] = 1.0 + _half(cfg.photo_gain_rgb, (m, 1, 1, 3))
+        if getattr(cfg, "photo_brightness", 0.0) > 0.0:
+            self._photo_brightness[env_ids] = _half(cfg.photo_brightness, (m, 1, 1, 3))
+        if getattr(cfg, "photo_contrast", 0.0) > 0.0:
+            self._photo_contrast[env_ids] = 1.0 + _half(cfg.photo_contrast, (m, 1, 1, 3))
+        if getattr(cfg, "photo_gamma", 0.0) > 0.0:
+            self._photo_gamma[env_ids] = 1.0 + _half(cfg.photo_gamma, (m, 1, 1, 1))
+
+        self._randomize_part_materials()
+        self._randomize_scene_light()
+
+    def _randomize_part_materials(self):
+        """Per-env, CORRELATED screw/base albedo + roughness (best-effort).
+
+        For each env we draw ONE scene colour (base +/- material_color_jitter), then screw and base
+        get that colour +/- a SMALL material_part_color_jitter. So within an env the two parts are
+        usually similar (matching reality: same filament => same colour => no colour contrast to lean
+        on) while still occasionally diverging (robustness). The wide between-env spread is the actual
+        DR; the small within-env spread stops the policy keying on a screw-vs-base colour contrast that
+        won't exist on hardware. Colours are drawn as tensors then ``.tolist()`` once (no per-channel
+        GPU sync); the cost is the per-env USD ``Set`` calls, paid only at reset.
+        """
+        if self._material_dr_failed or not self._appearance_shader_paths:
+            return
+        cfg = self.cfg
+        base = torch.tensor(cfg.material_base_color)  # CPU
+        jit = float(getattr(cfg, "material_color_jitter", 0.0))
+        pjit = float(getattr(cfg, "material_part_color_jitter", 0.0))
+        r_lo, r_hi = (float(x) for x in getattr(cfg, "material_roughness_range", (0.5, 0.5)))
+        try:
+            import isaacsim.core.utils.prims as prim_utils
+            from pxr import Gf
+
+            screw_paths = self._appearance_shader_paths.get("screw", [])
+            base_paths = self._appearance_shader_paths.get("base", [])
+            n = len(screw_paths)
+            if n == 0:
+                return
+            scene = base + (2.0 * torch.rand(n, 3) - 1.0) * jit  # per-env shared colour
+            screw_c = (scene + (2.0 * torch.rand(n, 3) - 1.0) * pjit).clamp(0.0, 1.0).tolist()
+            base_c = (scene + (2.0 * torch.rand(n, 3) - 1.0) * pjit).clamp(0.0, 1.0).tolist()
+            screw_r = (r_lo + (r_hi - r_lo) * torch.rand(n)).tolist()
+            base_r = (r_lo + (r_hi - r_lo) * torch.rand(n)).tolist()
+
+            for paths, colors, roughs in ((screw_paths, screw_c, screw_r), (base_paths, base_c, base_r)):
+                for sp, col, rgh in zip(paths, colors, roughs):
+                    prim = prim_utils.get_prim_at_path(sp)
+                    d_attr = prim.GetAttribute("inputs:diffuseColor") if (prim and prim.IsValid()) else None
+                    if not (d_attr and d_attr.IsValid()):
+                        self._material_dr_failed = True  # not the material we expect -> fall back to aug
+                        return
+                    d_attr.Set(Gf.Vec3f(*col))
+                    r_attr = prim.GetAttribute("inputs:roughness")
+                    if r_attr and r_attr.IsValid():
+                        r_attr.Set(float(rgh))
+        except Exception as exc:  # noqa: BLE001
+            carb.log_warn(f"[InsertionEnv] part-material DR disabled after error: {exc}")
+            self._material_dr_failed = True
+
+    def _randomize_scene_light(self):
+        """Per reset: dome (ambient) intensity+colour, and the key light's DIRECTION+intensity.
+
+        Dome = soft fill; key DistantLight = the directional source casting moving shadows/specular.
+        The key direction is sampled in the upper hemisphere (elevation off straight-down, random
+        azimuth) so light arrives from a realistic-but-varied overhead angle each episode. Best-effort.
+        """
+        if self._light_dr_failed:
+            return
+        cfg = self.cfg
+        try:
+            import isaacsim.core.utils.prims as prim_utils
+            from pxr import Gf
+
+            def _attr(p, name):  # tolerate both UsdLux input schemas
+                a = p.GetAttribute(f"inputs:{name}")
+                return a if (a and a.IsValid()) else p.GetAttribute(name)
+
+            # --- dome ambient: intensity + colour ---
+            rng = getattr(cfg, "light_intensity_range", None)
+            jit = float(getattr(cfg, "light_color_jitter", 0.0))
+            do_intensity = bool(rng) and float(rng[1]) > 0.0
+            if do_intensity or jit > 0.0:
+                dome = prim_utils.get_prim_at_path("/World/Light")
+                if not (dome and dome.IsValid()):
+                    self._light_dr_failed = True
+                    return
+                if do_intensity:
+                    lo, hi = float(rng[0]), float(rng[1])
+                    a = _attr(dome, "intensity")
+                    if a and a.IsValid():
+                        a.Set(lo + (hi - lo) * torch.rand(1).item())
+                if jit > 0.0:
+                    c = [min(1.0, max(0.0, 0.75 + (2.0 * torch.rand(1).item() - 1.0) * jit)) for _ in range(3)]
+                    a = _attr(dome, "color")
+                    if a and a.IsValid():
+                        a.Set(Gf.Vec3f(*c))
+
+            # --- directional key light: re-point + intensity ---
+            krng = getattr(cfg, "key_light_intensity_range", None)
+            elev_lo, elev_hi = (float(x) for x in getattr(cfg, "key_light_elev_range_deg", (15.0, 60.0)))
+            key = prim_utils.get_prim_at_path("/World/KeyLight")
+            if key and key.IsValid():
+                if krng and float(krng[1]) > 0.0:
+                    a = _attr(key, "intensity")
+                    if a and a.IsValid():
+                        a.Set(float(krng[0]) + (float(krng[1]) - float(krng[0])) * torch.rand(1).item())
+                # tilt straight-down by a random elevation about a random azimuth -> overhead but varied.
+                elev = math.radians(elev_lo + (elev_hi - elev_lo) * torch.rand(1).item())
+                az = 2.0 * math.pi * torch.rand(1).item()
+                axis = torch.tensor([math.cos(az), math.sin(az), 0.0])
+                q = torch_utils.quat_from_angle_axis(torch.tensor([elev]), axis.unsqueeze(0))[0].tolist()
+                o_attr = key.GetAttribute("xformOp:orient")
+                if o_attr and o_attr.IsValid():
+                    cur = o_attr.Get()
+                    QuatT = type(cur) if cur is not None else Gf.Quatd
+                    o_attr.Set(QuatT(float(q[0]), float(q[1]), float(q[2]), float(q[3])))
+        except Exception as exc:  # noqa: BLE001
+            carb.log_warn(f"[InsertionEnv] scene-light DR disabled after error: {exc}")
+            self._light_dr_failed = True
+
     # --- observations (adds the RGB-D image group for the vision variant) -------------------
     def _get_observations(self):
         obs = super()._get_observations()  # {"policy": proprio, "critic": state}
         if getattr(self, "_has_camera", False):
             obs["image"] = self._get_camera_image()
+            obs["aux_label"] = self._get_aux_label()
         return obs
+
+    def _get_aux_label(self):
+        """Privileged supervised targets for the auxiliary vision heads (NOT fed to the policy).
+
+        [0]   signed grasp-misalignment angle (rad) about the finger pressing axis -- the per-episode,
+              actor-unobservable shaft tilt the policy must recover (set in
+              ``get_handheld_asset_relative_pose``).
+        [1:4] true shaft-tip -> socket-opening gap, expressed in the fingertip frame (m) -- the clean
+              relative pose the wrist camera sees, vs the +/-8mm-noisy socket estimate the actor's
+              proprio carries. Uses the realized tip (so it already encodes the grasp-induced tip shift).
+
+        Both come from privileged (critic-only) state, so the labels are available server-side at train
+        time and simply unused at deploy (the heads are a training-time representation prior, not a
+        runtime estimator).
+        """
+        grasp = getattr(self, "_grasp_misalign_signed", None)
+        if grasp is None:
+            grasp = torch.zeros(self.num_envs, device=self.device)
+        tip_pos, _ = self._held_base_pose()
+        gap_world = self._socket_opening_pos() - tip_pos
+        gap_ft = torch_utils.quat_rotate_inverse(self.fingertip_midpoint_quat, gap_world)
+        return torch.cat([grasp.unsqueeze(-1), gap_ft], dim=-1)
 
     def _get_camera_image(self):
         """Wrist RGB-D as a (num_envs, H, W, 4) tensor: normalized RGB (3) + normalized depth (1).
 
-        RGB is scaled to [0,1] and mean-subtracted per image (as in Isaac Lab's camera examples);
-        depth has inf (no-hit) zeroed and is scaled by the camera far-clip into ~[0,1]. The CNN in
-        the hybrid network consumes this directly (it permutes HWC->CHW).
+        RGB is scaled to [0,1], then (appearance DR) per-env photometric augmentation + sensor noise,
+        then mean-subtracted per image (as in Isaac Lab's camera examples). Depth has inf (no-hit)
+        zeroed, (appearance DR) range noise on real returns + dropout holes, then far-clip scaling into
+        ~[0,1]. The CNN in the hybrid network consumes this directly (it permutes HWC->CHW).
         """
         if getattr(self.cfg, "blank_image", False):
             # Ablation: zeroed image (camera still renders; the policy just gets no visual signal).
+            # Returned BEFORE any DR so the blank control stays exactly blank.
             h, w, c = self.cfg.image_height, self.cfg.image_width, self.cfg.image_channels
             return torch.zeros((self.num_envs, h, w, c), device=self.device)
 
         out = self._tiled_camera.data.output
-        rgb_raw = out["rgb"][..., :3].float() / 255.0
-        rgb = rgb_raw - torch.mean(rgb_raw, dim=(1, 2), keepdim=True)
+        cfg = self.cfg
+
+        # RGB: per-env photometric augmentation (exposure/white-balance, gamma tone curve, contrast),
+        # then sensor noise. Brightness/gain go BEFORE gamma so the additive shift survives the final
+        # per-image mean re-centring (a pure DC shift would otherwise cancel).
+        rgb01 = out["rgb"][..., :3].float() / 255.0
+        rgb01 = torch.clamp(rgb01 * self._photo_gain + self._photo_brightness, 0.0, 1.0)
+        if (self._photo_gamma != 1.0).any():
+            rgb01 = torch.pow(rgb01, self._photo_gamma)
+        ch_mean = rgb01.mean(dim=(1, 2), keepdim=True)
+        rgb01 = torch.clamp((rgb01 - ch_mean) * self._photo_contrast + ch_mean, 0.0, 1.0)
+        rgb_ns = float(getattr(cfg, "rgb_noise_std", 0.0))
+        if rgb_ns > 0.0:
+            rgb01 = torch.clamp(rgb01 + rgb_ns * torch.randn_like(rgb01), 0.0, 1.0)
+        rgb = rgb01 - torch.mean(rgb01, dim=(1, 2), keepdim=True)
 
         depth = out["depth"].clone()
-        depth[~torch.isfinite(depth)] = 0.0
+        finite = torch.isfinite(depth)
+        depth[~finite] = 0.0
         far = float(self.cfg.tiled_camera.spawn.clipping_range[1])
+        d_ns = float(getattr(cfg, "depth_noise_std", 0.0))
+        if d_ns > 0.0:  # range noise on REAL returns only (no-hit stays 0)
+            depth = torch.where(finite, depth + d_ns * torch.randn_like(depth), depth)
         depth = torch.clamp(depth, 0.0, far) / far
+        d_drop = float(getattr(cfg, "depth_dropout_prob", 0.0))
+        if d_drop > 0.0:  # per-pixel no-return holes, like a real depth sensor
+            depth[torch.rand_like(depth) < d_drop] = 0.0
         if depth.dim() == 3:
             depth = depth.unsqueeze(-1)
 
         if getattr(self.cfg, "write_image_to_file", False):
             from isaaclab.sensors import save_images_to_file
 
-            save_images_to_file(rgb_raw, "/tmp/wrist_rgb.png")
+            save_images_to_file(rgb01, "/tmp/wrist_rgb.png")  # the augmented image the policy sees
             save_images_to_file(depth, "/tmp/wrist_depth.png")
+
+        # Periodic training gallery: every cam_log_interval calls, dump a tiled montage (all envs in one
+        # grid, via save_images_to_file) of exactly what the policy SEES -> watch the env/DR/framing
+        # during an 8h run without a second GPU job. Off when cam_log_interval<=0. renders/ is gitignored.
+        log_int = int(getattr(self.cfg, "cam_log_interval", 0))
+        if log_int > 0:
+            if self._cam_log_counter % log_int == 0:
+                import os
+
+                from isaaclab.sensors import save_images_to_file
+
+                d = str(getattr(self.cfg, "cam_log_dir", "renders/train_cam"))
+                os.makedirs(d, exist_ok=True)
+                tag = f"{self._cam_log_counter:08d}"
+                save_images_to_file(rgb01, f"{d}/rgb_{tag}.png")
+                save_images_to_file(depth.expand(-1, -1, -1, 3) if depth.shape[-1] == 1 else depth,
+                                    f"{d}/depth_{tag}.png")
+            self._cam_log_counter += 1
 
         return torch.cat([rgb, depth], dim=-1)

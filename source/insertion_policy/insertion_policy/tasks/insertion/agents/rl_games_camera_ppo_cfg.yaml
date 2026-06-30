@@ -12,8 +12,10 @@ params:
     clip_actions: 1.0
     clip_observations: 5.0
     # Map Isaac Lab obs groups -> rl_games. Policy sees proprio + image; the asymmetric critic sees
-    # the privileged state vector only. Dict mode so the image stays a (H,W,C) tensor for the CNN.
-    obs_groups: { obs: [policy, image], states: [critic] }
+    # the privileged state vector only. `aux_label` rides along in the policy obs but is sliced out by
+    # the network and used ONLY for the auxiliary-head supervised loss (never as a policy input). Dict
+    # mode so the image stays a (H,W,C) tensor for the CNN.
+    obs_groups: { obs: [policy, image, aux_label], states: [critic] }
     concate_obs_groups: False
 
   model:
@@ -22,6 +24,21 @@ params:
   network:
     name: insertion_hybrid
     separate: False
+
+    # Auxiliary supervised heads off the projected CNN features. They force the image encoder to
+    # represent the two actor-unobservable cues that vision must recover: the grasp tilt (how the screw
+    # sits in the hand) and the true hole gap (where the socket is, vs the +/-8mm-noisy proprio
+    # estimate). Labels arrive via the `aux_label` obs group (excluded from the policy input); each
+    # target's MEAN MSE is added to the PPO loss via the model's get_aux_loss() hook and logged under
+    # losses/<name>. `slice` indexes the 4-d label [grasp(1), hole_gap_xyz(3)]; `coef` weights each head
+    # vs the policy/value losses (labels are input-normalized, so MSE starts ~O(1) and these are
+    # directly comparable). Drop a target (or set coef 0) to ablate one head.
+    aux_head:
+      label_key: aux_label
+      hidden: 128
+      targets:
+        grasp: { slice: [0, 1], coef: 1.0 }
+        hole:  { slice: [1, 4], coef: 1.0 }
 
     space:
       continuous:

@@ -4,7 +4,7 @@ _An overview for the repo: what this project is, how it's built, what we've foun
 where we stand. For install/run commands see [README.md](README.md); for the running design log see
 the (local) `DECISIONS.md`._
 
-_Last updated: 2026-06-25._
+_Last updated: 2026-06-29._
 
 ---
 
@@ -45,9 +45,10 @@ the policy cannot observe from proprioception, which is precisely what vision sh
   - **Pre-insert tilt injection** (up to ~25°, about the shaft tip) — the upstream orientation error.
   - **Grasp misalignment** (up to **10°**, baked into the grasp, about the **finger pressing axis** —
     the only way a cylinder can tip between flat pads) — unobservable by proprioception.
-  - **Domain randomization:** camera-pose jitter (5 mm eye + 2° roll) and moderate proprio/force
-    observation noise (0.5 mm / 0.5° / larger F/T) on the actor — so the comparison is fair (real
-    proprio is noisy) and the policy survives a real feed. Appearance DR (lights/textures) is deferred.
+  - **Domain randomization:** camera-pose jitter (5 mm eye + 2° roll), moderate proprio/force
+    observation noise (0.5 mm / 0.5° / larger F/T), plus appearance DR for the wrist RGB-D stream
+    (per-env matte materials, dome + directional key light, photometric aug, and D405-style RGB/depth
+    noise). The actor sees the noisy signal; the critic keeps privileged clean state.
   - **Orientation-aware reward:** a multi-keypoint **squashing kernel** (dense, bounded, smooth near
     the goal) + a binary seat bonus + FORGE's success-prediction term.
   - **Success:** centered (<2.5 mm) **and** seated (z within ~0.25× socket depth) **and** aligned
@@ -83,13 +84,46 @@ geometry **strengthens** the vision motivation rather than being a flaw.
 
 ## 4. Results so far
 
-> **2026-06-25 (later) — the env was then hardened; the numbers below are now the *easy* baseline.**
-> After the bug fixes we made the env transfer-valid and realistic: **rigid** wrist camera (no more
-> privileged look-at), grasp misalignment raised to **10°** and corrected to tip about the finger
-> pressing axis, lateral **±8 mm**, camera-pose + proprio/force **domain randomization** on. The
-> 94.5 / 95.5 % below were measured at **5° grasp, a non-physical look-at camera, and no DR** — so they
-> are superseded *again*. The honest state-vs-vision verdict on the hardened env is **pending** (training
-> deferred, not yet launched). See `DECISIONS.md` §12.
+> **2026-06-29 — APPEARANCE DR + final transfer number: vision holds 72.7%.** Added the deferred
+> appearance DR (the sim-to-real piece) onto the hardened env and trained the vision policy there — this
+> is now **the env we quote the final number on**. Four cfg-gated layers: **per-env matte materials**
+> (each env its own colour; screw≈base *within* an env so the policy can't lean on a colour-contrast cue
+> that won't exist on the same-filament real parts), **dome + directional key light** (moving
+> shadows/specular a dome can't give), **per-env photometric aug**, and **D405 sensor noise** (RGB +
+> depth gaussian + dropout holes). `vision_appearance_1` (3000 it, seed 42) finished crash-free.
+>
+> | policy | env | success (512 ep, DR-on) |
+> |---|---|---|
+> | state (proprio) | hardened | 66.2% |
+> | vision | hardened (no appearance DR) | 75.6% |
+> | **vision** | **+ appearance DR (final env), best ckpt ep3000** | **72.7%** |
+>
+> **72.7% still beats state 66.2% (+6.5 pp)** and is the **flattest across grasp tilt yet** (67–77% over
+> *every* bin incl. 72% past 25°) — the camera reading the unobservable tilt. The −3 pp vs the old 75.6%
+> is the appearance-DR/sensor-noise **robustness tax**, paid on purpose (north star = transfer, not sim %).
+> **Eval kept climbing** 64.6%(ep1000)→66.4%(ep2000)→72.7%(ep3000), so the full 3000 it was justified for the
+> deliverable (the *training*-success plateau ~ep1500 was a red herring — exploration variance); use short
+> ~1500-it runs only for architecture *screening*, then retrain the winner long. NB `Forge.pth` (best by
+> reward, ep2700, 70.7%) ≠ best by success (ep3000). See `DECISIONS.md` §14, renders in `renders/appearance_dr/`.
+
+> **2026-06-26 — HARDENED-ENV VERDICT: vision wins.** On the transfer-valid env (rigid wrist cam, grasp
+> **10° about the pressing axis**, **±8 mm**, 25° tilt, camera + proprio/force **DR**), 512-ep eval @1000 it:
+>
+> | policy | @300 it | @1000 it |
+> |---|---|---|
+> | state (proprio) | 58.6% | **66.2%** |
+> | vision (proprio + RGB-D) | 50.2% | **75.6%** |
+> | blank (image zeroed) | **33.8%** | — |
+>
+> **Vision 75.6% > state 66.2% (+9.4 pp)**, flat-robust across all tilt/lateral bins. A **matched-300-it
+> control isolates the image** as the cause: `vision@300 50.2%` vs `blank@300 33.8%` (+16.4 pp, **same net +
+> budget, only image on/off**) — so it's the image content, not the architecture. (The hybrid net is slow
+> to train — both vision and blank trail the lean state net at 300 it, then vision overtakes by 1000 — which
+> is why blank's number is low: undertraining, not a proprio ceiling.) Unlike the 5° **"tie" below** — now
+> the *easy, superseded* baseline (5° grasp, non-physical look-at cam, no DR) — at realistic grasp error the
+> camera earns its keep. Absolutes are lower than 95% because DR + 10° + rigid cam is much harder (and
+> correctly so; see the realistic target). See `DECISIONS.md` §13. This result motivated the appearance-DR
+> transfer run summarized above.
 
 > **2026-06-25 — two sim bugs invalidated all earlier results.** A wrist-POV rollout review revealed
 > the screw was never properly gripped and the base slid on the table. After fixing both, **every
@@ -125,12 +159,11 @@ current 5° grasp misalignment there's simply no headroom left for vision to add
 a firm grasp already absorbs a 5° in-jaw tilt. The unobservable error vision was built to handle is, at
 5°, too small to matter.
 
-**What this means / next.** The decision-relevant question is now whether vision helps at the *realistic*
-grasp uncertainty (~10°, vs the 5° we trained at): re-run the state-vs-vision pair at
-`grasp_misalign_max_deg = 10` (and maybe 15). If proprioception *drops* while vision *holds*, the camera
-is genuinely needed; if both stay ~95%, the blind policy suffices. This directly answers "do we need
-vision at all," and takes priority over fusion micro-tuning (the earlier "fusion is the bottleneck"
-hypothesis was wrong — the broken env was).
+**What this meant / what happened next.** The decision-relevant question was whether vision helps at the
+*realistic* grasp uncertainty (~10°, vs the 5° easy baseline). That test is now done in the hardened env:
+proprioception dropped to **66.2%** while vision reached **75.6%**, then vision held **72.7%** after
+appearance DR. So the camera is genuinely needed under the realistic transfer-targeted assumptions; the
+earlier "fusion is the bottleneck" hypothesis was wrong — the broken env was.
 
 <details><summary><b>Superseded (broken-env) results, for history</b></summary>
 
@@ -190,25 +223,26 @@ the env bugs, not fusion.
 
 ## 7. Current status & next steps
 
-**Status:** the **honest test environment is built and verified** (rigid 45° wrist cam, grasp tilt about
-the pressing axis at 10°, ±8 mm lateral, 25° pre-insert tilt, camera-pose + proprio/force DR — see
-`DECISIONS.md` §12). It supersedes the earlier setup that gave the 94.5 / 95.5 % tie (that ran at 5° with
-a non-physical look-at camera and no DR). **Training on the hardened env is deferred (not yet launched)**;
-nothing is committed. The question to answer next is the decision-relevant one: *is vision actually needed*
-once the grasp error is realistic, the camera is honest, and proprioception is noisy?
+**Status (2026-06-29):** Plan A step 1 is **done** — appearance DR built and the vision policy trained on
+it (`vision_appearance_1`, 3000 it, crash-free) and eval'd to **72.7%** on the full transfer env, **still
+beating state 66.2% (+6.5 pp)** and the flattest across grasp tilt yet. This is the **final transfer-targeted
+env** and the current best deliverable is `vision_appearance_1/nn/last_Forge_ep_3000` (eval climbed through
+ep3000; `Forge.pth` best-by-reward is ep2700/70.7%, slightly behind). (Earlier: the 2026-06-26 hardened-env
+verdict `vision 75.6%` vs `state 66.2%` — pre-appearance-DR; and the superseded 94.5/95.5% "tie" at the easy
+5° baseline.) Deliverable runs warrant ~3000 it (eval kept improving); use **~1500 it only for architecture
+screening**, then retrain the winner long.
 
-**Immediate next steps (in order):**
-1. **Launch the batched run** (deferred pending go-ahead): `state_hardened_1` (128 envs) →
-   `vision_hardened_1` (64 envs), **1000 iterations**, fresh names so the watchdog doesn't resume the old
-   look-at checkpoints. One overnight chain.
-2. **Eval 512-ep on the hardened env** → the honest verdict. If proprioception drops while vision holds →
-   vision is genuinely needed; if both stay high → the blind policy suffices.
-3. **Branch on the verdict:** vision wins → add **appearance DR** (lights/textures) for the sim-to-real
-   push, then the ablation matrix (state / +vision / +force / +vision+force); tie/state wins → reconsider
-   whether the camera earns its keep before investing further in vision.
+**Immediate next steps (see `PLANNING.md` for the full week plan + schedule):**
+1. **Push the sim % (architecture) — lead with an auxiliary head** predicting the held/grasp pose from the
+   image (forces the CNN to encode the unobservable grasp tilt, may speed convergence), then fc_size sweep /
+   frame-stack / force-tactile fusion. Tuned on *this* final env.
+2. **Generalization** — multi-socket is already live; bring in **pb_parts** (second, non-cylindrical part)
+   so the policy isn't cooling_screw-only. Interleave with (1) to keep the single GPU busy.
+3. **Sim-to-real (gripper-gated):** KUKA iiwa + custom parallel-gripper swap (re-derive grasp offset *and*
+   camera mount azimuth), mount the real D405, retrain on the new-gripper env, deploy/fine-tune. Install
+   final Isaac Sim 4.5.0 first. The gripper file may arrive early next week → it preempts the GPU queue.
 
-**Then:** KUKA iiwa + custom parallel-gripper swap (once the gripper is built — the grasp offset *and* the
-camera mount azimuth will be re-derived for it); sim-to-real transfer; final Isaac Sim 4.5.0 install.
+*Optional rigor (engineering, so nice-to-have): a 2nd training seed of vision.*
 
 ---
 

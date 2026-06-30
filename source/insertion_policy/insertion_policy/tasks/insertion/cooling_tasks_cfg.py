@@ -222,12 +222,68 @@ class ForgeTaskCoolingInsertCameraCfg(ForgeTaskCoolingInsertCfg):
     # rigid-mount look-at toward the fixed aim point it also tilts the optical axis slightly, so it is
     # a combined position+angle mount perturbation. ON (5mm) for the hardened realistic batch.
     # Dynamics DR (friction, mass, dead-zone) is already active via Forge's EventCfg; appearance DR
-    # (per-env lights / textures) needs per-env lights + GPU iteration and is a later sim-to-real pass.
+    # (scene materials/lighting + per-env photometric aug + camera sensor noise) is the block below.
     cam_pos_jitter: float = 0.005
     # Per-episode camera ROLL jitter about the optical axis (deg, stddev), sampled at reset. Models
     # mount/bracket roll-calibration error on top of the rigid mount. Small -- the mount is rigid, this
     # is just realistic uncertainty (NOT the old world-up roll artifact, which has been removed).
     cam_rot_jitter_deg: float = 2.0
+
+    # --- Appearance domain randomization (sim-to-real for the wrist RGB-D) -----------------------
+    # FOUR complementary layers, all default-ON, each a no-op when its knob is 0/empty (so the
+    # state-obs task and the deterministic render scripts are unaffected). Expect the absolute sim
+    # success % to DROP vs the no-appearance-DR run -- that is correct; we are buying transfer, not a
+    # higher sim number. See InsertionEnv._randomize_appearance / _get_camera_image.
+
+    # (1) SCENE-MATERIAL DR (PER-ENV, matte). Parts are matte 3D-printed plastic -> albedo (colour) is
+    # the dominant material cue and the real filament colour is only a GUESS. EACH env gets its own
+    # material (colours vary WITHIN a batch). Per env we draw ONE scene colour (base +/- color_jitter),
+    # then screw and base = that colour +/- a SMALL part_color_jitter: usually similar (matching reality
+    # -- same filament => no screw-vs-base colour contrast to exploit), occasionally diverging (robust).
+    # Geometry-correct specular/shading under the moving wrist light -- which the image aug can't fake.
+    # Fail-safe: self-disables on any USD error (can't kill a run). See _setup_part_materials.
+    randomize_part_materials: bool = True
+    material_base_color: tuple = (0.33, 0.33, 0.40)  # darker centre -> richer/less-washed colours (was 0.45/0.5 = pale)
+    material_color_jitter: float = 0.25             # per-env scene-colour half-range (the between-env DR)
+    material_part_color_jitter: float = 0.05        # screw-vs-base divergence within an env (small => usually same)
+    material_roughness_range: tuple = (0.55, 0.95)  # matte 3D-printed plastic (high roughness -> diffuse colour dominates, less white specular)
+    material_metallic: float = 0.0
+
+    # (2) SCENE-LIGHTING DR: a DOME (soft ambient fill: intensity + colour) PLUS a directional KEY light
+    # (DistantLight) whose DIRECTION is re-pointed per reset (random azimuth, elevation off straight-down)
+    # -> the moving shadows/specular highlights a dome alone can't give (the real cell has a directional
+    # source). Distant = parallel/infinite, so it lights every env identically (no per-env brightness
+    # confound a positioned point light would add). Distance/falloff intentionally omitted (negligible
+    # over a ~10cm workspace). See _setup_key_light / _randomize_scene_light.
+    light_intensity_range: tuple = (700.0, 2500.0)   # dome ambient lux (dome+key stack; keep combined ~ original 2000)
+    light_color_jitter: float = 0.12                 # dome +/- per-RGB-channel about the 0.75 grey baseline
+    key_light_intensity_range: tuple = (700.0, 2500.0)  # directional key lux
+    key_light_elev_range_deg: tuple = (15.0, 60.0)   # key direction: tilt off straight-down (deg)
+    key_light_angle: float = 1.0                     # angular size (deg) -> shadow softness
+
+    # (3) PER-ENV PHOTOMETRIC IMAGE AUG (resampled per episode PER ENV; applied every step). Gives the
+    # within-batch appearance diversity a single global light/material can't. Pure GPU tensor ops (no
+    # USD/instancing risk). NOTE the env re-centres each image (rgb - per-channel mean), which already
+    # grants brightness-invariance, so we lean on terms that SURVIVE that: contrast, gamma, per-channel
+    # gain (white balance); brightness is applied BEFORE gamma so it survives nonlinearly. Half-ranges.
+    photo_brightness: float = 0.06  # additive exposure shift (pre-gamma), +/- this in [0,1] units
+    photo_contrast: float = 0.25    # contrast gain in [1-this, 1+this] about the per-channel mean
+    photo_gain_rgb: float = 0.12    # independent per-channel gain in [1-this, 1+this] (white balance)
+    photo_gamma: float = 0.3        # tone-curve gamma in [1-this, 1+this]
+
+    # (4) CAMERA SENSOR NOISE (every step), modelling the real D405: gaussian RGB noise; gaussian depth
+    # range noise (metres, applied to real returns only) + per-pixel depth DROPOUT (no-return holes ->
+    # 0, like a real depth sensor). Keeps the blank-image control truly blank (added after that branch).
+    rgb_noise_std: float = 0.02     # stddev on the [0,1] RGB image
+    depth_noise_std: float = 0.002  # metres (2mm) on real depth returns, before far-clip normalisation
+    depth_dropout_prob: float = 0.02  # fraction of depth pixels zeroed (sensor holes)
+
+    # (5) TRAINING IMAGE GALLERY (observability, not DR): every cam_log_interval camera reads, dump a
+    # tiled montage (all envs) of exactly what the policy SEES to cam_log_dir -> watch framing / DR
+    # aggressiveness / occlusion DURING an 8h run without a second GPU job. 0 disables. renders/ is
+    # gitignored. (For rollout BEHAVIOUR video, use train.py --video; see auto_resume_train.sh VIDEO=1.)
+    cam_log_interval: int = 2000    # camera reads between montage dumps (~15 it at 64 envs); 0 = off
+    cam_log_dir: str = "renders/train_cam"
 
     def __post_init__(self):
         # Keep Fabric ENABLED (GPU PhysX is stable on Fabric; disabling it caused CUDA-700 crashes /

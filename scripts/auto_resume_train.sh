@@ -37,6 +37,21 @@ if [ -n "$EXPERIENCE" ]; then
   EXPERIENCE_ARGS=(--experience "$EXPERIENCE")
 fi
 
+# Optional rollout-video recording (gym RecordVideo). VIDEO=1 records a third-person clip every
+# VIDEO_INTERVAL steps (VIDEO_LENGTH long) to logs/rl_games/Forge/<name>/videos/train. Complements the
+# in-env wrist gallery (env.cam_log_interval): that shows what the camera SEES, this shows BEHAVIOUR.
+VIDEO_ARGS=()
+if [ "${VIDEO:-0}" = "1" ]; then
+  VIDEO_ARGS=(--video --video_interval "${VIDEO_INTERVAL:-20000}" --video_length "${VIDEO_LENGTH:-200}")
+fi
+
+# Optional fixed RNG seed (reproducibility for the number you'll quote + a clean 2nd-seed comparison).
+# Shared across all resume attempts so a mid-run watchdog restart doesn't re-roll the seed.
+SEED_ARGS=()
+if [ -n "${SEED_RNG:-}" ]; then
+  SEED_ARGS=(--seed "$SEED_RNG")
+fi
+
 log "=== auto-resume start: name=$NAME task=$TASK envs=$ENVS max=$MAX seed=${SEED:-none} experience=${EXPERIENCE:-default} ==="
 for attempt in $(seq 1 "$MAX_ATTEMPTS"); do
   # pick the newest checkpoint to resume from (own run first, else the seed on attempt 1)
@@ -49,7 +64,8 @@ for attempt in $(seq 1 "$MAX_ATTEMPTS"); do
   # epoch 1 and is re-paid on every resume (SIGKILL never warms the cache) — it broke the watchdog
   # (killed mid-compile every attempt). Eager mode is a bit slower but starts fast and deterministically.
   OMNI_KIT_ACCEPT_EULA=YES TORCHDYNAMO_DISABLE=1 PYTHONUNBUFFERED=1 "$PY" scripts/train.py --task "$TASK" \
-    --num_envs "$ENVS" --headless --enable_cameras "${EXPERIENCE_ARGS[@]}" --max_iterations "$MAX" \
+    --num_envs "$ENVS" --headless --enable_cameras "${EXPERIENCE_ARGS[@]}" "${VIDEO_ARGS[@]}" \
+    "${SEED_ARGS[@]}" --max_iterations "$MAX" \
     agent.params.config.full_experiment_name="$NAME" $RESUME $EXTRA > "$LOG" 2>&1 &
   TPID=$!
   log "launched train pid $TPID"

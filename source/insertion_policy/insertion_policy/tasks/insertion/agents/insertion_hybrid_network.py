@@ -54,12 +54,21 @@ class InsertionHybridBuilder(A2CBuilder):
                     f"got input_shape={input_shape!r}"
                 )
 
-            # The image is the rank-3 (H, W, C) group; everything else is a flat proprio vector.
+            # Auxiliary-head config (optional). The labels for the aux heads ride in their own obs group
+            # (`label_key`); it is privileged (the actor-unobservable grasp tilt + true hole gap), so it
+            # is EXCLUDED from the policy input below and consumed only by the supervised aux loss.
+            aux_cfg = params.get("aux_head")
+            self._aux_label_key = (aux_cfg or {}).get("label_key")
+
+            # The image is the rank-3 (H, W, C) group; everything else is a flat proprio vector (minus
+            # the privileged aux-label group, which is never fed to the policy).
             # (Plain attributes only here -- nn.Module is not initialized until super().__init__.)
             self._image_key = None
             image_chw = None
             proprio_dim = 0
             for key, shape in input_shape.items():
+                if key == self._aux_label_key:
+                    continue  # privileged aux label: excluded from the policy input
                 if len(shape) == 3:
                     self._image_key = key
                     image_chw = (int(shape[2]), int(shape[0]), int(shape[1]))  # HWC -> CHW
@@ -86,6 +95,7 @@ class InsertionHybridBuilder(A2CBuilder):
             # parent does not build its own CNN, and pass the fused feature dim as the input shape.
             parent_params = copy.deepcopy(params)
             parent_params.pop("cnn", None)
+            parent_params.pop("aux_head", None)
             parent_kwargs = dict(kwargs)
             parent_kwargs["input_shape"] = (self._proj_dim + proprio_dim,)
             super().__init__(parent_params, **parent_kwargs)
@@ -97,6 +107,25 @@ class InsertionHybridBuilder(A2CBuilder):
             else:
                 self._image_cnn = None
                 self._image_proj = None
+
+            # Auxiliary supervised heads hang off the 128-d projected CNN features, so the aux gradient
+            # flows ONLY into the image encoder (CNN + projection) -- forcing it to represent each cue --
+            # and never into the proprio/LSTM/actor path. Each target is a small MLP regressor; its MSE
+            # against the matching slice of the privileged label is returned by get_aux_loss() and added
+            # to the PPO loss by the agent (rl_games' built-in model.get_aux_loss() hook).
+            self._aux_loss = None
+            self._aux_heads = None
+            self._aux_spec = {}  # name -> (lo, hi, coef)
+            if self._image_key is not None and aux_cfg:
+                hidden = int(aux_cfg.get("hidden", 128))
+                heads = {}
+                for name, spec in (aux_cfg.get("targets") or {}).items():
+                    lo, hi = int(spec["slice"][0]), int(spec["slice"][1])
+                    heads[name] = nn.Sequential(
+                        nn.Linear(self._proj_dim, hidden), nn.ReLU(), nn.Linear(hidden, hi - lo)
+                    )
+                    self._aux_spec[name] = (lo, hi, float(spec.get("coef", 1.0)))
+                self._aux_heads = nn.ModuleDict(heads)
 
         @staticmethod
         def _make_cnn(in_channels, convs):
@@ -112,16 +141,37 @@ class InsertionHybridBuilder(A2CBuilder):
 
         def forward(self, obs_dict):
             obs = obs_dict["obs"]
-            # Concatenate proprio groups (everything that is not the image), preserving dict order.
-            proprio = [v for k, v in obs.items() if k != self._image_key]
+            # Concatenate proprio groups (everything that is neither the image nor the privileged aux
+            # label), preserving dict order.
+            proprio = [v for k, v in obs.items() if k != self._image_key and k != self._aux_label_key]
             feat = torch.cat(proprio, dim=1) if proprio else None
+            self._aux_loss = None
             if self._image_cnn is not None:
                 img = obs[self._image_key].permute(0, 3, 1, 2).contiguous()  # BHWC -> BCHW
                 cnn_feat = self._image_proj(self._image_cnn(img).flatten(1))  # 3136 -> proj_dim
+                # Compute the aux loss only on training forwards (skipped during rollout/eval, where the
+                # heads are unused) and only when the privileged label is present.
+                if self.training and self._aux_heads is not None and self._aux_label_key in obs:
+                    self._aux_loss = self._compute_aux_loss(cnn_feat, obs[self._aux_label_key])
                 feat = cnn_feat if feat is None else torch.cat([cnn_feat, feat], dim=1)
             fused = dict(obs_dict)
             fused["obs"] = feat
             return super().forward(fused)
+
+        def _compute_aux_loss(self, cnn_feat, label):
+            # float32 for the regression (cnn_feat may be bf16 under autocast). Per-target MEAN MSE so a
+            # 3-d head (hole) and a 1-d head (grasp) contribute on the same scale before their coef.
+            feat = cnn_feat.float()
+            label = label.float()
+            return {
+                name: coef * torch.nn.functional.mse_loss(self._aux_heads[name](feat), label[:, lo:hi])
+                for name, (lo, hi, coef) in self._aux_spec.items()
+            }
+
+        def get_aux_loss(self):
+            # rl_games' A2CAgent.calc_gradients adds each value of this dict to the PPO loss and logs it
+            # under losses/<key>. None => no aux loss (e.g. the central-value network, or rollout/eval).
+            return self._aux_loss
 
 
 model_builder.register_network("insertion_hybrid", InsertionHybridBuilder)

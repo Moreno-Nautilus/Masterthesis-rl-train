@@ -36,6 +36,7 @@ _build
 .lastformat
 
 /DECISIONS.md
+/PLANNING.md
 *.mp4
 *.png
 *.log

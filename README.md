@@ -37,10 +37,22 @@ pose-uncertainty), trained with **PPO (RL-Games)**.
   azimuth so the grasp tilt isn't foreshortened), grasp misalignment raised to **10°** and corrected to
   tip about the **finger pressing axis**, lateral **±8 mm**, plus camera-pose + moderate proprio/force
   **domain randomization** (a fair comparison needs noisy proprio too). See `DECISIONS.md` §12.
-- 🔄 Now: **training on the hardened env is deferred (not yet launched)**, nothing committed. Next: launch
-  `state_hardened_1` → `vision_hardened_1` (1000 it, fresh names), then 512-ep eval = the honest
-  *is-the-camera-needed* verdict. Then (if vision wins) appearance DR + sim-to-real; then the
-  Franka → iiwa 7 + parallel-gripper swap (re-tunes the grasp offset *and* the camera mount).
+- ✅ **Hardened-env verdict (2026-06-26): vision wins.** 512-ep eval @1000 it: **state 66.2% vs vision
+  75.6% (+9.4 pp)**, vision flat-robust across tilt/lateral. A matched-300-it control isolates the **image**
+  as the cause (`vision@300 50.2%` vs image-zeroed `blank@300 33.8%`, same net + budget). At realistic grasp
+  error (10° about the pressing axis) + rigid cam + DR the camera earns its keep → **vision is the
+  deliverable**. (Absolutes are below the old 95% because the env is much harder now — by design.)
+- ✅ **Appearance DR + final transfer number (2026-06-29):** added the sim-to-real appearance DR — **per-env
+  matte materials** (each env its own colour; screw≈base *within* an env so the policy can't lean on a
+  colour-contrast cue absent on the same-filament real parts), **dome + directional key light**, **per-env
+  photometric aug**, and **D405 sensor noise** (RGB + depth gaussian + dropout). Trained `vision_appearance_1`
+  (3000 it, seed 42, crash-free). 512-ep eval, DR-on: **vision 72.7%** (best ckpt ep3000) — **still beats
+  state 66.2% (+6.5 pp)** and the flattest across grasp tilt yet (67–77% over every bin incl. >25°). The −3 pp
+  vs the old 75.6% is the robustness tax (more DR = harder, by design). Eval kept climbing through ep3000
+  (64.6→66.4→72.7) so the full run was justified. See `DECISIONS.md` §14, renders in `renders/appearance_dr/`.
+  Best deliverable: `vision_appearance_1/nn/last_Forge_ep_3000` (NB `Forge.pth` = best-by-*reward* ep2700, 70.7%).
+- 🔄 Next (see `PLANNING.md`): **push %** — auxiliary grasp-pose head, fc_size sweep, frame-stack, force
+  fusion — interleaved with **generalization** (pb_parts); then the iiwa 7 + custom-gripper swap + sim-to-real.
 
 > **Parts note:** the cooling parts are chamfer-free 3D-printed test parts (12 mm shaft into a 14 mm
 > socket, 1 mm clearance). Precise lateral alignment — not chamfer-funneling — is the binding
@@ -108,10 +120,13 @@ OMNI_KIT_ACCEPT_EULA=YES python scripts/train.py \
 
 # Vision policy (wrist RGB-D + CNN). NOTE: requires --enable_cameras; run at 64 envs (128 = PhysX crash).
 # For any unattended run prefer the watchdog (auto --experience + auto-resume through crashes):
-setsid bash scripts/auto_resume_train.sh my_vision_run \
-  Isaac-Insertion-CoolingPeg-Vision-Direct-v0 64 1000 >my_vision_run.log 2>&1 &
-# Realistic ranges (grasp 10°, ±8 mm, 25° tilt) + DR are now the cfg DEFAULTS (see DECISIONS.md §12);
-# override per-run via EXTRA_OVERRIDES, e.g. EXTRA_OVERRIDES="env.cam_pos_jitter=0.0 env.cam_rot_jitter_deg=0.0"
+SEED_RNG=42 setsid bash scripts/auto_resume_train.sh my_vision_run \
+  Isaac-Insertion-CoolingPeg-Vision-Direct-v0 64 1800 >my_vision_run.log 2>&1 &
+# Realistic ranges (grasp 10°, ±8 mm, 25° tilt) + camera/proprio DR + APPEARANCE DR (per-env materials,
+# directional light, D405 sensor noise; see DECISIONS.md §12+§14) are now the cfg DEFAULTS. Override per-run
+# via EXTRA_OVERRIDES, e.g. EXTRA_OVERRIDES="env.cam_pos_jitter=0.0 env.randomize_part_materials=false".
+# Watch what the policy SEES: renders/train_cam/ (periodic gallery, on by default). Add VIDEO=1 for rollout
+# clips in logs/.../videos/train/. SEED_RNG pins the RNG for reproducibility.
 
 # Evaluate (add --enable_cameras for the vision task)
 OMNI_KIT_ACCEPT_EULA=YES python scripts/eval_policy.py \
@@ -120,8 +135,11 @@ OMNI_KIT_ACCEPT_EULA=YES python scripts/eval_policy.py \
 ```
 
 Logs/checkpoints land in `logs/rl_games/Forge/<run>/` (`nn/Forge.pth` = best by mean reward). On the
-old easy env runs plateaued by ~200–300 it; the hardened env (10° grasp + DR + obs noise) is harder, so
-use **~1000 it**. Eval writes a timestamped report next to the checkpoint.
+old easy env runs plateaued by ~200–300 it; on the full hardened + appearance-DR env eval success kept
+climbing through **~3000 it** (`vision_appearance_1`: 64.6→72.7% from ep1000→3000 — the *training*-success
+plateau ~ep1500 was misleading), so deliverable runs warrant ~3000; use **~1500 it only for architecture
+screening**, then retrain the winner long. Eval writes a timestamped report next to the checkpoint, and
+`Forge.pth` is best-by-*reward* (not always best-by-success — eval the last few checkpoints).
 
 > **Vision/GPU note:** the vision task keeps PhysX on Fabric (GPU-stable) but routes only the
 > camera's pose view to the USD path, working around a missing `usdrt.hierarchy` in this Isaac Sim
@@ -136,4 +154,4 @@ pre-commit run --all-files
 
 ---
 
-_README last updated: 2026-06-25._
+_README last updated: 2026-06-29._
