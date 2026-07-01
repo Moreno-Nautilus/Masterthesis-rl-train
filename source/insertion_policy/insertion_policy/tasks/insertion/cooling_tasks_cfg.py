@@ -153,6 +153,20 @@ class ForgeTaskCoolingInsertCfg(ForgeEnvCfg):
     # pose-estimation/table-height/calibration error.
     fixed_asset_pos_obs_noise_bound: list = [0.008, 0.008, 0.002]
 
+    # --- 6-axis F/T: expose the CONTACT TORQUE channels in the policy obs ---------------------
+    # Forge already feeds the 3-axis contact FORCE (`ft_force` = noisy `force_sensor_smooth[:,0:3]`)
+    # into the policy, but the matching 3 TORQUE channels (`force_sensor_smooth[:,3:6]`, the contact
+    # MOMENT a tilted shaft makes in the hole) are computed by the base env and left UNUSED. Turning
+    # this on appends the (noisy) torque triplet to the policy proprio vector -> 24-d becomes 27-d,
+    # giving the policy the 6-axis wrench. The hybrid net auto-infers the wider proprio from the obs
+    # space (no net change); the aux-label group is untouched. Toggle so it screens cleanly on/off.
+    use_torque_obs: bool = False
+    # Gaussian obs noise (stddev) on the torque channels, mirroring Forge's `obs_rand.ft_force` on the
+    # force channels. Kept a SEPARATE knob because torque (N*m) and force (N) have different units and
+    # magnitudes -- coupling them 1:1 could swamp the (small) torque signal. Default matches the bumped
+    # force noise (2.0); re-tune once the smoke prints the realized force-vs-torque magnitudes.
+    torque_obs_noise: float = 2.0
+
 
 @configclass
 class ForgeTaskCoolingInsertCameraCfg(ForgeTaskCoolingInsertCfg):
@@ -168,7 +182,14 @@ class ForgeTaskCoolingInsertCameraCfg(ForgeTaskCoolingInsertCfg):
     # RGB (3) + depth (1), stacked in InsertionEnv._get_camera_image. Render is ~2x slower than 64px.
     image_height: int = 160
     image_width: int = 160
-    image_channels: int = 4
+    image_channels: int = 4  # per-FRAME channels: RGB (3) + depth (1)
+    # Temporal frame-stack: stack the last N wrist frames along the channel axis (env-side ring buffer)
+    # so the CNN sees intra-observation MOTION (approach speed, contact-onset dynamics) the single frame
+    # lacks -- complements the LSTM's cross-step memory. 1 = OFF (current single-frame behaviour); N>1
+    # feeds the CNN 4*N channels (its first conv auto-adapts from the widened image obs space, no net
+    # change). The buffer is cleared per-episode at reset so no frames bleed across episodes. Toggle so
+    # it screens on/off; N=2-3 is the intended range. Note: N*image memory -- may need fewer envs @224px.
+    frame_stack: int = 1
     # Stage-1 debug: dump a rendered RGB/depth frame to disk to sanity-check the mount pose.
     write_image_to_file: bool = False
     # Ablation: feed the policy a BLANK (zeroed) image instead of the rendered one. Same network +

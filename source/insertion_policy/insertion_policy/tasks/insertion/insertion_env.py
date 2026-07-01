@@ -93,13 +93,32 @@ class InsertionEnv(ForgeEnv):
         self._light_dr_failed = False
         super().__init__(cfg, render_mode, **kwargs)
 
+        # 6-axis F/T: widen the policy proprio by the 3 torque channels (see _get_observations). Done
+        # here (post-super, so the base 24-d policy space already exists) by rebuilding the "policy"
+        # Box; the batched observation_space is regenerated to match. The hybrid/state nets infer the
+        # new proprio width from this space, so no net change is needed. Applies to both state + vision.
+        if getattr(self.cfg, "use_torque_obs", False):
+            base_dim = int(self.single_observation_space["policy"].shape[0])
+            self.single_observation_space["policy"] = gym.spaces.Box(
+                low=-float("inf"), high=float("inf"), shape=(base_dim + 3,)
+            )
+            self.observation_space = gym.vector.utils.batch_space(
+                self.single_observation_space["policy"], self.num_envs
+            )
+
         # Vision variant: a wrist RGB-D camera adds an "image" observation group alongside Forge's
         # "policy" (proprio) and "critic" (state) groups. The rl_games wrapper consumes it via
         # obs_groups={"obs": ["policy", "image"], "states": ["critic"]} + concate_obs_groups=False.
         self._has_camera = getattr(self.cfg, "tiled_camera", None) is not None
         if self._has_camera:
             h, w, c = self.cfg.image_height, self.cfg.image_width, self.cfg.image_channels
-            self.single_observation_space["image"] = gym.spaces.Box(low=0.0, high=1.0, shape=(h, w, c))
+            # Temporal frame-stack: the OBSERVED image has c*frame_stack channels (last N frames stacked
+            # on the channel axis; see _get_camera_image / _stack_frames). N=1 => single frame (default).
+            self._frame_stack = max(1, int(getattr(self.cfg, "frame_stack", 1) or 1))
+            self._frame_hist = None  # lazy (num_envs, N, H, W, c) ring buffer, filled on first render
+            self._frame_reset_mask = torch.zeros(self.num_envs, dtype=torch.bool, device=self.device)
+            obs_c = c * self._frame_stack
+            self.single_observation_space["image"] = gym.spaces.Box(low=0.0, high=1.0, shape=(h, w, obs_c))
             # Privileged labels for the auxiliary vision heads (actor-UNOBSERVABLE; never fed to the
             # policy): signed grasp tilt (1) + true shaft-tip->socket-opening gap in the fingertip frame
             # (3). Routed to the policy net as its own obs group and sliced out there for the aux loss.
@@ -325,6 +344,10 @@ class InsertionEnv(ForgeEnv):
                 )
             # Appearance DR: per-env photometric params + global scene material/light randomization.
             self._randomize_appearance(env_ids)
+            # Temporal frame-stack: flag these envs so their frame history is reset to the new episode's
+            # first frame (no cross-episode motion bleed); consumed in the next _get_camera_image.
+            if getattr(self, "_frame_stack", 1) > 1:
+                self._frame_reset_mask[env_ids] = True
 
     def get_handheld_asset_relative_pose(self):
         """Grip the screw HEAD between the fingerpads, then add the rotational grasp misalignment.
@@ -740,6 +763,15 @@ class InsertionEnv(ForgeEnv):
     # --- observations (adds the RGB-D image group for the vision variant) -------------------
     def _get_observations(self):
         obs = super()._get_observations()  # {"policy": proprio, "critic": state}
+        if getattr(self.cfg, "use_torque_obs", False):
+            # 6-axis F/T: the base env already put the 3-axis contact FORCE in the policy obs
+            # (`ft_force`); append the matching 3 TORQUE channels (`force_sensor_smooth[:,3:6]`, the
+            # contact moment of a tilted shaft), with obs noise mirroring Forge's force-channel noise.
+            # Appended at the END of the proprio vector -> policy 24-d becomes 27-d. The critic keeps
+            # the clean privileged state; the aux-label group is a separate obs group, untouched.
+            torque = self.force_sensor_smooth[:, 3:6]
+            noisy_torque = torque + self.cfg.torque_obs_noise * torch.randn_like(torque)
+            obs["policy"] = torch.cat([obs["policy"], noisy_torque], dim=-1)
         if getattr(self, "_has_camera", False):
             obs["image"] = self._get_camera_image()
             obs["aux_label"] = self._get_aux_label()
@@ -777,9 +809,10 @@ class InsertionEnv(ForgeEnv):
         """
         if getattr(self.cfg, "blank_image", False):
             # Ablation: zeroed image (camera still renders; the policy just gets no visual signal).
-            # Returned BEFORE any DR so the blank control stays exactly blank.
+            # Returned BEFORE any DR so the blank control stays exactly blank. Channels include the
+            # frame-stack (stacked zeros are still zeros) so the shape matches the widened obs space.
             h, w, c = self.cfg.image_height, self.cfg.image_width, self.cfg.image_channels
-            return torch.zeros((self.num_envs, h, w, c), device=self.device)
+            return torch.zeros((self.num_envs, h, w, c * getattr(self, "_frame_stack", 1)), device=self.device)
 
         out = self._tiled_camera.data.output
         cfg = self.cfg
@@ -836,4 +869,29 @@ class InsertionEnv(ForgeEnv):
                                     f"{d}/depth_{tag}.png")
             self._cam_log_counter += 1
 
-        return torch.cat([rgb, depth], dim=-1)
+        frame = torch.cat([rgb, depth], dim=-1)  # (num_envs, H, W, c) -- this timestep's processed frame
+        return self._stack_frames(frame)
+
+    def _stack_frames(self, frame):
+        """Temporal frame-stack: return the last N processed frames stacked on the channel axis.
+
+        Keeps a per-env ring buffer of the FULLY-PROCESSED frames (post DR/normalisation), so the
+        stacked channels carry real motion (approach speed, contact onset) the CNN can read. N=1 is a
+        pass-through. On the first call (or a size change) the buffer is filled with the current frame
+        so there is no zero-pad startup transient; envs flagged at reset get all N slots overwritten
+        with their current frame (no cross-episode bleed). Channel order is oldest -> newest.
+        """
+        n = getattr(self, "_frame_stack", 1)
+        if n <= 1:
+            return frame
+        if self._frame_hist is None or self._frame_hist.shape[0] != frame.shape[0]:
+            self._frame_hist = frame.unsqueeze(1).repeat(1, n, 1, 1, 1)  # (N_env, N, H, W, c)
+        else:
+            self._frame_hist = torch.roll(self._frame_hist, shifts=-1, dims=1)
+            self._frame_hist[:, -1] = frame
+        m = self._frame_reset_mask
+        if bool(m.any()):
+            self._frame_hist[m] = frame[m].unsqueeze(1)  # clear history for just-reset envs
+            self._frame_reset_mask = torch.zeros_like(m)
+        b, h, w, c = frame.shape
+        return self._frame_hist.permute(0, 2, 3, 1, 4).reshape(b, h, w, n * c)

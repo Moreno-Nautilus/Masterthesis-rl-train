@@ -223,26 +223,23 @@ the env bugs, not fusion.
 
 ## 7. Current status & next steps
 
-**Status (2026-06-29):** Plan A step 1 is **done** — appearance DR built and the vision policy trained on
-it (`vision_appearance_1`, 3000 it, crash-free) and eval'd to **72.7%** on the full transfer env, **still
-beating state 66.2% (+6.5 pp)** and the flattest across grasp tilt yet. This is the **final transfer-targeted
-env** and the current best deliverable is `vision_appearance_1/nn/last_Forge_ep_3000` (eval climbed through
-ep3000; `Forge.pth` best-by-reward is ep2700/70.7%, slightly behind). (Earlier: the 2026-06-26 hardened-env
-verdict `vision 75.6%` vs `state 66.2%` — pre-appearance-DR; and the superseded 94.5/95.5% "tie" at the easy
-5° baseline.) Deliverable runs warrant ~3000 it (eval kept improving); use **~1500 it only for architecture
-screening**, then retrain the winner long.
+**Status (2026-07-01):** Deliverable = **72.7%** (`vision_appearance_1/nn/last_Forge_ep_3000`, 160 px, still
+beats state 66.2%). Since then, architecture screening settled two things (DECISIONS §16): **aux heads are a
+dead end** (grasp head unlearnable @160px, hurt −11 pp; hole head neutral) and **higher camera resolution is the
+real lever** — 224 px beat matched 160 px by +3.7 pp with a **+22.6 pp high-tilt** gain (the headroom is
+sensor-limited). So **224 px is the new experimental base** (not yet the deliverable — needs a 224 px run trained
+to 3000 to beat 72.7%). Two sensing/arch leads are now built + smoke-clean (default OFF): **6-axis F/T torque**
+(`env.use_torque_obs`) and **temporal frame-stack** (`env.frame_stack`). Tactile fusion + force history are DEAD
+(custom gripper has no tactile; LSTM handles temporal force).
 
-**Immediate next steps (see `PLANNING.md` for the full week plan + schedule):**
-1. **Push the sim % (architecture) — lead with an auxiliary head** predicting the held/grasp pose from the
-   image (forces the CNN to encode the unobservable grasp tilt, may speed convergence), then fc_size sweep /
-   frame-stack / force-tactile fusion. Tuned on *this* final env.
-2. **Generalization** — multi-socket is already live; bring in **pb_parts** (second, non-cylindrical part)
-   so the policy isn't cooling_screw-only. Interleave with (1) to keep the single GPU busy.
-3. **Sim-to-real (gripper-gated):** KUKA iiwa + custom parallel-gripper swap (re-derive grasp offset *and*
-   camera mount azimuth), mount the real D405, retrain on the new-gripper env, deploy/fine-tune. Install
-   final Isaac Sim 4.5.0 first. The gripper file may arrive early next week → it preempts the GPU queue.
-
-*Optional rigor (engineering, so nice-to-have): a 2nd training seed of vision.*
+**Immediate plan (see `PLANNING.md`):** a 3-day overnight screen sprint (torque@48, 256px@32, frame-stack) driven
+by `scripts/run_chain.sh` (robust unattended train+eval chain), then a **3-week holiday long-run chain** — unified
+at 32 env for comparability, extending the winners to ~3000–4000, then re-running the best at max env for the
+deliverable number. Env counts are memory-probed (`scripts/probe_max_envs.sh`; 24 GB card).
+1. **Push sim % (architecture):** 224 px (won) · torque · frame-stack · 256 px · fusion-dim. (Aux heads dropped.)
+2. **Generalization** — pb_parts (state task built; pb VISION deferred to the gripper swap). Only once maxed.
+3. **Sim-to-real (gripper-gated = the goal):** KUKA iiwa + custom-gripper swap (re-derive grasp offset + cam
+   azimuth), mount the real D405, retrain, deploy; install final Isaac Sim 4.5.0. Gripper file preempts the GPU.
 
 ---
 
@@ -259,7 +256,11 @@ source/insertion_policy/insertion_policy/tasks/insertion/
 scripts/
   train.py, eval_policy.py, plot_training.py   # train / evaluate / plot
   check_recoverability.py    # geometric chamfer/clearance probe
-  auto_resume_train.sh       # crash-resilient training watchdog
+  auto_resume_train.sh       # crash-resilient training watchdog (MAX_ATTEMPTS env-overridable)
+  eval_robust.sh             # timeout-wrapped multi-eval (Isaac boot/shutdown-hang safe)
+  run_chain.sh + runlist_*.txt  # unattended train+eval CHAIN (auto-advance, restart-safe, extend-aware)
+  probe_max_envs.sh          # per-config max num_envs memory probe (24 GB card)
+  check_torque_obs.py, check_frame_stack.py, check_aux_labels.py  # feature smokes
   convert_assets.py, smoke_env.py, ...         # assets + sanity tools
 logs/rl_games/Forge/<run>/   # checkpoints (nn/), TensorBoard (summaries/), curves, eval reports
 ```

@@ -22,7 +22,7 @@ LOG="/tmp/${NAME}.log"              # current attempt's stdout (overwritten each
 MASTER="/tmp/${NAME}_master.log"    # watchdog audit trail (persists)
 STALL=600                           # seconds with no new epoch (while training) => treat as a hang
 BOOT_GRACE=1200                     # seconds allowed to reach epoch 1 (Isaac boot + first epoch)
-MAX_ATTEMPTS=60
+MAX_ATTEMPTS="${MAX_ATTEMPTS:-60}"  # env-overridable (chain sets it low to fail-fast-test recovery; prod=60)
 
 log(){ echo "[$(date '+%F %T')] $*" >> "$MASTER"; }
 

@@ -127,6 +127,16 @@ SEED_RNG=42 setsid bash scripts/auto_resume_train.sh my_vision_run \
 # via EXTRA_OVERRIDES, e.g. EXTRA_OVERRIDES="env.cam_pos_jitter=0.0 env.randomize_part_materials=false".
 # Watch what the policy SEES: renders/train_cam/ (periodic gallery, on by default). Add VIDEO=1 for rollout
 # clips in logs/.../videos/train/. SEED_RNG pins the RNG for reproducibility.
+#
+# Sensing/arch toggles (default OFF; add to EXTRA_OVERRIDES). Memory is 24 GB-bound -> use the PROBED env
+# counts (scripts/probe_max_envs.sh): 160px=64, 224px=48, 256px OR 224px+frame_stack=32.
+#   env.image_height/width + env.tiled_camera.width/height=224|256   # camera resolution (224 > 160, DECISIONS §16)
+#   env.use_torque_obs=True                                          # 6-axis F/T: +3 wrist-torque channels (proprio 24->27)
+#   env.frame_stack=3                                                # temporal: stack last N frames (image 4->4N ch)
+#
+# Unattended run CHAINS (train+eval back-to-back, crash/hang-safe, restart-safe): scripts/run_chain.sh <runlist>
+#   setsid bash scripts/run_chain.sh scripts/runlist_week.txt </dev/null >/tmp/chain.log 2>&1 &
+# Runlist row: name | envs | iters | eval_envs | seeds | overrides . Summary -> logs/chain/summary.txt.
 
 # Evaluate (add --enable_cameras for the vision task)
 OMNI_KIT_ACCEPT_EULA=YES python scripts/eval_policy.py \

@@ -1,0 +1,3 @@
+# Wed-night single screen: 6-axis F/T torque @224px/48env/1200it vs res224@48@1200=69.7% (only torque differs).
+# name | envs | iters | eval_envs | seeds | overrides
+vision_torque_1 | 48 | 1200 | 128 | 42 | ~agent.params.network.aux_head agent.params.env.obs_groups.obs=[policy,image] env.image_height=224 env.image_width=224 env.tiled_camera.width=224 env.tiled_camera.height=224 env.use_torque_obs=True

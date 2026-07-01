@@ -1,0 +1,10 @@
+# Wed-Fri screen chain (drives scripts/run_chain.sh). All seed 42, 1200 it (matches res224@48@1200=69.7%
+# and the future H1@32@1200 checkpoint -> clean matched reads). Base 224px no-aux override is repeated per
+# row. torque @48 (memory-free, clean vs res224@48). base32/256/framestk @32 (probe: 256@32=20.3GB safe).
+# name | envs | iters | eval_envs | seeds | overrides
+vision_torque_1   | 48 | 1200 | 128 | 42 | ~agent.params.network.aux_head agent.params.env.obs_groups.obs=[policy,image] env.image_height=224 env.image_width=224 env.tiled_camera.width=224 env.tiled_camera.height=224 env.use_torque_obs=True
+vision_base32_1   | 32 | 1200 | 128 | 42 | ~agent.params.network.aux_head agent.params.env.obs_groups.obs=[policy,image] env.image_height=224 env.image_width=224 env.tiled_camera.width=224 env.tiled_camera.height=224
+vision_res256_1   | 32 | 1200 |  64 | 42 | ~agent.params.network.aux_head agent.params.env.obs_groups.obs=[policy,image] env.image_height=256 env.image_width=256 env.tiled_camera.width=256 env.tiled_camera.height=256
+# frame-stack REMOVED from the week: probe showed it OOMs at 24 AND 32 (full rollout-buffer reshape spike +
+# ~8GB fixed Isaac overhead); only ~16 env fits. Demoted to a to-have-it run at the VERY END of the holiday
+# chain (@16, then @8 fallback) — see runlist_holiday.txt / PLANNING.md. Week screens = torque, 256px, base32.
