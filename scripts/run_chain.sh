@@ -9,8 +9,10 @@
 #                      re-enters that run and auto_resume RESUMES it from its last checkpoint.
 #
 # Usage:  setsid bash scripts/run_chain.sh <runlist_file> </dev/null >/tmp/<chain>.log 2>&1 &
-# Runlist line ('|'-separated, '#' comments + blank lines ok; last field may contain spaces):
-#   name | num_envs | max_iters | eval_envs | eval_seeds | extra_overrides
+# Runlist line ('|'-separated, '#' comments + blank lines ok; overrides field has spaces but no '|'):
+#   name | num_envs | max_iters | eval_envs | eval_seeds | extra_overrides [| train_seed]
+# train_seed is OPTIONAL (7th field); if omitted, uses $SEED_RNG (default 42). Lets one chain mix seeds
+# (e.g. a 2-seed variance check) unattended.
 set -u
 cd /home/moreno/Masterthesis-rl-train
 RUNLIST="${1:?runlist file}"
@@ -25,13 +27,15 @@ log(){ echo "[$(ts)] $*"; }
 free_gpu(){ for gp in $(nvidia-smi --query-compute-apps=pid --format=csv,noheader 2>/dev/null); do kill -9 "$gp" 2>/dev/null; done
   for s in /dev/shm/carb-*; do [ -e "$s" ] || continue; p=$(echo "$s"|grep -oE '[0-9]+$'); kill -0 "$p" 2>/dev/null || rm -f "$s"; done; sleep 8; }
 latest_ckpt(){ ls -t "logs/rl_games/Forge/$1/nn/"last_Forge_ep_[0-9]*_rew_[0-9]*.pth 2>/dev/null | head -1; }
+trim(){ printf '%s' "${1:-}" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//'; }   # quote-safe (xargs choked on apostrophes)
 
 log "=== CHAIN START (list=$RUNLIST) ==="
-while IFS='|' read -r name envs iters evalenvs seeds ov; do
-  name="$(echo "${name:-}" | xargs)"; [ -z "$name" ] && continue
+while IFS='|' read -r name envs iters evalenvs seeds ov trainseed; do
+  name="$(trim "${name:-}")"; [ -z "$name" ] && continue
   case "$name" in \#*) continue;; esac
-  envs="$(echo "$envs"|xargs)"; iters="$(echo "$iters"|xargs)"; evalenvs="$(echo "$evalenvs"|xargs)"
-  seeds="$(echo "$seeds"|xargs)"; ov="$(echo "$ov"|sed 's/^ *//;s/ *$//')"
+  envs="$(trim "$envs")"; iters="$(trim "$iters")"; evalenvs="$(trim "$evalenvs")"
+  seeds="$(trim "$seeds")"; ov="$(trim "$ov")"
+  tseed="$(trim "${trainseed:-}")"; [ -z "$tseed" ] && tseed="$SEED_RNG"   # optional per-row train seed
   marker="$STATE_DIR/${name}.iters"
 
   if [ -f "$marker" ]; then
@@ -41,14 +45,14 @@ while IFS='|' read -r name envs iters evalenvs seeds ov; do
   fi
 
   if [ "$DRYRUN" = "1" ]; then
-    log "[DRY] TRAIN: SEED_RNG=$SEED_RNG bash scripts/auto_resume_train.sh $name $TASK $envs $iters  EXTRA_OVERRIDES='$ov'"
+    log "[DRY] TRAIN: SEED_RNG=$tseed bash scripts/auto_resume_train.sh $name $TASK $envs $iters  EXTRA_OVERRIDES='$ov'"
     log "[DRY] EVAL : NUM_ENVS=$evalenvs bash scripts/eval_robust.sh $TASK <latest_ckpt $name> $seeds chain_${name}  EXTRA_OVERRIDES='$ov'"
     echo "$iters" > "$marker"; log "[DRY] marker $name -> $iters"; continue
   fi
 
-  log ">>> TRAIN $name : ${envs} env -> ${iters} it  [ov: ${ov:0:60}...]"
+  log ">>> TRAIN $name : ${envs} env -> ${iters} it  seed=${tseed}  [ov: ${ov:0:55}...]"
   free_gpu
-  SEED_RNG="$SEED_RNG" EXTRA_OVERRIDES="$ov" bash scripts/auto_resume_train.sh "$name" "$TASK" "$envs" "$iters"
+  SEED_RNG="$tseed" EXTRA_OVERRIDES="$ov" bash scripts/auto_resume_train.sh "$name" "$TASK" "$envs" "$iters"
 
   free_gpu
   ck="$(latest_ckpt "$name")"

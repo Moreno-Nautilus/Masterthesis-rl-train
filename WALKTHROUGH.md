@@ -11,9 +11,7 @@ _Last updated: 2026-06-29._
 ## 1. Goal & scope
 
 Train an RL policy in **NVIDIA Isaac Lab** that performs the **final ~1–5 cm of a part insertion**
-on a KUKA LBR iiwa, using a **wrist-mounted RGB-D camera** for closed-loop visual feedback. We
-augment the blind, state-based insertion policy of **Fabrica** (Tian et al., 2025); the thesis
-contribution is **adding vision**.
+on a KUKA LBR iiwa, using a **wrist-mounted RGB-D camera** for closed-loop visual feedback. 
 
 **Scope — pure residual insertion.** The upstream pipeline hands over a *pre-insert pose* and a
 *goal (seated) pose*; the policy only outputs a **6-DOF residual correction** for the accumulated

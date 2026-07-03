@@ -1,0 +1,39 @@
+# === HOLIDAY CHAIN (LOCKED 2026-07-03) → 21 runs, ~23 days ==========================================
+# Driver: setsid bash scripts/run_chain.sh scripts/runlist_holiday.txt </dev/null >/tmp/chain_holiday.log 2>&1 &
+# Value-ordered; ALL potentially MEMORY-RISKY runs at the END (capacity combos, then frame-stack) so any OOM
+# is skipped without blocking the safe high-value runs. ALL @48 (224px, proven) EXCEPT 256px (@32) & frame-stack (@16/8).
+# Hygiene every row: agent.params.config.save_frequency=250  env.cam_log_interval=0.
+# no-aux base = '~aux_head' + obs=[policy,image]; AUX rows KEEP default aux (grasp+hole+aux_label), drop one target.
+# Verified fits @48: base 21.0 | lstm2048 21.6 | fc512 21.2 GB. 256px@32=20.3 GB. name | envs | iters | eval_envs | eval_seeds | overrides | [train_seed]
+
+# --- SAFE BLOCK (verified/expected-fit) --------------------------------------------------------------
+# anchor (depth 4000) + early variance
+base48        | 48 | 3500 | 128 | 42 | ~agent.params.network.aux_head agent.params.env.obs_groups.obs=[policy,image] env.image_height=224 env.image_width=224 env.tiled_camera.width=224 env.tiled_camera.height=224 agent.params.config.save_frequency=250 env.cam_log_interval=0
+base48_s7     | 48 | 3500 | 128 |  7 | ~agent.params.network.aux_head agent.params.env.obs_groups.obs=[policy,image] env.image_height=224 env.image_width=224 env.tiled_camera.width=224 env.tiled_camera.height=224 agent.params.config.save_frequency=250 env.cam_log_interval=0 | 7
+# single-axis capacity sweep (fc 256/512, lstm 2048/512, mlp wide)
+fc256         | 48 | 3500 | 128 | 42 | ~agent.params.network.aux_head agent.params.env.obs_groups.obs=[policy,image] env.image_height=224 env.image_width=224 env.tiled_camera.width=224 env.tiled_camera.height=224 agent.params.network.cnn.fc_size=256 agent.params.config.save_frequency=250 env.cam_log_interval=0
+fc512         | 48 | 3500 | 128 | 42 | ~agent.params.network.aux_head agent.params.env.obs_groups.obs=[policy,image] env.image_height=224 env.image_width=224 env.tiled_camera.width=224 env.tiled_camera.height=224 agent.params.network.cnn.fc_size=512 agent.params.config.save_frequency=250 env.cam_log_interval=0
+lstm2048      | 48 | 3500 | 128 | 42 | ~agent.params.network.aux_head agent.params.env.obs_groups.obs=[policy,image] env.image_height=224 env.image_width=224 env.tiled_camera.width=224 env.tiled_camera.height=224 agent.params.network.rnn.units=2048 agent.params.config.save_frequency=250 env.cam_log_interval=0
+lstm512       | 48 | 3500 | 128 | 42 | ~agent.params.network.aux_head agent.params.env.obs_groups.obs=[policy,image] env.image_height=224 env.image_width=224 env.tiled_camera.width=224 env.tiled_camera.height=224 agent.params.network.rnn.units=512 agent.params.config.save_frequency=250 env.cam_log_interval=0
+mlp_wide      | 48 | 3500 | 128 | 42 | ~agent.params.network.aux_head agent.params.env.obs_groups.obs=[policy,image] env.image_height=224 env.image_width=224 env.tiled_camera.width=224 env.tiled_camera.height=224 agent.params.network.mlp.units=[1024,256,64] agent.params.config.save_frequency=250 env.cam_log_interval=0
+# 3rd seed + aux re-tests
+base48_s99    | 48 | 3500 | 128 | 99 | ~agent.params.network.aux_head agent.params.env.obs_groups.obs=[policy,image] env.image_height=224 env.image_width=224 env.tiled_camera.width=224 env.tiled_camera.height=224 agent.params.config.save_frequency=250 env.cam_log_interval=0 | 99
+holeaux       | 48 | 3500 | 128 | 42 | ~agent.params.network.aux_head.targets.grasp env.image_height=224 env.image_width=224 env.tiled_camera.width=224 env.tiled_camera.height=224 agent.params.config.save_frequency=250 env.cam_log_interval=0
+bothaux       | 48 | 3500 | 128 | 42 | env.image_height=224 env.image_width=224 env.tiled_camera.width=224 env.tiled_camera.height=224 agent.params.config.save_frequency=250 env.cam_log_interval=0
+graspaux      | 48 | 3500 | 128 | 42 | ~agent.params.network.aux_head.targets.hole env.image_height=224 env.image_width=224 env.tiled_camera.width=224 env.tiled_camera.height=224 agent.params.config.save_frequency=250 env.cam_log_interval=0
+# torque confirm + PPO tweaks (P3)
+torque48      | 48 | 3500 | 128 | 42 | ~agent.params.network.aux_head agent.params.env.obs_groups.obs=[policy,image] env.image_height=224 env.image_width=224 env.tiled_camera.width=224 env.tiled_camera.height=224 env.use_torque_obs=True agent.params.config.save_frequency=250 env.cam_log_interval=0
+lr2e4         | 48 | 3500 | 128 | 42 | ~agent.params.network.aux_head agent.params.env.obs_groups.obs=[policy,image] env.image_height=224 env.image_width=224 env.tiled_camera.width=224 env.tiled_camera.height=224 agent.params.config.learning_rate=2e-4 agent.params.config.save_frequency=250 env.cam_log_interval=0
+lr5e5         | 48 | 3500 | 128 | 42 | ~agent.params.network.aux_head agent.params.env.obs_groups.obs=[policy,image] env.image_height=224 env.image_width=224 env.tiled_camera.width=224 env.tiled_camera.height=224 agent.params.config.learning_rate=5e-5 agent.params.config.save_frequency=250 env.cam_log_interval=0
+entropy       | 48 | 3500 | 128 | 42 | ~agent.params.network.aux_head agent.params.env.obs_groups.obs=[policy,image] env.image_height=224 env.image_width=224 env.tiled_camera.width=224 env.tiled_camera.height=224 agent.params.config.entropy_coef=0.005 agent.params.config.save_frequency=250 env.cam_log_interval=0
+# 256px fc-rescue sweep (@32, verified-fit)
+res256_fc256  | 32 | 3500 |  64 | 42 | ~agent.params.network.aux_head agent.params.env.obs_groups.obs=[policy,image] env.image_height=256 env.image_width=256 env.tiled_camera.width=256 env.tiled_camera.height=256 agent.params.network.cnn.fc_size=256 agent.params.config.save_frequency=250 env.cam_log_interval=0
+res256_fc512  | 32 | 3500 |  64 | 42 | ~agent.params.network.aux_head agent.params.env.obs_groups.obs=[policy,image] env.image_height=256 env.image_width=256 env.tiled_camera.width=256 env.tiled_camera.height=256 agent.params.network.cnn.fc_size=512 agent.params.config.save_frequency=250 env.cam_log_interval=0
+
+# --- MEMORY-RISKY BLOCK (capacity combos @48 -> chain skips if OOM) ----------------------------------
+combo_fc256_lstm2048 | 48 | 3500 | 128 | 42 | ~agent.params.network.aux_head agent.params.env.obs_groups.obs=[policy,image] env.image_height=224 env.image_width=224 env.tiled_camera.width=224 env.tiled_camera.height=224 agent.params.network.cnn.fc_size=256 agent.params.network.rnn.units=2048 agent.params.config.save_frequency=250 env.cam_log_interval=0
+combo_bigmodel       | 48 | 3500 | 128 | 42 | ~agent.params.network.aux_head agent.params.env.obs_groups.obs=[policy,image] env.image_height=224 env.image_width=224 env.tiled_camera.width=224 env.tiled_camera.height=224 agent.params.network.cnn.fc_size=256 agent.params.network.rnn.units=2048 agent.params.network.mlp.units=[1024,256,64] agent.params.config.save_frequency=250 env.cam_log_interval=0
+
+# --- DANGEROUS / memory-hostile LAST (chain skips 16->8 if OOM) --------------------------------------
+framestk16    | 16 | 3500 |  32 | 42 | ~agent.params.network.aux_head agent.params.env.obs_groups.obs=[policy,image] env.image_height=224 env.image_width=224 env.tiled_camera.width=224 env.tiled_camera.height=224 env.frame_stack=3 agent.params.config.save_frequency=250 env.cam_log_interval=0
+framestk8     |  8 | 3500 |  16 | 42 | ~agent.params.network.aux_head agent.params.env.obs_groups.obs=[policy,image] env.image_height=224 env.image_width=224 env.tiled_camera.width=224 env.tiled_camera.height=224 env.frame_stack=3 agent.params.config.save_frequency=250 env.cam_log_interval=0
