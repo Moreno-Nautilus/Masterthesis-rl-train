@@ -1,0 +1,143 @@
+# END-TO-END VISUOMOTOR cfg (supervisor-locked 2026-07-30).
+# The real end-to-end policy: obs = wrist RGB-D (frozen ImageNet ResNet-18, input conv inflated to 4ch +
+# trainable) + wrist force (3) + prev_action (5), NO proprio. Asymmetric privileged critic (flat state,
+# no CNN). LSTM + MLP; fixed_sigma; entropy 0. Consumes Dict obs (concate_obs_groups: False) via the
+# insertion_hybrid network with cnn.backbone=resnet18. Run with --enable_cameras.
+# Task: Isaac-Insertion-CoolingPeg-Iiwa-E2E-Vision-Direct-v0.
+
+params:
+  seed: 0
+  algo:
+    name: a2c_continuous
+
+  env:
+    clip_actions: 1.0
+    clip_observations: 5.0
+    # Policy sees force+prev_action (the "policy" group) + the wrist image; the asymmetric critic sees
+    # the privileged state only. Dict mode so the image stays a (H,W,C) tensor for the encoder.
+    obs_groups: { obs: [policy, image], states: [critic] }
+    concate_obs_groups: False
+
+  model:
+    name: continuous_a2c_logstd
+
+  network:
+    name: insertion_hybrid
+    separate: False
+
+    space:
+      continuous:
+        mu_activation: None
+        sigma_activation: None
+        mu_init:
+          name: default
+        sigma_init:
+          name: const_initializer
+          val: 0
+        fixed_sigma: True
+
+    cnn:
+      # Frozen ImageNet ResNet-18; input conv inflated to the image's 4 channels (RGB copied, depth =
+      # mean of the RGB weights) and kept trainable so depth adapts. Its 512-d pooled feature is projected
+      # to fc_size before fusing with force+prev_action (so the small proprio isn't swamped).
+      backbone: resnet18
+      pretrained: True
+      # weights_path:  # optional local resnet18 state_dict if the box is offline (else random-init warn)
+      fc_size: 128
+      type: conv2d          # ignored by the resnet path; kept so rl_games' cnn parser is happy
+      activation: relu
+      initializer:
+        name: default
+      convs: []             # unused for resnet18 (the from-scratch Nature CNN path reads this)
+
+    mlp:
+      units: [512, 128, 64]
+      activation: elu
+      d2rl: False
+      initializer:
+        name: default
+      regularizer:
+        name: None
+
+    rnn:
+      name: lstm
+      units: 1024
+      layers: 2
+      before_mlp: True
+      concat_input: True
+      layer_norm: True
+
+  load_checkpoint: False
+  load_path: ""
+
+  config:
+    name: Forge
+    device: cuda:0
+    full_experiment_name: test
+    env_name: rlgpu
+    multi_gpu: False
+    ppo: True
+    mixed_precision: True
+    normalize_input: True   # normalizes the policy vector + critic state; the image is pre-normalized in-env
+    normalize_value: True
+    value_bootstrap: True
+    num_actors: 128         # 224px + ResNet-18 is memory-heavy -> lower this (e.g. 48/64) on the real run
+    reward_shaper:
+      scale_value: 1.0
+    normalize_advantage: True
+    gamma: 0.995
+    tau: 0.95
+    learning_rate: 1.0e-4
+    lr_schedule: adaptive
+    schedule_type: standard
+    kl_threshold: 0.016     # see the state cfg (LR-cascade guard); fall back to constant LR if it cascades
+    score_to_win: 20000
+    max_epochs: 1500
+    save_best_after: 10
+    save_frequency: 100
+    print_stats: True
+    grad_norm: 1.0
+    entropy_coef: 0.0
+    truncate_grads: True
+    e_clip: 0.2
+    horizon_length: 128
+    minibatch_size: 512
+    mini_epochs: 4
+    critic_coef: 2
+    clip_value: True
+    seq_length: 128
+    bounds_loss_coef: 0.0001
+
+    central_value_config:
+      minibatch_size: 512
+      mini_epochs: 4
+      learning_rate: 1e-4
+      lr_schedule: adaptive
+      kl_threshold: 0.016
+      clip_value: True
+      normalize_input: True
+      truncate_grads: True
+
+      network:
+        name: insertion_hybrid
+        central_value: True
+
+        mlp:
+          units: [512, 128, 64]
+          activation: elu
+          d2rl: False
+          initializer:
+            name: default
+          regularizer:
+            name: None
+
+        rnn:
+          name: lstm
+          units: 1024
+          layers: 2
+          before_mlp: True
+          concat_input: True
+          layer_norm: True
+
+    player:
+      deterministic: False

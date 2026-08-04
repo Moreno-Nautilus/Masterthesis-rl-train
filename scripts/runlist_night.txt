@@ -1,0 +1,26 @@
+# ===== 2 NIGHT RUNS — CLEAN vs FAST fix for the contact-and-SEARCH failure (2026-08-03) ==========
+# e2e_vis_proprio restored the obs (proprio + noisy socket pose) -> underlying metrics improved (tip ~6cm,
+# axis ~18deg, beats every blind tilt run) BUT success stuck ~4%: per the footage the policy DESCENDS,
+# CONTACTS the surface, and SEARCHES for the 1mm chamfer-free hole without entering. Two A/B screens
+# (1000it each, ~6.7h; ~13h total), both on the proprio baseline + socket Y+-15cm / X 0.65-0.75 + tilt 18deg, ONE change each:
+#
+#   FAST  (socket-anchored action): confine the IK target to a +-8cm box around the (noisy) socket so the peg
+#         can't wander/hover and the search is caged ON the hole -- res224's mechanism, reuses the pose we
+#         already feed (no new sim2real dependency). -> env.e2e_socket_anchored_action=True
+#   CLEAN (bigger seat bonus): stay fingertip-relative (sim2real-pure), but pay 8x for a seated step so the
+#         policy commits to the entry once its search finds it. -> env.e2e_success_bonus=8.0
+#
+# 1000it IS enough to SCREEN working-vs-not (750 was too; proprio-alone already plateaued at ~4% by it300):
+# res224 was ~0.6 by 750, and socket-anchored should show its ~25%
+# head-start almost immediately; a failing config stays flat (the tilt runs were flat at ~2% all 1500). We are
+# NOT measuring the final ceiling here, just which path lifts off. Curriculum + steeper reward stay in reserve
+# (memory: e2e-policy-fix-levers). FAST first (higher-confidence + more informative) so it finishes even if the
+# night gets cut short.
+#
+# LAUNCH (needs the GPU free -> stop e2e_vis_proprio first; user's go):
+#   PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True TASK=Isaac-Insertion-CoolingPeg-Iiwa-E2E-Vision-Direct-v0 \
+#   setsid bash scripts/run_chain.sh scripts/runlist_night.txt </dev/null >/tmp/chain_night.log 2>&1 &
+#
+# name             | num_envs | max_iters | eval_envs | eval_seeds | extra_overrides                                                                            | train_seed
+e2e_socket_anch    | 32       | 1000       | 64        | 42         | env.e2e_use_proprio_obs=True env.e2e_socket_anchored_action=True env.weekend_tilt_deg=18.0 | 42
+e2e_seatbonus      | 32       | 1000       | 64        | 42         | env.e2e_use_proprio_obs=True env.e2e_success_bonus=8.0 env.weekend_tilt_deg=18.0           | 42

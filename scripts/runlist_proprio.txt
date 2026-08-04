@@ -1,0 +1,30 @@
+# ===== E2E VISUOMOTOR — OBS RESTORATION (proprio + noisy socket-rel pose) 2026-08-03 =============
+# WHY: the weekend E2E vision sweep failed (0.4-5.5%). Root cause (config diff, no GPU): the pure-E2E
+# graft DELETED the state block that vision_res224_1 (65%) fed its policy -- NOISY socket-relative
+# fingertip pose (+-8mm) + proprio (quat + lin/ang vel). res224 = that block + image; E2E = force+image
+# only. So res224 IS the "with-pose" control: pose in obs -> 65%, pose out -> 2%. This run puts it back.
+#
+# WHAT CHANGED (this run only; controls UNTOUCHED, no NaN guard, per user):
+#   env.e2e_use_proprio_obs=True  -> prepend [fingertip_pos_rel_fixed(3, noisy +-8mm), fingertip_quat(4),
+#                                    ee_linvel(3), ee_angvel(3)] to the POLICY obs (image + force kept).
+#   Everything else identical to the weekend vision recipe: iiwa + high-gain IK+PD, 224px RGB-D,
+#   ResNet-18, squashing reward + seat bonus, fixed_sigma, kl_threshold 0.016.
+# SOCKET STILL VARIES: fixed_asset_init_pos_noise=[0.05,0.05,0.05] (+-5cm) + 360deg yaw + dual socket
+#   (x=+-30mm) -- unchanged, so the rel-pose obs is NOT a memorisable constant, and +-5cm is well inside
+#   the iiwa's easy reach (no torque-limit risk). fingertip_pos_rel_fixed is +-8mm noisy = imperfect
+#   upstream estimate (deployable if the base part is fixtured at a known pose; vision refines the rest).
+#
+# WATCH: does success climb OFF the ~2% floor toward res224's ~65%? If yes -> confirmed it was the obs,
+#   and vision is now doing the fine correction on top of a coarse anchor. If a minority still fails via
+#   the run-2 "ram + screw slips back in the grip" mode -> THEN soften the insertion-axis PD gain (run 2).
+# NOTE: deviates from the supervisor-locked pure-E2E spec (NO proprio/pose) -> confirm the direction first.
+#
+# LAUNCH (user runs this -- do NOT auto-launch):
+#   PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True \
+#   TASK=Isaac-Insertion-CoolingPeg-Iiwa-E2E-Vision-Direct-v0 \
+#   setsid bash scripts/run_chain.sh scripts/runlist_proprio.txt </dev/null >/tmp/chain_proprio.log 2>&1 &
+#
+# SOCKET (set in the vision cfg __post_init__, not here): nominal x=0.70 (band 0.65-0.75), noise
+#   [0.05,0.15,0.05] -> Y +-15cm lateral. Smoke-validated 2026-08-03 (3 epochs clean, resets fine).
+# name            | num_envs | max_iters | eval_envs | eval_seeds | extra_overrides                             | train_seed
+e2e_vis_proprio   | 32       | 1500      | 32        | 42         | env.e2e_use_proprio_obs=True env.weekend_tilt_deg=18.0 | 42

@@ -1,0 +1,20 @@
+# ===== WELD + TILT CURRICULUM (2026-08-04) =========================================================
+# The screw is now RIGIDLY WELDED to gripper_tcp (RigidObject + excludeFromArticulation + the screw USD's
+# baked articulation root disabled; per-env grasp-misalign baked into each weld about the finger-closing
+# axis). Validated 100/100 held, NO penetration (diagnostics/grasp_grid_weld.png). Weld is default-ON for
+# the E2E task. Reset-IK is CLEAN per the diag (~88% converge 1st try, worst 10mm/2deg) -> no reset change.
+#
+# TWO changes since the 33% socket run (grasp WELD + tilt CURRICULUM) -> A/B them ONE variable at a time:
+#   Run A (weld only)       = socket+proprio, constant tilt 18deg. Isolates the WELD vs the old 33%.
+#   Run B (weld+curriculum) = socket+proprio, tilt ramps 0->18deg over ~600it (76800 steps @ horizon 128),
+#                             then constant 18deg. Isolates the CURRICULUM on top of the weld.
+# 1500it each (both curves were still climbing at 1000it; the LR-cascade guard caps ~1500). KL stays 0.016,
+# no constant LR. Stuck at 32 envs (VRAM). ~10.5h/run.
+#
+# LAUNCH (user's go; needs the GPU free):
+#   PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True TASK=Isaac-Insertion-CoolingPeg-Iiwa-E2E-Vision-Direct-v0 \
+#   setsid bash scripts/run_chain.sh scripts/runlist_weld_curriculum.txt </dev/null >/tmp/chain_weld.log 2>&1 &
+#
+# name              | num_envs | max_iters | eval_envs | eval_seeds | extra_overrides                                                                                                                      | train_seed
+e2e_weld_socket     | 32       | 1500      | 64        | 42         | env.e2e_use_proprio_obs=True env.e2e_socket_anchored_action=True env.weekend_tilt_deg=18.0                                            | 42
+e2e_weld_curric     | 32       | 1500      | 64        | 42         | env.e2e_use_proprio_obs=True env.e2e_socket_anchored_action=True env.weekend_tilt_deg=18.0 env.tilt_curriculum_steps=76800 env.tilt_start_deg=0.0 | 42

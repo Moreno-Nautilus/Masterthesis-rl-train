@@ -26,6 +26,54 @@ gym.register(
     },
 )
 
+# Sim2real hardware variant: KUKA iiwa7 + custom Y-gripper (replaces the Franka), same cooling-screw
+# task. NEW env class (InsertionEnvIiwa) that only re-derives the robot-specific geometry; the Franka
+# cooling tasks above are untouched so the validated pipeline / fallback stays intact. See
+# cooling_iiwa_tasks_cfg / insertion_env_iiwa.
+gym.register(
+    id="Isaac-Insertion-CoolingPeg-Iiwa-Direct-v0",
+    entry_point=f"{__name__}.insertion_env_iiwa:InsertionEnvIiwa",
+    disable_env_checker=True,
+    kwargs={
+        "env_cfg_entry_point": f"{__name__}.cooling_iiwa_tasks_cfg:ForgeTaskCoolingInsertIiwaCfg",
+        "rl_games_cfg_entry_point": "isaaclab_tasks.direct.forge.agents:rl_games_ppo_cfg.yaml",
+    },
+)
+gym.register(
+    id="Isaac-Insertion-CoolingPeg-Iiwa-Vision-Direct-v0",
+    entry_point=f"{__name__}.insertion_env_iiwa:InsertionEnvIiwa",
+    disable_env_checker=True,
+    kwargs={
+        "env_cfg_entry_point": f"{__name__}.cooling_iiwa_tasks_cfg:ForgeTaskCoolingInsertIiwaCameraCfg",
+        "rl_games_cfg_entry_point": f"{__name__}.agents:rl_games_camera_ppo_cfg.yaml",
+    },
+)
+
+# END-TO-END VISUOMOTOR variant (supervisor-locked 2026-07-30): pure end-to-end insertion on the iiwa
+# hardware -- RGB-D + force -> 5-DoF fingertip-relative delta, IK + high-gain joint PD (NOT Forge's OSC),
+# -L2 + shaft-axis reward. NEW env class (InsertionEnvE2EIiwa); the residual iiwa tasks above are
+# untouched. The STATE task is the state-first debug scaffold (true-delta obs, no camera) to validate the
+# control loop before switching to the vision encoder. See cooling_iiwa_tasks_cfg / insertion_env_e2e_iiwa
+# / PLANNING.md "END-TO-END VISUOMOTOR INSERTION".
+gym.register(
+    id="Isaac-Insertion-CoolingPeg-Iiwa-E2E-Direct-v0",
+    entry_point=f"{__name__}.insertion_env_e2e_iiwa:InsertionEnvE2EIiwa",
+    disable_env_checker=True,
+    kwargs={
+        "env_cfg_entry_point": f"{__name__}.cooling_iiwa_tasks_cfg:ForgeTaskCoolingInsertIiwaE2ECfg",
+        "rl_games_cfg_entry_point": f"{__name__}.agents:rl_games_e2e_state_ppo_cfg.yaml",
+    },
+)
+gym.register(
+    id="Isaac-Insertion-CoolingPeg-Iiwa-E2E-Vision-Direct-v0",
+    entry_point=f"{__name__}.insertion_env_e2e_iiwa:InsertionEnvE2EIiwa",
+    disable_env_checker=True,
+    kwargs={
+        "env_cfg_entry_point": f"{__name__}.cooling_iiwa_tasks_cfg:ForgeTaskCoolingInsertIiwaE2EVisionCfg",
+        "rl_games_cfg_entry_point": f"{__name__}.agents:rl_games_e2e_vision_ppo_cfg.yaml",
+    },
+)
+
 # Generalization target ("across parts"): pb-assembly SCREW insertion (pb_screw into pb_base's Ø10 hole).
 # Same InsertionEnv; only the parts/geometry differ (pb_tasks_cfg). Vision variant reuses the cooling
 # camera + appearance-DR + aux-head agent config wholesale. FIRST CUT (base alone, geometry TODO-tuned);

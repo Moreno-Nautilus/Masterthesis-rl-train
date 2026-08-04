@@ -1,0 +1,19 @@
+# ===== EVENING CHAIN — GRASP FIXED (2026-08-03) =====================================================
+# The iiwa grasp was BROKEN on all prior E2E runs (Franka fingerpad on the iiwa gripper -> screw retracted;
+# 100N close rammed the jaws THROUGH the 20mm SDF head). FIXED the Factory way: held screw already
+# disable_gravity=True (weightless, like Factory's peg -> no drops), + franka_fingerpad_length 0.030->0.012
+# (pads on the head, full shaft protruding) + gripper close force 100N->10N (clamps without penetrating).
+# Grid-verified: solid grasp in ~47/50 (a few edge-case penetrations remain, minor). This was likely a
+# DOMINANT confound on the hover/contact-search failure -> re-baseline before assuming levers are needed.
+#
+# Run 1 = clean proprio re-baseline on the FIXED grasp (does obs-restoration + a real grasp now seat?).
+# Run 2 = socket-anchored action (the top lever) IF the baseline still doesn't crack the entry.
+# 1000it each (~7h) -> ~13h, fits overnight. FAST/robust: auto-resume watchdog handles PhysX CUDA-700.
+#
+# LAUNCH:
+#   PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True TASK=Isaac-Insertion-CoolingPeg-Iiwa-E2E-Vision-Direct-v0 \
+#   setsid bash scripts/run_chain.sh scripts/runlist_evening.txt </dev/null >/tmp/chain_evening.log 2>&1 &
+#
+# name             | num_envs | max_iters | eval_envs | eval_seeds | extra_overrides                                              | train_seed
+e2e_proprio_grasp  | 32       | 1000      | 64        | 42         | env.e2e_use_proprio_obs=True env.weekend_tilt_deg=18.0        | 42
+e2e_socket_grasp   | 32       | 1000      | 64        | 42         | env.e2e_use_proprio_obs=True env.e2e_socket_anchored_action=True env.weekend_tilt_deg=18.0 | 42

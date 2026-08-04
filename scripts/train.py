@@ -74,6 +74,23 @@ from rl_games.common import env_configurations, vecenv
 from rl_games.common.algo_observer import IsaacAlgoObserver
 from rl_games.torch_runner import Runner
 
+# --- CONFINED opt-in fix: raise the AdaptiveScheduler LR floor (env-gated; NO-OP unless LR_FLOOR is set) ---
+# The KL-adaptive LR scheduler ratchets the learning rate down to a hardcoded 1e-6 floor over long/big runs
+# (natural KL ~0.012 > kl_threshold 0.008 => it's always cutting), which stalls learning -> the "cascade".
+# Setting env LR_FLOOR (e.g. 1e-5) raises only that floor: the protective EARLY cutting is untouched, so a
+# fresh policy is still rescued from divergence, but the LR can no longer collapse to a non-learning value.
+# Default (unset) leaves rl_games byte-for-byte unchanged, so every other run is unaffected.
+import os as _os  # noqa: E402
+_LR_FLOOR = _os.environ.get("LR_FLOOR", "").strip()
+if _LR_FLOOR:
+    from rl_games.common import schedulers as _schedulers  # noqa: E402
+    _AdaptiveInit = _schedulers.AdaptiveScheduler.__init__
+    def _adaptive_init_floored(self, kl_threshold=0.008):
+        _AdaptiveInit(self, kl_threshold)
+        self.min_lr = float(_LR_FLOOR)
+    _schedulers.AdaptiveScheduler.__init__ = _adaptive_init_floored
+    print(f"[train.py] LR_FLOOR override ACTIVE -> AdaptiveScheduler.min_lr = {float(_LR_FLOOR):.1e}")
+
 from isaaclab.envs import (
     DirectMARLEnv,
     DirectMARLEnvCfg,

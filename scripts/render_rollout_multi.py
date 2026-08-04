@@ -1,18 +1,19 @@
 # Copyright (c) 2022-2026, The Isaac Lab Project Developers.
 # SPDX-License-Identifier: BSD-3-Clause
 
-"""Render the WRIST CAMERA POV of a single env as a video while a trained policy runs.
+"""Render N separate rollout clips (one per env) from a SINGLE Isaac session.
 
-Unlike ``eval_policy.py --video`` (which records the third-person viewport), this dumps what the
-wrist RGB-D camera actually SEES each step -- RGB and depth side by side -- for one chosen env, so
-you can watch the part enter the socket from the policy's own eye. Output: an mp4 (falls back to a
-numbered PNG sequence if no ffmpeg writer is available).
+render_wrist_rollout.py follows ONE env per launch; inspecting 10 "random goes" that way needs 10
+launches. This runs the trained policy once over `num_envs` parallel envs and dumps the first
+`n_clips` of them as separate videos, so 10 goes = 1 launch. Scene (third-person) view by default
+(best for judging reset placement + seating); `--view wrist` dumps the RGB|depth POV instead.
 
-    OMNI_KIT_ACCEPT_EULA=YES python scripts/render_wrist_rollout.py \
-        --task Isaac-Insertion-CoolingPeg-Vision-Direct-v0 --num_envs 16 \
-        --checkpoint logs/rl_games/Forge/vision_160_1/nn/Forge.pth \
-        --frames 300 --env 0 --out /tmp/wrist_rollout.mp4 \
-        --experience /home/moreno/Masterthesis-rl-train/apps/isaaclab.python.headless.rendering.physx1065.kit
+    OMNI_KIT_ACCEPT_EULA=YES python scripts/render_rollout_multi.py \
+        --task Isaac-Insertion-CoolingPeg-Iiwa-E2E-Vision-Direct-v0 --num_envs 16 --n_clips 10 \
+        --checkpoint logs/rl_games/Forge/e2e_socket_grasp/nn/last_Forge_ep_1000_rew_97.57502.pth \
+        --frames 160 --view scene --out_dir diagnostics/renders --prefix socket_go \
+        --experience /home/moreno/Masterthesis-rl-train/apps/isaaclab.python.headless.rendering.physx1065.kit \
+        env.e2e_use_proprio_obs=True env.e2e_socket_anchored_action=True env.weekend_tilt_deg=18.0
 """
 
 import argparse
@@ -20,17 +21,17 @@ import sys
 
 from isaaclab.app import AppLauncher
 
-parser = argparse.ArgumentParser(description="Render the wrist-cam POV of a trained policy rollout.")
-parser.add_argument("--task", type=str, default="Isaac-Insertion-CoolingPeg-Vision-Direct-v0")
+parser = argparse.ArgumentParser(description="Render N per-env rollout clips from one policy launch.")
+parser.add_argument("--task", type=str, default="Isaac-Insertion-CoolingPeg-Iiwa-E2E-Vision-Direct-v0")
 parser.add_argument("--agent", type=str, default="rl_games_cfg_entry_point")
 parser.add_argument("--checkpoint", type=str, required=True, help="Path to model checkpoint (.pth).")
 parser.add_argument("--num_envs", type=int, default=16)
-parser.add_argument("--env", type=int, default=0, help="Which env to follow.")
-parser.add_argument("--view", type=str, default="wrist", choices=["wrist", "scene"],
-                    help="wrist = the wrist RGB-D POV; scene = a close third-person view of the env.")
-parser.add_argument("--frames", type=int, default=300, help="Number of frames (sim steps) to record.")
+parser.add_argument("--n_clips", type=int, default=10, help="How many envs (clips) to record.")
+parser.add_argument("--view", type=str, default="scene", choices=["wrist", "scene"])
+parser.add_argument("--frames", type=int, default=160, help="Number of frames (sim steps) to record.")
 parser.add_argument("--fps", type=int, default=20)
-parser.add_argument("--out", type=str, default="/tmp/wrist_rollout.mp4")
+parser.add_argument("--out_dir", type=str, default="diagnostics/renders")
+parser.add_argument("--prefix", type=str, default="go")
 parser.add_argument("--seed", type=int, default=None)
 AppLauncher.add_app_launcher_args(parser)
 args_cli, hydra_args = parser.parse_known_args()
@@ -61,32 +62,28 @@ import insertion_policy.tasks  # noqa: F401
 from isaaclab_tasks.utils.hydra import hydra_task_config
 
 
-def _scene_frame(u, env_idx):
-    """One (H, W, 3) uint8 third-person frame of env `env_idx`."""
-    rgb = u._scene_camera.data.output["rgb"][env_idx, :, :, :3].clamp(0, 255).to(torch.uint8)
-    return rgb.cpu().numpy()
-
-
 def _aim_scene_camera(u):
-    """Aim the third-person camera at each env's socket+gripper region (close 3/4 view)."""
+    """Aim each env's third-person camera at its own socket+gripper region (close 3/4 view)."""
     target = 0.5 * (u.fixed_pos_obs_frame + u.fingertip_midpoint_pos) + u.scene.env_origins
     eye = target + torch.tensor([0.16, 0.13, 0.14], device=u.device)
     u._scene_camera.set_world_poses_from_view(eye, target)
 
 
-def _to_frame(u, env_idx, far):
-    """Build one (H, 2W, 3) uint8 frame: raw RGB | depth (grayscale), side by side."""
+def _scene_frame(u, env_idx):
+    rgb = u._scene_camera.data.output["rgb"][env_idx, :, :, :3].clamp(0, 255).to(torch.uint8)
+    return rgb.cpu().numpy()
+
+
+def _wrist_frame(u, env_idx, far):
     out = u._tiled_camera.data.output
     rgb = out["rgb"][env_idx, :, :, :3].clamp(0, 255).to(torch.uint8).cpu().numpy()
-
     depth = out["depth"][env_idx].clone().float()
     depth[~torch.isfinite(depth)] = 0.0
     depth = (depth.clamp(0.0, far) / far * 255.0).to(torch.uint8).cpu().numpy()
     if depth.ndim == 3:
         depth = depth[..., 0]
-    depth = np.repeat(depth[:, :, None], 3, axis=2)  # gray -> 3ch
-
-    sep = np.full((rgb.shape[0], 4, 3), 255, dtype=np.uint8)  # white divider
+    depth = np.repeat(depth[:, :, None], 3, axis=2)
+    sep = np.full((rgb.shape[0], 4, 3), 255, dtype=np.uint8)
     return np.concatenate([rgb, sep, depth], axis=1)
 
 
@@ -100,7 +97,6 @@ def main(env_cfg, agent_cfg: dict):
 
     resume_path = retrieve_file_path(args_cli.checkpoint)
 
-    # Add a close third-person camera for the "scene" view (the env builds it from cfg.scene_camera).
     if args_cli.view == "scene":
         env_cfg.scene_camera = TiledCameraCfg(
             prim_path="/World/envs/env_.*/scene_cam",
@@ -136,10 +132,9 @@ def main(env_cfg, agent_cfg: dict):
     agent.reset()
 
     u = env.unwrapped
-    # far-clip only needed for wrist-DEPTH normalization; the state task has no wrist cam (scene view only).
     _tc = getattr(u.cfg, "tiled_camera", None)
     far = float(_tc.spawn.clipping_range[1]) if _tc is not None else 5.0
-    env_idx = max(0, min(args_cli.env, u.num_envs - 1))
+    n_clips = max(1, min(args_cli.n_clips, u.num_envs))
 
     obs = env.reset()
     if isinstance(obs, dict):
@@ -148,16 +143,17 @@ def main(env_cfg, agent_cfg: dict):
     if agent.is_rnn:
         agent.init_rnn()
 
-    frames = []
-    print(f"[INFO] recording {args_cli.frames} {args_cli.view} frames of env {env_idx} ...")
+    clips = [[] for _ in range(n_clips)]
+    print(f"[INFO] recording {args_cli.frames} {args_cli.view} frames for {n_clips} envs ...")
     for i in range(args_cli.frames):
         with torch.inference_mode():
             if args_cli.view == "scene":
-                _aim_scene_camera(u)  # aim before stepping so the in-step render uses this pose
+                _aim_scene_camera(u)
             obs = agent.obs_to_torch(obs)
             actions = agent.get_action(obs, is_deterministic=agent.is_deterministic)
             obs, _, dones, _ = env.step(actions)
-            frames.append(_scene_frame(u, env_idx) if args_cli.view == "scene" else _to_frame(u, env_idx, far))
+            for e in range(n_clips):
+                clips[e].append(_scene_frame(u, e) if args_cli.view == "scene" else _wrist_frame(u, e, far))
             if agent.is_rnn and agent.states is not None:
                 d = dones.nonzero(as_tuple=False).squeeze(-1)
                 if len(d) > 0:
@@ -166,25 +162,13 @@ def main(env_cfg, agent_cfg: dict):
 
     env.close()
 
-    # Write video (mp4 via imageio-ffmpeg; fall back to PNG sequence).
-    os.makedirs(os.path.dirname(os.path.abspath(args_cli.out)) or ".", exist_ok=True)
-    try:
-        import imageio.v2 as imageio
+    os.makedirs(args_cli.out_dir, exist_ok=True)
+    import imageio.v2 as imageio
 
-        imageio.mimwrite(args_cli.out, frames, fps=args_cli.fps, macro_block_size=None)
-        print(f"[OK] wrote {args_cli.out} ({len(frames)} frames, {args_cli.fps} fps)  [left=RGB | right=depth]")
-    except Exception as exc:
-        seq_dir = os.path.splitext(args_cli.out)[0] + "_frames"
-        os.makedirs(seq_dir, exist_ok=True)
-        try:
-            import imageio.v2 as imageio
-
-            for i, f in enumerate(frames):
-                imageio.imwrite(os.path.join(seq_dir, f"frame_{i:04d}.png"), f)
-        except Exception:
-            np.save(os.path.splitext(args_cli.out)[0] + "_frames.npy", np.stack(frames))
-        print(f"[WARN] mp4 write failed ({exc}); wrote frames to {seq_dir}")
-        print(f"       ffmpeg -framerate {args_cli.fps} -i {seq_dir}/frame_%04d.png -pix_fmt yuv420p {args_cli.out}")
+    for e in range(n_clips):
+        out = os.path.join(args_cli.out_dir, f"{args_cli.prefix}_{e:02d}.mp4")
+        imageio.mimwrite(out, clips[e], fps=args_cli.fps, macro_block_size=None)
+        print(f"[OK] wrote {out}  ({len(clips[e])} frames)")
 
 
 if __name__ == "__main__":

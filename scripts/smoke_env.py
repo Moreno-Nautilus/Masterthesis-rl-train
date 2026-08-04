@@ -38,6 +38,13 @@ def main() -> None:
 
     emit(f"task={args_cli.task} num_envs={args_cli.num_envs}")
     env_cfg = parse_env_cfg(args_cli.task, device=args_cli.device, num_envs=args_cli.num_envs)
+    # Escape hatch for a broken/mismatched omni.physx.fabric extension (route poses via USD XformCache
+    # instead of Fabric). Default OFF -> normal fabric path unchanged. Set SMOKE_NO_FABRIC=1 to bypass.
+    import os as _os
+
+    if _os.environ.get("SMOKE_NO_FABRIC"):
+        env_cfg.sim.use_fabric = False
+        emit("SMOKE_NO_FABRIC=1 -> sim.use_fabric=False")
     # Vision variant: dump a rendered RGB/depth frame to /tmp to sanity-check the wrist mount pose.
     if hasattr(env_cfg, "write_image_to_file"):
         env_cfg.write_image_to_file = True

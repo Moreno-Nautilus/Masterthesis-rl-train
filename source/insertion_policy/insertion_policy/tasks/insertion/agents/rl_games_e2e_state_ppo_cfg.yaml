@@ -1,0 +1,131 @@
+# END-TO-END STATE-FIRST DEBUG cfg (supervisor-locked 2026-07-30).
+# The state-first scaffold: policy obs = TRUE (error-free) delta (6) + wrist force (3) + prev_action (5),
+# NO image. Validates the RL + IK/PD controller + reward + 5-DoF action loop before the vision encoder is
+# switched in (rl_games_e2e_vision). Asymmetric privileged critic. LSTM + MLP; fixed_sigma; entropy 0.
+# Consumes Dict obs (concate_obs_groups: False) via the insertion_hybrid network (no CNN -> a plain
+# MLP+LSTM over the flat policy vector). Task: Isaac-Insertion-CoolingPeg-Iiwa-E2E-Direct-v0.
+
+params:
+  seed: 0
+  algo:
+    name: a2c_continuous
+
+  env:
+    clip_actions: 1.0
+    clip_observations: 5.0
+    # Policy sees the flat end-to-end vector; the asymmetric critic sees the privileged state.
+    obs_groups: { obs: [policy], states: [critic] }
+    concate_obs_groups: False
+
+  model:
+    name: continuous_a2c_logstd
+
+  network:
+    name: insertion_hybrid
+    separate: False
+
+    space:
+      continuous:
+        mu_activation: None
+        sigma_activation: None
+        mu_init:
+          name: default
+        sigma_init:
+          name: const_initializer
+          val: 0
+        fixed_sigma: True   # state-independent sigma (Forge-style); entropy 0 keeps it from inflating
+
+    mlp:
+      units: [512, 128, 64]
+      activation: elu
+      d2rl: False
+      initializer:
+        name: default
+      regularizer:
+        name: None
+
+    rnn:
+      name: lstm
+      units: 1024
+      layers: 2
+      before_mlp: True
+      concat_input: True
+      layer_norm: True
+
+  load_checkpoint: False
+  load_path: ""
+
+  config:
+    name: Forge
+    device: cuda:0
+    full_experiment_name: test
+    env_name: rlgpu
+    multi_gpu: False
+    ppo: True
+    mixed_precision: True
+    normalize_input: True    # normalize the policy vector + privileged critic state (physical units)
+    normalize_value: True
+    value_bootstrap: True
+    num_actors: 128
+    reward_shaper:
+      scale_value: 1.0
+    normalize_advantage: True
+    gamma: 0.995
+    tau: 0.95
+    learning_rate: 1.0e-4
+    lr_schedule: adaptive
+    schedule_type: standard
+    # 0.016 (not Forge's 0.008): keeps the adaptive-LR controller from ratcheting to its floor on a KL
+    # excursion (the holiday LR-cascade lesson, memory lr-cascade-instability). If it still cascades on
+    # this new reward/action, fall back to a fixed LR (lr_schedule: constant).
+    kl_threshold: 0.016
+    score_to_win: 20000
+    max_epochs: 1500
+    save_best_after: 10
+    save_frequency: 100
+    print_stats: True
+    grad_norm: 1.0
+    entropy_coef: 0.0
+    truncate_grads: True
+    e_clip: 0.2
+    horizon_length: 128
+    minibatch_size: 512
+    mini_epochs: 4
+    critic_coef: 2
+    clip_value: True
+    seq_length: 128
+    bounds_loss_coef: 0.0001
+
+    central_value_config:
+      minibatch_size: 512
+      mini_epochs: 4
+      learning_rate: 1e-4
+      lr_schedule: adaptive
+      kl_threshold: 0.016
+      clip_value: True
+      normalize_input: True
+      truncate_grads: True
+
+      network:
+        name: insertion_hybrid
+        central_value: True
+
+        mlp:
+          units: [512, 128, 64]
+          activation: elu
+          d2rl: False
+          initializer:
+            name: default
+          regularizer:
+            name: None
+
+        rnn:
+          name: lstm
+          units: 1024
+          layers: 2
+          before_mlp: True
+          concat_input: True
+          layer_norm: True
+
+    player:
+      deterministic: False

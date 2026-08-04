@@ -77,14 +77,24 @@ class InsertionHybridBuilder(A2CBuilder):
 
             cnn_params = params.get("cnn")
             convs = (cnn_params or {}).get("convs") or _DEFAULT_CONVS
+            # Optional pretrained backbone (end-to-end visuomotor): cnn.backbone == "resnet18" swaps the
+            # from-scratch Nature CNN for a frozen ImageNet ResNet-18 whose input conv is inflated to the
+            # image's channel count (RGB weights copied; extra channels = mean of the RGB weights) and
+            # kept TRAINABLE so depth adapts. Everything else (LSTM/MLP/heads, projection FC) is unchanged.
+            backbone = (cnn_params or {}).get("backbone")
+            self._image_is_resnet = bool(self._image_key is not None and backbone == "resnet18")
 
             # Measure the CNN's flattened output with a throwaway module (cannot store an nn.Module
-            # before nn.Module.__init__ runs inside the parent constructor).
+            # before nn.Module.__init__ runs inside the parent constructor). ResNet-18's pooled feature
+            # is always 512, so we skip the measurement (and a redundant weight download) for it.
             cnn_out = 0
             if self._image_key is not None:
                 c, h, w = image_chw
-                with torch.no_grad():
-                    cnn_out = self._make_cnn(c, convs)(torch.zeros(1, c, h, w)).flatten(1).shape[1]
+                if self._image_is_resnet:
+                    cnn_out = 512
+                else:
+                    with torch.no_grad():
+                        cnn_out = self._make_cnn(c, convs)(torch.zeros(1, c, h, w)).flatten(1).shape[1]
 
             # Project the (large) CNN feature vector down before fusing with proprio, so proprio is
             # not drowned. With no image (the critic) there is no projection. Plain ints only here.
@@ -102,7 +112,12 @@ class InsertionHybridBuilder(A2CBuilder):
 
             # Now that nn.Module is initialized, build the real CNN + projection FC that forward() uses.
             if self._image_key is not None:
-                self._image_cnn = self._make_cnn(image_chw[0], convs)
+                if self._image_is_resnet:
+                    pretrained = bool((cnn_params or {}).get("pretrained", True))
+                    weights_path = (cnn_params or {}).get("weights_path")
+                    self._image_cnn = self._build_resnet18(image_chw[0], pretrained, weights_path)
+                else:
+                    self._image_cnn = self._make_cnn(image_chw[0], convs)
                 self._image_proj = nn.Sequential(nn.Linear(self._cnn_out, self._proj_dim), nn.ReLU())
             else:
                 self._image_cnn = None
@@ -139,6 +154,63 @@ class InsertionHybridBuilder(A2CBuilder):
                 ch = cv["filters"]
             return nn.Sequential(*layers)
 
+        @staticmethod
+        def _build_resnet18(in_channels, pretrained, weights_path=None):
+            """ImageNet ResNet-18 encoder, input conv inflated to ``in_channels``, backbone FROZEN.
+
+            - conv1 (3ch) -> (in_channels)ch: copy the RGB weights; init each extra (depth) channel to the
+              MEAN of the RGB conv weights (a sane grey-world init). conv1 is kept TRAINABLE so the depth
+              channel adapts; every other backbone param is frozen.
+            - fc is replaced by Identity so forward() returns the 512-d global-average-pooled feature.
+            - BatchNorm stays in eval mode at forward time (see forward()) so the frozen running stats are
+              used, not noisy RL-minibatch stats. Robust to being offline: if the pretrained download fails
+              we fall back to random init (still trainable conv1) with a warning; an optional local
+              ``weights_path`` (a torchvision resnet18 state_dict) is loaded first if given.
+            """
+            import warnings
+
+            from torchvision.models import resnet18
+
+            try:
+                from torchvision.models import ResNet18_Weights
+
+                default_weights = ResNet18_Weights.IMAGENET1K_V1
+            except Exception:  # very old torchvision
+                default_weights = None
+
+            net = None
+            if pretrained:
+                try:
+                    net = resnet18(weights=default_weights)
+                except Exception as exc:  # noqa: BLE001 (offline / download failure)
+                    warnings.warn(f"[insertion_hybrid] ResNet-18 pretrained load failed ({exc}); random init.")
+            if net is None:
+                net = resnet18(weights=None)
+                if weights_path:
+                    try:
+                        net.load_state_dict(torch.load(weights_path, map_location="cpu"), strict=False)
+                    except Exception as exc:  # noqa: BLE001
+                        warnings.warn(f"[insertion_hybrid] local ResNet-18 weights load failed ({exc}); random init.")
+
+            old_conv = net.conv1  # Conv2d(3, 64, k=7, s=2, p=3, bias=False)
+            new_conv = nn.Conv2d(in_channels, 64, kernel_size=7, stride=2, padding=3, bias=False)
+            with torch.no_grad():
+                w = old_conv.weight  # (64, 3, 7, 7)
+                if in_channels >= 3:
+                    new_conv.weight[:, :3] = w
+                    if in_channels > 3:
+                        new_conv.weight[:, 3:] = w.mean(dim=1, keepdim=True).repeat(1, in_channels - 3, 1, 1)
+                else:
+                    new_conv.weight[:] = w[:, :in_channels]
+            net.conv1 = new_conv
+
+            for p in net.parameters():
+                p.requires_grad = False
+            for p in net.conv1.parameters():  # keep ONLY the (inflated) input conv trainable
+                p.requires_grad = True
+            net.fc = nn.Identity()  # forward() returns the 512-d pooled feature
+            return net
+
         def forward(self, obs_dict):
             obs = obs_dict["obs"]
             # Concatenate proprio groups (everything that is neither the image nor the privileged aux
@@ -148,7 +220,12 @@ class InsertionHybridBuilder(A2CBuilder):
             self._aux_loss = None
             if self._image_cnn is not None:
                 img = obs[self._image_key].permute(0, 3, 1, 2).contiguous()  # BHWC -> BCHW
-                cnn_feat = self._image_proj(self._image_cnn(img).flatten(1))  # 3136 -> proj_dim
+                if self._image_is_resnet:
+                    # Keep the frozen backbone's BatchNorm on its ImageNet running stats regardless of the
+                    # agent toggling model.train()/eval(); the trainable conv1 still gets gradients (eval
+                    # mode gates BN/dropout, not autograd).
+                    self._image_cnn.eval()
+                cnn_feat = self._image_proj(self._image_cnn(img).flatten(1))  # cnn_out -> proj_dim
                 # Compute the aux loss only on training forwards (skipped during rollout/eval, where the
                 # heads are unused) and only when the privileged label is present.
                 if self.training and self._aux_heads is not None and self._aux_label_key in obs:

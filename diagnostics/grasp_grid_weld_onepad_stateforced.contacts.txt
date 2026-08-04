@@ -1,0 +1,24 @@
+[contacts] clearance mm: left min/mean/max=-0.00/-0.00/0.00, right min/mean/max=0.03/0.03/0.03; max_gap=0.03mm max_pen=-0.00mm envs_gap>1mm=[] envs_pen>1mm=[]
+[contacts] joint q mm: left=8.01, right=8.01; screw_y mean=-0.01mm
+[contacts] worst penetration envs:
+  env 079: left=-0.00mm right=+0.03mm lf_y=+31.98 rf_y=-31.99 screw_y=-0.02 q=(8.02,8.01)
+  env 002: left=-0.00mm right=+0.03mm lf_y=+31.99 rf_y=-31.99 screw_y=-0.01 q=(8.01,8.01)
+  env 049: left=-0.00mm right=+0.03mm lf_y=+31.99 rf_y=-31.99 screw_y=-0.02 q=(8.01,8.01)
+  env 016: left=-0.00mm right=+0.03mm lf_y=+31.98 rf_y=-31.99 screw_y=-0.02 q=(8.02,8.01)
+  env 041: left=-0.00mm right=+0.03mm lf_y=+31.99 rf_y=-31.99 screw_y=-0.01 q=(8.01,8.01)
+  env 078: left=-0.00mm right=+0.03mm lf_y=+31.98 rf_y=-31.99 screw_y=-0.02 q=(8.02,8.01)
+  env 076: left=-0.00mm right=+0.03mm lf_y=+31.99 rf_y=-31.99 screw_y=-0.01 q=(8.01,8.01)
+  env 013: left=-0.00mm right=+0.03mm lf_y=+31.98 rf_y=-31.99 screw_y=-0.02 q=(8.02,8.01)
+  env 007: left=-0.00mm right=+0.03mm lf_y=+31.99 rf_y=-31.99 screw_y=-0.01 q=(8.01,8.01)
+  env 001: left=-0.00mm right=+0.03mm lf_y=+31.98 rf_y=-31.99 screw_y=-0.02 q=(8.02,8.01)
+[contacts] worst gap envs:
+  env 016: left=-0.00mm right=+0.03mm lf_y=+31.98 rf_y=-31.99 screw_y=-0.02 q=(8.02,8.01)
+  env 013: left=-0.00mm right=+0.03mm lf_y=+31.98 rf_y=-31.99 screw_y=-0.02 q=(8.02,8.01)
+  env 078: left=-0.00mm right=+0.03mm lf_y=+31.98 rf_y=-31.99 screw_y=-0.02 q=(8.02,8.01)
+  env 022: left=-0.00mm right=+0.03mm lf_y=+31.98 rf_y=-31.99 screw_y=-0.02 q=(8.02,8.01)
+  env 019: left=-0.00mm right=+0.03mm lf_y=+31.98 rf_y=-31.99 screw_y=-0.02 q=(8.02,8.01)
+  env 001: left=-0.00mm right=+0.03mm lf_y=+31.98 rf_y=-31.99 screw_y=-0.02 q=(8.02,8.01)
+  env 089: left=-0.00mm right=+0.03mm lf_y=+31.98 rf_y=-31.99 screw_y=-0.02 q=(8.02,8.01)
+  env 020: left=-0.00mm right=+0.03mm lf_y=+31.98 rf_y=-31.99 screw_y=-0.02 q=(8.02,8.01)
+  env 031: left=-0.00mm right=+0.03mm lf_y=+31.99 rf_y=-31.99 screw_y=-0.02 q=(8.01,8.01)
+  env 079: left=-0.00mm right=+0.03mm lf_y=+31.98 rf_y=-31.99 screw_y=-0.02 q=(8.02,8.01)

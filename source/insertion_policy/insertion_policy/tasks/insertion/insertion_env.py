@@ -29,7 +29,7 @@ import torch
 import isaacsim.core.utils.torch as torch_utils
 
 import isaaclab.sim as sim_utils
-from isaaclab.assets import Articulation
+from isaaclab.assets import Articulation, RigidObject, RigidObjectCfg
 from isaaclab.sensors import TiledCamera
 from isaaclab.sim.spawners.from_files import GroundPlaneCfg, spawn_ground_plane
 from isaaclab.utils.assets import ISAAC_NUCLEUS_DIR
@@ -183,7 +183,190 @@ class InsertionEnv(ForgeEnv):
             0.0, self.cfg_task.held_asset_cfg.height, self.cfg_task.num_keypoints, device=self.device
         )
 
+    def _weld_gripper_dof_pos(self) -> float:
+        """Finger joint target for welded grasps.
+
+        Both fingers stop at the calibrated screw-head contact aperture. The custom Y-gripper collision
+        pads still have about a 4 mm face-to-face gap at q=0, so the contact joint value is not simply
+        the screw-head radius.
+        """
+        closed_half_gap = float(getattr(self.cfg, "weld_gripper_closed_half_gap", 0.0))
+        return max(0.0, 0.5 * float(self.cfg_task.held_asset_cfg.diameter) - closed_half_gap)
+
+    def _weld_gripper_dof_pos_for_envs(self, env_ids) -> torch.Tensor:
+        target = float(self._weld_gripper_dof_pos())
+        return torch.full((len(env_ids), 2), target, device=self.device)
+
+    def _set_welded_gripper_state(self, env_ids=None):
+        """Force the reset-time finger state to the welded contact aperture.
+
+        Factory's reset close-loop and IK fallback write raw joint states. For welded grasps, a stale
+        q=0 finger state moves the one-pad weld parent inward and drags the screw into the opposite pad.
+        """
+        if not getattr(self, "_weld_held", False):
+            return
+        if env_ids is None:
+            env_ids = torch.arange(self.num_envs, device=self.device)
+        elif not isinstance(env_ids, torch.Tensor):
+            env_ids = torch.as_tensor(env_ids, device=self.device, dtype=torch.long)
+        else:
+            env_ids = env_ids.to(device=self.device, dtype=torch.long)
+        target = self._weld_gripper_dof_pos_for_envs(env_ids)
+        joint_ids = [7, 8]
+        zero_vel = torch.zeros_like(target)
+        self.joint_pos[env_ids[:, None], joint_ids] = target
+        self.joint_vel[env_ids[:, None], joint_ids] = zero_vel
+        self.ctrl_target_joint_pos[env_ids[:, None], joint_ids] = target
+        self._robot.write_joint_state_to_sim(target, zero_vel, joint_ids=joint_ids, env_ids=env_ids)
+        self._robot.set_joint_position_target(target, joint_ids=joint_ids, env_ids=env_ids)
+
+    def _weld_parent_to_tcp_pose(self, parent_body: str):
+        """Gripper kinematics for a one-pad weld frame.
+
+        The exported gripper USD defines q=0 as closed and q=0.04 as open. At the welded-pad target,
+        the chosen finger link sits laterally at +/- (0.04 - q), while gripper_tcp is 145.5 mm past the
+        finger-link origins along the local z axis.
+        """
+        quat = torch.tensor([1.0, 0.0, 0.0, 0.0], device=self.device).repeat(self.num_envs, 1)
+        pos = torch.zeros((self.num_envs, 3), device=self.device)
+        if parent_body == "gripper_tcp":
+            return quat, pos
+
+        pad_target = self._weld_gripper_dof_pos()
+        closed_y = float(getattr(self.cfg, "weld_finger_closed_origin_y", 0.04))
+        tcp_z = float(getattr(self.cfg, "weld_tcp_from_finger_z", 0.1455))
+        lateral = closed_y - pad_target
+        if parent_body == "left_finger_link":
+            pos[:, 1] = -lateral
+        elif parent_body == "right_finger_link":
+            pos[:, 1] = lateral
+        else:
+            raise ValueError(f"Unsupported weld_held_parent_body={parent_body!r}")
+        pos[:, 2] = tcp_z
+        return quat, pos
+
+    def generate_ctrl_signals(
+        self, ctrl_target_fingertip_midpoint_pos, ctrl_target_fingertip_midpoint_quat, ctrl_target_gripper_dof_pos
+    ):
+        if getattr(self, "_weld_held", False):
+            ctrl_target_gripper_dof_pos = self._weld_gripper_dof_pos()
+        super().generate_ctrl_signals(
+            ctrl_target_fingertip_midpoint_pos=ctrl_target_fingertip_midpoint_pos,
+            ctrl_target_fingertip_midpoint_quat=ctrl_target_fingertip_midpoint_quat,
+            ctrl_target_gripper_dof_pos=ctrl_target_gripper_dof_pos,
+        )
+
     # --- scene (adds the wrist camera for the vision variant) -------------------------------
+    def _weld_held_asset(self):
+        """Rigidly WELD the held screw to a gripper body with a PER-ENV FixedJoint (created AFTER clone, so each
+        env bakes its OWN grasp-misalign tilt). The screw is a RigidObject (no articulation root), so the
+        joint to the robot articulation is legal -- welding two ARTICULATIONS crashes PhysX. It stays a
+        DYNAMIC body: still physically seats in the socket + transmits contact to the wrist F/T, it just
+        can't slip, fall out, or be pinched through by the welded pad.
+
+        The joint frame is derived to EXACTLY match Factory's validated clamp grasp transform. The clamp
+        (randomize_initial_state) places the screw at ``fingertip * flip_z * inverse(rel)`` -- note the
+        flip_z (180deg about Y) AND the inverse of the fingertip->asset relative pose. For a TCP weld,
+        body0 IS the gripper_tcp (= fingertip) body. For a one-pad weld, body0 is a finger link and frame0
+        first maps that link to gripper_tcp, then applies the same TCP->screw transform. Hand-building it as
+        a plain +z offset put the screw in UPSIDE DOWN (shaft in the jaws), so we compute it from the SAME
+        tf ops. rel already includes the per-env grasp-misalign, so the DR is preserved (fixed per-env tilt,
+        not per-reset -- a static joint frame can't be re-randomized cheaply). NOTE: Factory's per-reset
+        +-3mm held_asset_pos_noise is dropped (minor)."""
+        import re
+        import omni.usd
+        from pxr import Gf, UsdPhysics
+
+        stage = omni.usd.get_context().get_stage()
+        # Sample the per-env grasp-misalign ONCE; stash it so the reset grasp placement + aux label reuse the
+        # SAME angle (so the written reset pose matches the weld and there is no first-step snap/fight).
+        max_deg = float(getattr(self.cfg_task, "grasp_misalign_max_deg", 0.0))
+        if max_deg > 0.0:
+            angles = math.radians(max_deg) * (2.0 * torch.rand(self.num_envs, device=self.device) - 1.0)
+        else:
+            angles = torch.zeros(self.num_envs, device=self.device)
+        self._weld_misalign_signed = angles
+
+        # TCP->screw = flip_z * inverse(held_asset_relative_pose), per env -- the clamp's exact hand->screw tf.
+        rel_pos, rel_quat = self.get_handheld_asset_relative_pose()  # per-env, includes the baked misalign
+        inv_quat, inv_pos = torch_utils.tf_inverse(rel_quat, rel_pos)
+        flip_z = torch.tensor([0.0, 0.0, 1.0, 0.0], device=self.device).repeat(self.num_envs, 1)  # 180deg about Y
+        tcp_screw_quat, tcp_screw_pos = torch_utils.tf_combine(
+            flip_z, torch.zeros((self.num_envs, 3), device=self.device), inv_quat, inv_pos
+        )
+
+        parent_body = str(getattr(self.cfg, "weld_held_parent_body", "gripper_tcp"))
+        parent_tcp_quat, parent_tcp_pos = self._weld_parent_to_tcp_pose(parent_body)
+        f0_quat, f0_pos = torch_utils.tf_combine(
+            parent_tcp_quat, parent_tcp_pos, tcp_screw_quat, tcp_screw_pos
+        )
+        self._weld_parent_body = parent_body
+        self._weld_frame0_quat = f0_quat.clone()
+        self._weld_frame0_pos = f0_pos.clone()
+        f0_quat, f0_pos = f0_quat.cpu(), f0_pos.cpu()
+
+        parent_by_env, screw_by_env = {}, {}
+        for prim in stage.Traverse():
+            p = prim.GetPath().pathString
+            m = re.search(r"/env_(\d+)/", p)
+            if m is None:
+                continue
+            e = int(m.group(1))
+            if p.endswith(f"/{parent_body}"):
+                parent_by_env[e] = p
+            elif "/HeldAsset" in p and prim.HasAPI(UsdPhysics.RigidBodyAPI):
+                screw_by_env[e] = p
+
+        n_ok = 0
+        for e in range(self.num_envs):
+            parent, screw = parent_by_env.get(e), screw_by_env.get(e)
+            if parent is None or screw is None:
+                continue
+            qw, qx, qy, qz = (float(x) for x in f0_quat[e])
+            px, py, pz = (float(x) for x in f0_pos[e])
+            j = UsdPhysics.FixedJoint.Define(stage, screw + f"/weld_to_{parent_body}")
+            j.CreateBody0Rel().SetTargets([parent])
+            j.CreateBody1Rel().SetTargets([screw])
+            j.CreateLocalPos0Attr().Set(Gf.Vec3f(px, py, pz))
+            j.CreateLocalRot0Attr().Set(Gf.Quatf(qw, qx, qy, qz))
+            j.CreateLocalPos1Attr().Set(Gf.Vec3f(0.0, 0.0, 0.0))
+            j.CreateLocalRot1Attr().Set(Gf.Quatf(1.0, 0.0, 0.0, 0.0))
+            # CRITICAL: a joint from an articulation link to an external body pulls that body
+            # INTO the robot articulation and breaks its creation ("Failed to create articulation at Robot").
+            # Mark it excludeFromArticulation so PhysX treats it as a MAXIMAL (out-of-articulation) fixed
+            # constraint -- a rigid weld that leaves the Robot articulation topology untouched.
+            j.CreateExcludeFromArticulationAttr().Set(True)
+            n_ok += 1
+        print(f"[weld] created {n_ok}/{self.num_envs} per-env {parent_body}<-screw welds (clamp-matched frame)  "
+              f"misalign<=+/-{max_deg:.1f}deg")
+
+    def _sync_welded_held_pose_from_parent(self, env_ids=None):
+        """Write the held screw pose implied by the fixed joint and its current parent body.
+
+        Factory resets freely teleport the held asset into the gripper. Once the screw is welded, direct
+        held-body teleports can fight the fixed joint and create visible snap/penetration artifacts. This
+        helper keeps the RigidObject state exactly consistent with the authored parent->screw weld frame.
+        """
+        if not getattr(self, "_weld_held", False) or not hasattr(self, "_weld_frame0_pos"):
+            return
+        if env_ids is None:
+            env_ids = torch.arange(self.num_envs, device=self.device)
+        elif not isinstance(env_ids, torch.Tensor):
+            env_ids = torch.as_tensor(env_ids, device=self.device, dtype=torch.long)
+        else:
+            env_ids = env_ids.to(device=self.device, dtype=torch.long)
+        parent_body = str(getattr(self, "_weld_parent_body", getattr(self.cfg, "weld_held_parent_body", "gripper_tcp")))
+        parent_idx = self._robot.body_names.index(parent_body)
+        parent_pos = self._robot.data.body_pos_w[env_ids, parent_idx]
+        parent_quat = self._robot.data.body_quat_w[env_ids, parent_idx]
+        held_quat, held_pos = torch_utils.tf_combine(
+            parent_quat, parent_pos, self._weld_frame0_quat[env_ids], self._weld_frame0_pos[env_ids]
+        )
+        held_pose = torch.cat((held_pos, held_quat), dim=1)
+        self._held_asset.write_root_pose_to_sim(held_pose, env_ids=env_ids)
+        self._held_asset.write_root_velocity_to_sim(torch.zeros((len(env_ids), 6), device=self.device), env_ids=env_ids)
+        self._held_asset.reset(env_ids)
+
     def _setup_scene(self):
         """Factory's scene plus a wrist-mounted TiledCamera (vision variant only).
 
@@ -203,7 +386,15 @@ class InsertionEnv(ForgeEnv):
 
         self._robot = Articulation(self.cfg.robot)
         self._fixed_asset = Articulation(self.cfg_task.fixed_asset)
-        self._held_asset = Articulation(self.cfg_task.held_asset)
+        # Held screw: a RigidObject when we weld it to the gripper (no articulation root -> a FixedJoint to
+        # the robot articulation is legal; welding two ARTICULATIONS crashes PhysX). Else Factory's 1-body
+        # Articulation (physical clamp grasp). The weld itself is created AFTER clone (per-env, below).
+        self._held_is_rigid = isinstance(self.cfg_task.held_asset, RigidObjectCfg)
+        self._weld_held = self._held_is_rigid and bool(getattr(self.cfg, "weld_held_to_gripper", False))
+        if self._held_is_rigid:
+            self._held_asset = RigidObject(self.cfg_task.held_asset)
+        else:
+            self._held_asset = Articulation(self.cfg_task.held_asset)
 
         self._tiled_camera = None
         if getattr(self.cfg, "tiled_camera", None) is not None:
@@ -223,7 +414,13 @@ class InsertionEnv(ForgeEnv):
 
         self.scene.articulations["robot"] = self._robot
         self.scene.articulations["fixed_asset"] = self._fixed_asset
-        self.scene.articulations["held_asset"] = self._held_asset
+        if self._held_is_rigid:
+            self.scene.rigid_objects["held_asset"] = self._held_asset
+        else:
+            self.scene.articulations["held_asset"] = self._held_asset
+        # Per-env FixedJoint welds, created AFTER clone so each env can bake its OWN grasp-misalign tilt.
+        if self._weld_held:
+            self._weld_held_asset()
         if self._tiled_camera is not None:
             self.scene.sensors["tiled_camera"] = self._tiled_camera
         if self._scene_camera is not None:
@@ -319,7 +516,19 @@ class InsertionEnv(ForgeEnv):
         # parent __init__, which may itself trigger a reset.)
         if hasattr(self, "_socket_table"):
             self._sample_sockets(env_ids)
-        super().randomize_initial_state(env_ids)
+        old_held_noise = None
+        if getattr(self, "_weld_held", False):
+            old_held_noise = self.cfg_task.held_asset_pos_noise
+            self.cfg_task.held_asset_pos_noise = [0.0, 0.0, 0.0]
+        try:
+            super().randomize_initial_state(env_ids)
+        finally:
+            if old_held_noise is not None:
+                self.cfg_task.held_asset_pos_noise = old_held_noise
+        if getattr(self, "_weld_held", False):
+            self._set_welded_gripper_state(env_ids)
+            self._sync_welded_held_pose_from_parent(env_ids)
+            self.step_sim_no_action()
         # Replace Factory's inherited Gaussian fixed-asset observation noise with bounded upstream
         # socket/goal pose error. This is actor-side only: the critic still receives clean fixed_pos.
         # The physical reset offset is separate (cfg_task.hand_init_pos_noise).
@@ -373,22 +582,27 @@ class InsertionEnv(ForgeEnv):
         held_asset_relative_pos[:, 2] = head_height - self.cfg_task.robot_cfg.franka_fingerpad_length
         max_deg = getattr(self.cfg_task, "grasp_misalign_max_deg", 0.0)
         n = self.num_envs
-        if max_deg > 0.0:
-            # Physical grasp tilt: a cylindrical head between flat parallel pads can only tip ABOUT THE
-            # FINGER PRESSING AXIS (the pads' closing direction), flopping the shaft in the plane
-            # perpendicular to it. Tipping toward/away from a pad FACE is blocked by the flat pad. The
-            # Franka closes along the fingertip-frame Y axis (measured pressing axis ~= [0,-1,0] in the
-            # fingertip frame), so we tilt about Y by a signed angle in [-max, max]. The old code tilted
-            # about a random horizontal axis, which (a) included the blocked toward-pad direction and
-            # (b) wasted part of the rotation as harmless roll about the shaft. RE-MEASURE the pressing
-            # axis for the custom gripper (viz_camera prints it).
+        # Physical grasp tilt: a cylindrical head between flat parallel pads can only tip ABOUT THE
+        # FINGER PRESSING AXIS (the pads' closing direction), flopping the shaft in the plane
+        # perpendicular to it. Tipping toward/away from a pad FACE is blocked by the flat pad. The
+        # Franka closes along the fingertip-frame Y axis (measured pressing axis ~= [0,-1,0] in the
+        # fingertip frame), so we tilt about Y by a signed angle in [-max, max]. RE-MEASURE the pressing
+        # axis for the custom gripper (viz_camera prints it).
+        welded = getattr(self, "_weld_held", False)
+        if welded:
+            # Welded grasp: the tilt is BAKED into the per-env FixedJoint (_weld_held_asset). Reuse that same
+            # per-env angle so the written reset pose matches the weld (no first-step snap) + the aux label
+            # stays correct. (Per-env fixed, not per-reset -- a static joint frame can't be cheaply re-tilted.)
+            mag = getattr(self, "_weld_misalign_signed", torch.zeros(n, device=self.device))
+        elif max_deg > 0.0:
             mag = math.radians(max_deg) * (2.0 * torch.rand(n, device=self.device) - 1.0)
+        else:
+            mag = torch.zeros(n, device=self.device)
+        if welded or max_deg > 0.0:
             axis = torch.zeros((n, 3), device=self.device)
             axis[:, 1] = 1.0  # fingertip-frame Y = finger pressing/closing axis
             misalign_quat = torch_utils.quat_from_angle_axis(mag, axis)
             held_asset_relative_quat = torch_utils.quat_mul(misalign_quat, held_asset_relative_quat)
-        else:
-            mag = torch.zeros(n, device=self.device)
         # Stash the per-episode signed grasp tilt (rad) as the label for the auxiliary grasp head. Set
         # for ALL envs every reset (resets are synchronized), so it matches each env's current episode.
         # This is the COMMANDED tilt; the realized angle drifts a little under gravity sag, which is
@@ -407,7 +621,21 @@ class InsertionEnv(ForgeEnv):
         body angles -- a realistic angled pre-insert, not a tip swung out of the socket. Uses the
         live grasp poses, so it stays correct after the iiwa/gripper swap (no hard-coded geometry).
         """
-        if self.cfg_task.pre_insert_tilt_max_deg <= 0.0:
+        final_deg = float(self.cfg_task.pre_insert_tilt_max_deg)
+        if final_deg <= 0.0:
+            return
+        # Tilt CURRICULUM: linearly ramp the effective max tilt from start->final over the first
+        # pre_insert_tilt_curriculum_steps control steps (0 => constant at final). common_step_counter
+        # counts control steps (~= iters * horizon_length). Stashed for logging/inspection.
+        start_deg = float(getattr(self.cfg_task, "pre_insert_tilt_start_deg", 0.0))
+        ramp = int(getattr(self.cfg_task, "pre_insert_tilt_curriculum_steps", 0) or 0)
+        if ramp > 0:
+            frac = min(1.0, max(0.0, float(self.common_step_counter) / float(ramp)))
+            cur_deg = start_deg + (final_deg - start_deg) * frac
+        else:
+            cur_deg = final_deg
+        self._cur_pre_insert_tilt_deg = cur_deg
+        if cur_deg <= 0.0:
             return
 
         # No gravity while we re-pose (mirror Factory's reset; the screw also has gravity disabled).
@@ -416,7 +644,7 @@ class InsertionEnv(ForgeEnv):
 
         # Sample an isotropic tilt of the vertical screw axis: magnitude in [0, max], random azimuth.
         n = self.num_envs
-        max_rad = math.radians(self.cfg_task.pre_insert_tilt_max_deg)
+        max_rad = math.radians(cur_deg)
         mag = max_rad * torch.rand(n, device=self.device)
         az = 2.0 * math.pi * torch.rand(n, device=self.device)
         axis = torch.stack([torch.cos(az), torch.sin(az), torch.zeros_like(az)], dim=1)
@@ -435,28 +663,41 @@ class InsertionEnv(ForgeEnv):
         new_ft_quat = torch_utils.quat_mul(tilt_quat, ft_quat)
         pos_err, aa_err = self.set_pos_inverse_kinematics(new_ft_pos, new_ft_quat, env_ids)
         ik_failed = (torch.linalg.norm(pos_err, dim=1) > 1e-3) | (torch.linalg.norm(aa_err, dim=1) > 1e-3)
+        failed_env_ids = env_ids[ik_failed.nonzero(as_tuple=False).squeeze(-1)]
 
         # Carry the screw rigidly with the same tilt about the tip (tip stays put, body angles by the
         # sampled angle). Envs where IK failed keep the original vertical grasp -> arm + screw stay
         # consistent (no contact shove, no out-of-range tilt).
         new_held_pos = tip + torch_utils.quat_apply(tilt_quat, held_pos0 - tip)
         new_held_quat = torch_utils.quat_mul(tilt_quat, held_quat0)
-        new_held_pos[ik_failed] = held_pos0[ik_failed]
-        new_held_quat[ik_failed] = held_quat0[ik_failed]
-        if ik_failed.any():
-            self.joint_pos[ik_failed] = saved_joint_pos[ik_failed]
+        new_held_pos[failed_env_ids] = held_pos0[failed_env_ids]
+        new_held_quat[failed_env_ids] = held_quat0[failed_env_ids]
+        if len(failed_env_ids) > 0:
+            self.joint_pos[failed_env_ids] = saved_joint_pos[failed_env_ids]
             self.joint_vel[:] = 0.0
             self._robot.write_joint_state_to_sim(self.joint_pos, self.joint_vel)
             self.ctrl_target_joint_pos[:, 0:7] = self.joint_pos[:, 0:7]
             self._robot.set_joint_position_target(self.ctrl_target_joint_pos)
 
-        held_state = self._held_asset.data.default_root_state.clone()
-        held_state[:, 0:3] = new_held_pos + self.scene.env_origins
-        held_state[:, 3:7] = new_held_quat
+        if getattr(self, "_weld_held", False):
+            self._set_welded_gripper_state(env_ids)
+            self._sync_welded_held_pose_from_parent(env_ids)
+            self.step_sim_no_action()
+            physics_sim_view.set_gravity(carb.Float3(*self.cfg.sim.gravity))
+            self.prev_fingertip_pos = self.fingertip_midpoint_pos.clone()
+            self.prev_fingertip_quat = self.fingertip_midpoint_quat.clone()
+            self.prev_joint_pos = self.joint_pos[:, 0:7].clone()
+            self.ee_linvel_fd[:, :] = 0.0
+            self.ee_angvel_fd[:, :] = 0.0
+            return
+
+        held_state = self._held_asset.data.default_root_state.clone()[env_ids]
+        held_state[:, 0:3] = new_held_pos[env_ids] + self.scene.env_origins[env_ids]
+        held_state[:, 3:7] = new_held_quat[env_ids]
         held_state[:, 7:] = 0.0
-        self._held_asset.write_root_pose_to_sim(held_state[:, 0:7])
-        self._held_asset.write_root_velocity_to_sim(held_state[:, 7:])
-        self._held_asset.reset()
+        self._held_asset.write_root_pose_to_sim(held_state[:, 0:7], env_ids=env_ids)
+        self._held_asset.write_root_velocity_to_sim(held_state[:, 7:], env_ids=env_ids)
+        self._held_asset.reset(env_ids)
         self.step_sim_no_action()
 
         # Restore gravity; clear the reset-induced finite-difference velocities so step 0 is clean.

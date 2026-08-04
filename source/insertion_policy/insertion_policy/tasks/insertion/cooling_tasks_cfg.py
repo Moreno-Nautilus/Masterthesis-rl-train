@@ -58,6 +58,15 @@ class CoolingInsert(FactoryTask):
     # (tip stays over the socket mouth) by a uniform angle in [0, this], matching the ~20-25 deg
     # upstream orientation uncertainty. 0.0 disables it (recovers the vertical-only reset).
     pre_insert_tilt_max_deg: float = 25.0
+    # Tilt CURRICULUM: linearly ramp the effective max tilt from ``pre_insert_tilt_start_deg`` to
+    # ``pre_insert_tilt_max_deg`` over the first ``pre_insert_tilt_curriculum_steps`` env CONTROL steps
+    # (self.common_step_counter; ~= iterations * horizon_length, so e.g. 128*600=76800 ramps over ~600 it
+    # at horizon 128). 0 steps => no curriculum (constant at max, the current behaviour). Lets the policy
+    # learn to SEAT aligned first, then generalize to tilt -- the direct attack on the axis-error binding
+    # constraint. NOTE: common_step_counter resets to 0 on a resumed run, so set the ramp to finish well
+    # inside one run segment (re-ramp on a mid-anneal crash is a minor transient).
+    pre_insert_tilt_start_deg: float = 0.0
+    pre_insert_tilt_curriculum_steps: int = 0
 
     # Robot start, relative to the fixed-asset tip (socket opening). This is the FINGERTIP target:
     # nominally 6.3cm above the socket, with +/-2cm z noise -> fingertip starts about 4.3-8.3cm

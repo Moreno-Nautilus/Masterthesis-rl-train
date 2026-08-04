@@ -1,0 +1,26 @@
+# ===== E2E VISUOMOTOR — weekend TILT SWEEP (2026-07-31) ============================================
+# WHY a sweep, not 5 runs at one config: the first vision run (30deg tilt) showed the wrist camera
+# resolves POSITION but not fine ORIENTATION -> shaft-axis stuck ~35-40deg, screw arrives angled,
+# success ~0. So instead of burning the weekend on one config that may all-fail, we MAP success-vs-tilt.
+#   - LOW tilt (8-12deg) = the FIX: screw arrives ~aligned, vision should seat -> a WORKING policy by
+#     Monday ("something half useful"), and it validates the whole pipeline end-to-end.
+#   - HIGH tilt (20-24deg) = where vision breaks -> characterizes the orientation-perception limit
+#     (a real thesis finding either way). Easiest first (early positive result, box-death-safe).
+# tilt is set per-run via `env.weekend_tilt_deg` (ForgeTaskCoolingInsertIiwaE2EVisionCfg.__post_init__).
+# Everything else baked in: squashing reward + seat bonus, solver 128, 224px, ResNet-18, +-10mm lateral.
+#
+# LAUNCH:
+#   PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True \
+#   TASK=Isaac-Insertion-CoolingPeg-Iiwa-E2E-Vision-Direct-v0 \
+#   setsid bash scripts/run_chain.sh scripts/runlist_e2e_weekend.txt </dev/null >/tmp/chain_e2e_weekend.log 2>&1 &
+#
+# WATCH Monday: successes/iter per run + shaft_axis_error (does it come DOWN at low tilt?). The knee of
+# success-vs-tilt = how much orientation the wrist cam can resolve. If even 8deg fails -> it's not just
+# tilt (position/perception deeper issue) -> pull the explicit-estimator / higher-res levers.
+#
+# name             | num_envs | max_iters | eval_envs | eval_seeds | extra_overrides            | train_seed
+e2e_vis_tilt08     | 32       | 1500      | 32        | 42         | env.weekend_tilt_deg=8.0   | 42
+e2e_vis_tilt12     | 32       | 1500      | 32        | 42         | env.weekend_tilt_deg=12.0  | 42
+e2e_vis_tilt16     | 32       | 1500      | 32        | 42         | env.weekend_tilt_deg=16.0  | 42
+e2e_vis_tilt20     | 32       | 1500      | 32        | 42         | env.weekend_tilt_deg=20.0  | 42
+e2e_vis_tilt24     | 32       | 1500      | 32        | 42         | env.weekend_tilt_deg=24.0  | 42

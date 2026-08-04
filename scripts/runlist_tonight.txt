@@ -1,0 +1,29 @@
+# === THU 2026-07-30: fixed_sigma isolation test (the KL-explosion root fix) =========================
+# Launch (NO LR_FLOOR this time -> clean attribution):
+#   setsid bash scripts/run_chain.sh scripts/runlist_tonight.txt </dev/null >/tmp/chain_tonight.log 2>&1 &
+#
+# HYPOTHESIS: the late KL explosion / LR cascade is caused by the LEARNED sigma collapsing.
+#   KL(N(mu_old,s) || N(mu_new,s)) = ||dmu||^2 / (2*sigma^2). As learned sigma -> small (policy gets
+#   "confident", entropy_coef=0 so nothing resists it), the 1/sigma^2 factor detonates: an ordinary
+#   noisy dmu becomes a huge KL -> adaptive LR overreacts -> slams LR to the floor -> frozen policy.
+#
+# THE FIX (single variable): fixed_sigma=True. sigma_init is already const 0 -> sigma pinned at e^0 = 1.
+#   Removes the 1/sigma^2 amplifier (KL can't explode) AND keeps exploration alive (sigma stays wide ->
+#   the drift into saturation is resisted, not committed to). NOTHING else changed:
+#     - lr_schedule STAYS adaptive (kl0.008). If fixed_sigma alone tames the KL, the adaptive LR self-tunes
+#       normally like the healthy runs did. This is the ISOLATION: does killing sigma-collapse alone fix it?
+#     - NO LR_FLOOR (so a healthy LR proves fixed_sigma did it, not the floor).
+#     - mlp activation already elu, bounds_loss_coef already 0.0001 (= Fabrica) -> no drift counter added yet.
+#   Same proven vision_res224_1 recipe otherwise (224px, no torque, no aux, fc128, 48env, seed42, 1500it).
+#
+# WATCH: info/last_lr (should stay learnable, not ratchet to 1e-6), losses/kl (bounded, no late spike),
+#   and mu/bounds_loss + action saturation (drift is neutralized for STABILITY; if the policy still goes
+#   bang-bang that's a PERFORMANCE issue -> then raise bounds_loss_coef or mu_activation=tanh, not now).
+# save_frequency=100 -> eval ep1000/1200/1500, keep the best.
+#
+# ESCALATION if it STILL cascades late: add lr_schedule=fixed (Fabrica's other structural change) -> that's
+#   Fabrica's full proven config. Only then consider their other knobs (horizon 32, mini_epochs 8).
+#
+# NOTE: do NOT `DRYRUN=1` this file (writes the .iters marker -> skip). Do NOT kill -9 (corrupts GPU state).
+# name | envs | iters | eval_envs | eval_seeds | overrides | [train_seed]
+fixed_sigma_1 | 48 | 1500 | 128 | 42 | ~agent.params.network.aux_head agent.params.network.space.continuous.fixed_sigma=True agent.params.env.obs_groups.obs=[policy,image] env.image_height=224 env.image_width=224 env.tiled_camera.width=224 env.tiled_camera.height=224 agent.params.config.save_frequency=100 env.cam_log_interval=0
