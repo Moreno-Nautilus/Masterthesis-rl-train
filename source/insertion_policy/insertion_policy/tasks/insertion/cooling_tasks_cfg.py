@@ -158,9 +158,11 @@ class ForgeTaskCoolingInsertCfg(ForgeEnvCfg):
     # Actor-side socket/goal observation error. Factory's inherited fixed_asset_pos noise is Gaussian
     # (~1mm stddev by default), which makes the state policy's target estimate too clean for the
     # upstream pose-estimation error. Use bounded per-episode uniform noise instead: x/y are lateral
-    # target error "up to 8mm"; z is smaller because the base is table-supported, but nonzero for
-    # pose-estimation/table-height/calibration error.
-    fixed_asset_pos_obs_noise_bound: list = [0.008, 0.008, 0.002]
+    # target error "up to ~1cm"; z is smaller because the base is table-supported, but nonzero for
+    # pose-estimation/table-height/calibration error. Bounded PER-EPISODE (fixed within an episode) ->
+    # models the real INIT socket-pose estimate (base is static during a seat, so no per-step tracking
+    # needed); set to the real init-estimator accuracy (~1cm per user, 2026-08-04).
+    fixed_asset_pos_obs_noise_bound: list = [0.010, 0.010, 0.002]
 
     # --- 6-axis F/T: expose the CONTACT TORQUE channels in the policy obs ---------------------
     # Forge already feeds the 3-axis contact FORCE (`ft_force` = noisy `force_sensor_smooth[:,0:3]`)

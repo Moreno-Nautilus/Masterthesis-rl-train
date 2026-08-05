@@ -1,0 +1,15 @@
+# ===== RUN B ONLY: welded grasp + socket + proprio + tilt curriculum (2026-08-04) =================
+# The best-policy run. Weld is default-ON (rigid grasp, grid-verified 100/100). Socket obs noise now
+# +-1cm (init-estimate error; base static -> no per-step tracking needed). Compare to the old
+# e2e_socket_grasp (33%, same recipe but the BROKEN grasp) = the weld's effect, and to res224 (65%).
+# Skipping the weld-only A run: the old 33% already IS the pre-weld baseline (weld is a fix, not a lever).
+#
+# tilt CURRICULUM ramps 0 -> 18deg over 76800 control steps (~600 it @ horizon 128), then constant 18deg.
+# 1500it, 32 env (VRAM cap), KL 0.016, no constant LR. ~10.5h -> one night. Auto-resume watchdog on.
+#
+# LAUNCH (user's go):
+#   PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True TASK=Isaac-Insertion-CoolingPeg-Iiwa-E2E-Vision-Direct-v0 \
+#   setsid bash scripts/run_chain.sh scripts/runlist_weld_B.txt </dev/null >/tmp/chain_weldB.log 2>&1 &
+#
+# name              | num_envs | max_iters | eval_envs | eval_seeds | extra_overrides                                                                                                                      | train_seed
+e2e_weld_curric     | 32       | 1500      | 64        | 42         | env.e2e_use_proprio_obs=True env.e2e_socket_anchored_action=True env.weekend_tilt_deg=18.0 env.tilt_curriculum_steps=76800 env.tilt_start_deg=0.0 | 42
