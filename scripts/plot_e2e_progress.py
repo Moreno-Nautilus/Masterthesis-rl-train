@@ -76,7 +76,8 @@ def main():
 
     data = {r: load_stitched(r) for r in args.runs if os.path.isdir(os.path.join(ROOT, r))}
     runs = list(data)
-    hi = {"vision_res224_1": ("black", 3.0), "e2e_vis_proprio": ("tab:green", 3.0)}
+    hi = {"vision_res224_1": ("black", 3.0), "e2e_vis_proprio": ("tab:green", 3.0),
+          "e2e_deploy_g25t12": ("tab:green", 3.0), "e2e_deploy_g25t12_s192": ("tab:blue", 3.0)}
     faded = plt.cm.autumn(np.linspace(0.15, 0.75, max(1, len(runs))))
     colors, fi = {}, 0
     for r in runs:

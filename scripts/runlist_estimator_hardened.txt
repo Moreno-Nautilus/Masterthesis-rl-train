@@ -1,0 +1,28 @@
+# ===== ESTIMATOR RETRAIN under the 2026-08-13 DEPLOY-HARDENING edits (new run, 2500 it) ==============
+# Base recipe = w2_estimator_192 (the deployed explicit-estimator winner). The NEW hardening (structured
+# D405 depth + modality dropout, +-180 yaw, +-15mm lateral, grasp +7deg secondary tilt, friction ~0.5,
+# 18s episodes, control latency 0-2, blue-material + colour-temp DR, anti-jam force penalty, deeper
+# estimator head) is AUTO-APPLIED via ForgeTaskCoolingInsertIiwaE2EVisionCfg.__post_init__ -- no new
+# flags needed for those. The overrides below are the SAME run-time knobs w2 used (they default off/0 in
+# cfg, so they MUST be passed): proprio + socket-anchored action + gravity-comp + estimator label,
+# tilt/anchor curricula, center weight 20.0 (NOTE: multiplies xy_dist in METRES -> 0.5 would be ~off),
+# and the CAD-calibrated hand-eye camera pose (must match the deployed sensor).
+#
+# FROM SCRATCH (not a w2 resume): the estimator head arch changed (hidden 128->256, 1->2 layers) so the
+# old checkpoint can't warm-start; the depth regime also changed drastically. New name => fresh run.
+#
+# WATCH: 2500 it is beyond the LR-cascade-tested 1500 -> watch info/last_lr must NOT pin 1e-6 (kl 0.016
+# guard is in the yaml). And early success: structured depth (45% invalid) + modality dropout (15%
+# RGB-only) + full yaw hit from step 0 -> if it stalls off the line, add the depth curriculum (ask me).
+#
+# LAUNCH (your go):
+#   PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True \
+#   TASK=Isaac-Insertion-CoolingPeg-Iiwa-E2E-Vision-Estimator-Direct-v0 \
+#   setsid bash scripts/run_chain.sh scripts/runlist_estimator_hardened.txt </dev/null \
+#     >/tmp/chain_estimator_hardened.log 2>&1 &
+#
+# Curricula (all ramp over ~160000 control steps ~= 1250 it, ~50% of 2500): pre-insert tilt 0->25deg,
+# socket-anchor obs noise 1cm->3cm, DEPTH corruption+modality 0->full (cfg default), wrist yaw 45->180deg
+# (cfg default). Grasp misalign 25deg is BAKED per-env (can't be ramped -- rigid weld). center weight 20.
+# name | num_envs | max_iters | eval_envs | eval_seeds | extra_overrides | train_seed | task
+e2e_estimator_hardened_2500 | 32 | 2500 | 64 | 42 | env.e2e_use_proprio_obs=True env.e2e_socket_anchored_action=True env.weekend_tilt_deg=25.0 env.tilt_curriculum_steps=160000 env.tilt_start_deg=0.0 env.fixed_asset_pos_obs_noise_bound=[0.03,0.03,0.005] env.fixed_asset_pos_obs_noise_curriculum_steps=160000 env.use_gravity_comp=True env.e2e_reward_center_weight=20.0 env.e2e_keep_aux_label=True env.wrist_cam_offset_pos=[0.05567,0.00900,-0.07472] env.wrist_cam_offset_quat=[-0.18301,0.68301,-0.68301,0.18301] | 42 | Isaac-Insertion-CoolingPeg-Iiwa-E2E-Vision-Estimator-Direct-v0

@@ -1,0 +1,5 @@
+===== ESTIMATOR VIZ =====
+samples: 38144   denorm: True
+pred-vs-true hole-gap error (mm)  mean/median/p90: 9.09/4.75/15.01
+  near hole (<10mm): mean 6.44mm  (n=9640)
+true tip->hole dist (mm) min/mean/max: 0.3/18.9/804.2

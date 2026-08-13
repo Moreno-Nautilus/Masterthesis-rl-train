@@ -101,13 +101,22 @@ class InsertionHybridBuilder(A2CBuilder):
             self._cnn_out = cnn_out
             self._proj_dim = int((cnn_params or {}).get("fc_size", 128)) if self._image_key is not None else 0
 
-            # Build the rest of the net as a flat (proj + proprio)-vector net: strip 'cnn' so the
-            # parent does not build its own CNN, and pass the fused feature dim as the input shape.
+            # EXPLICIT ESTIMATOR: aux targets listed in aux_head.feed_to_policy have their (detached)
+            # PREDICTION concatenated into the policy input -- gives the policy a vision-predicted hole
+            # pose instead of relying on the noisy 2.5cm socket anchor. Sized here so the parent MLP fits.
+            self._feed_targets = list((aux_cfg or {}).get("feed_to_policy") or []) if self._image_key is not None else []
+            _tg = (aux_cfg or {}).get("targets") or {}
+            self._estimator_dim = sum(
+                int(_tg[n]["slice"][1]) - int(_tg[n]["slice"][0]) for n in self._feed_targets if n in _tg
+            )
+
+            # Build the rest of the net as a flat (proj + proprio + estimator)-vector net: strip 'cnn' so
+            # the parent does not build its own CNN, and pass the fused feature dim as the input shape.
             parent_params = copy.deepcopy(params)
             parent_params.pop("cnn", None)
             parent_params.pop("aux_head", None)
             parent_kwargs = dict(kwargs)
-            parent_kwargs["input_shape"] = (self._proj_dim + proprio_dim,)
+            parent_kwargs["input_shape"] = (self._proj_dim + proprio_dim + self._estimator_dim,)
             super().__init__(parent_params, **parent_kwargs)
 
             # Now that nn.Module is initialized, build the real CNN + projection FC that forward() uses.
@@ -133,12 +142,19 @@ class InsertionHybridBuilder(A2CBuilder):
             self._aux_spec = {}  # name -> (lo, hi, coef)
             if self._image_key is not None and aux_cfg:
                 hidden = int(aux_cfg.get("hidden", 128))
+                # Optional deeper regressor: aux_head.layers = number of hidden layers (default 1 -> the
+                # original single-hidden-layer head, so existing checkpoints load unchanged). A deeper head
+                # gives the explicit hole estimator more capacity to recover the hole from RGB when depth is
+                # corrupted (the realistic-depth regime). Set aux_head.layers: 2 (+ a wider hidden) to use it.
+                n_layers = max(1, int(aux_cfg.get("layers", 1)))
                 heads = {}
                 for name, spec in (aux_cfg.get("targets") or {}).items():
                     lo, hi = int(spec["slice"][0]), int(spec["slice"][1])
-                    heads[name] = nn.Sequential(
-                        nn.Linear(self._proj_dim, hidden), nn.ReLU(), nn.Linear(hidden, hi - lo)
-                    )
+                    mods = [nn.Linear(self._proj_dim, hidden), nn.ReLU()]
+                    for _ in range(n_layers - 1):
+                        mods += [nn.Linear(hidden, hidden), nn.ReLU()]
+                    mods.append(nn.Linear(hidden, hi - lo))
+                    heads[name] = nn.Sequential(*mods)
                     self._aux_spec[name] = (lo, hi, float(spec.get("coef", 1.0)))
                 self._aux_heads = nn.ModuleDict(heads)
 
@@ -218,6 +234,7 @@ class InsertionHybridBuilder(A2CBuilder):
             proprio = [v for k, v in obs.items() if k != self._image_key and k != self._aux_label_key]
             feat = torch.cat(proprio, dim=1) if proprio else None
             self._aux_loss = None
+            self._estimator_pred = None  # last explicit-estimator prediction (for viz/logging)
             if self._image_cnn is not None:
                 img = obs[self._image_key].permute(0, 3, 1, 2).contiguous()  # BHWC -> BCHW
                 if self._image_is_resnet:
@@ -230,7 +247,15 @@ class InsertionHybridBuilder(A2CBuilder):
                 # heads are unused) and only when the privileged label is present.
                 if self.training and self._aux_heads is not None and self._aux_label_key in obs:
                     self._aux_loss = self._compute_aux_loss(cnn_feat, obs[self._aux_label_key])
-                feat = cnn_feat if feat is None else torch.cat([cnn_feat, feat], dim=1)
+                parts = [cnn_feat] if feat is None else [cnn_feat, feat]
+                # EXPLICIT ESTIMATOR: append the DETACHED predicted hole pose(s) so the policy consumes a
+                # vision-predicted socket location (trained by the supervised aux loss; detach keeps the
+                # estimator gradient purely supervised, not shaped by the policy loss).
+                if self._feed_targets and self._aux_heads is not None:
+                    preds = [self._aux_heads[_n](cnn_feat).detach() for _n in self._feed_targets]
+                    self._estimator_pred = torch.cat(preds, dim=1)  # exposed for viz (pred vs true hole gap)
+                    parts = parts + preds
+                feat = torch.cat(parts, dim=1)
             fused = dict(obs_dict)
             fused["obs"] = feat
             return super().forward(fused)

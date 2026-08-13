@@ -10,9 +10,11 @@
 #
 # Usage:  setsid bash scripts/run_chain.sh <runlist_file> </dev/null >/tmp/<chain>.log 2>&1 &
 # Runlist line ('|'-separated, '#' comments + blank lines ok; overrides field has spaces but no '|'):
-#   name | num_envs | max_iters | eval_envs | eval_seeds | extra_overrides [| train_seed]
+#   name | num_envs | max_iters | eval_envs | eval_seeds | extra_overrides [| train_seed [| task]]
 # train_seed is OPTIONAL (7th field); if omitted, uses $SEED_RNG (default 42). Lets one chain mix seeds
 # (e.g. a 2-seed variance check) unattended.
+# task is OPTIONAL (8th field); if omitted, uses $TASK. Lets one chain mix TASKS (e.g. the explicit-
+# estimator run uses a different agent yaml / task id than the plain E2E runs) in one unattended launch.
 set -u
 cd /home/moreno/Masterthesis-rl-train
 RUNLIST="${1:?runlist file}"
@@ -30,12 +32,13 @@ latest_ckpt(){ ls -t "logs/rl_games/Forge/$1/nn/"last_Forge_ep_[0-9]*_rew_[0-9]*
 trim(){ printf '%s' "${1:-}" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//'; }   # quote-safe (xargs choked on apostrophes)
 
 log "=== CHAIN START (list=$RUNLIST) ==="
-while IFS='|' read -r name envs iters evalenvs seeds ov trainseed; do
+while IFS='|' read -r name envs iters evalenvs seeds ov trainseed rowtask; do
   name="$(trim "${name:-}")"; [ -z "$name" ] && continue
   case "$name" in \#*) continue;; esac
   envs="$(trim "$envs")"; iters="$(trim "$iters")"; evalenvs="$(trim "$evalenvs")"
   seeds="$(trim "$seeds")"; ov="$(trim "$ov")"
   tseed="$(trim "${trainseed:-}")"; [ -z "$tseed" ] && tseed="$SEED_RNG"   # optional per-row train seed
+  rtask="$(trim "${rowtask:-}")"; [ -z "$rtask" ] && rtask="$TASK"          # optional per-row task (8th field)
   marker="$STATE_DIR/${name}.iters"
 
   if [ -f "$marker" ]; then
@@ -45,20 +48,20 @@ while IFS='|' read -r name envs iters evalenvs seeds ov trainseed; do
   fi
 
   if [ "$DRYRUN" = "1" ]; then
-    log "[DRY] TRAIN: SEED_RNG=$tseed bash scripts/auto_resume_train.sh $name $TASK $envs $iters  EXTRA_OVERRIDES='$ov'"
-    log "[DRY] EVAL : NUM_ENVS=$evalenvs bash scripts/eval_robust.sh $TASK <latest_ckpt $name> $seeds chain_${name}  EXTRA_OVERRIDES='$ov'"
+    log "[DRY] TRAIN: SEED_RNG=$tseed bash scripts/auto_resume_train.sh $name $rtask $envs $iters  EXTRA_OVERRIDES='$ov'"
+    log "[DRY] EVAL : NUM_ENVS=$evalenvs bash scripts/eval_robust.sh $rtask <latest_ckpt $name> $seeds chain_${name}  EXTRA_OVERRIDES='$ov'"
     echo "$iters" > "$marker"; log "[DRY] marker $name -> $iters"; continue
   fi
 
-  log ">>> TRAIN $name : ${envs} env -> ${iters} it  seed=${tseed}  [ov: ${ov:0:55}...]"
+  log ">>> TRAIN $name : ${envs} env -> ${iters} it  seed=${tseed}  task=${rtask##*-Insertion-}  [ov: ${ov:0:55}...]"
   free_gpu
-  SEED_RNG="$tseed" EXTRA_OVERRIDES="$ov" bash scripts/auto_resume_train.sh "$name" "$TASK" "$envs" "$iters"
+  SEED_RNG="$tseed" EXTRA_OVERRIDES="$ov" bash scripts/auto_resume_train.sh "$name" "$rtask" "$envs" "$iters"
 
   free_gpu
   ck="$(latest_ckpt "$name")"
   if [ -z "$ck" ]; then log "!!! $name: NO checkpoint -> skip eval"; echo "$(ts)  ${name}: NO CKPT (train failed?)" >> "$SUMMARY"; continue; fi
   log ">>> EVAL  $name : $(basename "$ck")  (${evalenvs} env, seeds ${seeds})"
-  EXTRA_OVERRIDES="$ov" NUM_ENVS="$evalenvs" bash scripts/eval_robust.sh "$TASK" "$ck" "$seeds" "chain_${name}"
+  EXTRA_OVERRIDES="$ov" NUM_ENVS="$evalenvs" bash scripts/eval_robust.sh "$rtask" "$ck" "$seeds" "chain_${name}"
   res="$(grep -h 'success\|HUNG\|FAILED' "/tmp/chain_${name}_summary.txt" 2>/dev/null | tr '\n' ' ')"
   echo "$(ts)  ${name} (${envs}env/${iters}it): ${res:-no report}" >> "$SUMMARY"
   echo "$iters" > "$marker"

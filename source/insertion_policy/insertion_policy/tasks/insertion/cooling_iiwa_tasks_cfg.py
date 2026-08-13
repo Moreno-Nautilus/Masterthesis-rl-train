@@ -233,8 +233,8 @@ IIWA_GRIPPER_E2E_CFG = IIWA_GRIPPER_CFG.replace(
     actuators={
         "iiwa_arm1": ImplicitActuatorCfg(
             joint_names_expr=["joint[1-4]"],
-            stiffness=1000.0,
-            damping=80.0,
+            stiffness=750.0,   # softened from 1000 (2026-08-05) -> gentler contact / less weld-snap; still ~2.5x KUKA ref
+            damping=70.0,
             friction=0.0,
             armature=0.0,
             effort_limit_sim=176.0,
@@ -242,8 +242,8 @@ IIWA_GRIPPER_E2E_CFG = IIWA_GRIPPER_CFG.replace(
         ),
         "iiwa_arm2": ImplicitActuatorCfg(
             joint_names_expr=["joint[5-7]"],
-            stiffness=500.0,
-            damping=50.0,
+            stiffness=375.0,   # softened from 500 (2026-08-05), same ~25% cut as arm1
+            damping=45.0,
             friction=0.0,
             armature=0.0,
             effort_limit_sim=110.0,
@@ -308,7 +308,7 @@ class ForgeTaskCoolingInsertIiwaE2ECfg(ForgeTaskCoolingInsertIiwaCfg):
     robot: ArticulationCfg = IIWA_GRIPPER_E2E_CFG
     debug_true_delta_obs: bool = True
 
-    e2e_pos_action_scale: float = 0.02  # metres
+    e2e_pos_action_scale: float = 0.01  # metres (was 0.02 for the 85% run; halved -> gentler contact/deploy)
     e2e_rot_action_scale: float = 0.1   # radians (~5.7 deg) per unit tilt action
     # Reward: SQUASHING kernel (Factory multi-scale, sharply peaked near d=0) + seat bonus. The plain
     # "l2_axis" reward is flat near the goal, so the state-first policy learned to HOVER ~3cm above the
@@ -318,6 +318,8 @@ class ForgeTaskCoolingInsertIiwaE2ECfg(ForgeTaskCoolingInsertIiwaCfg):
     e2e_reward_mode: str = "squashing"
     e2e_reward_pos_weight: float = 1.0
     e2e_reward_rot_weight: float = 0.25
+    e2e_reward_center_weight: float = 0.0  # lateral-centering reward weight (hole-finding under noise); 0 => off
+    e2e_keep_aux_label: bool = False  # keep the aux_label obs group -> enables the EXPLICIT ESTIMATOR
     e2e_success_bonus: float = 1.0
 
     # --- SPEED (debug scaffold ONLY) ---------------------------------------------------------------
@@ -381,18 +383,37 @@ class ForgeTaskCoolingInsertIiwaE2EVisionCfg(ForgeTaskCoolingInsertIiwaCameraCfg
     weld_held_parent_body: str = "left_finger_link"
     weld_gripper_closed_half_gap: float = 0.002
 
-    e2e_pos_action_scale: float = 0.02  # metres
+    e2e_pos_action_scale: float = 0.01  # metres (was 0.02 for the 85% run; halved -> gentler contact/deploy)
     e2e_rot_action_scale: float = 0.1   # radians (~5.7 deg) per unit tilt action
     # Reward = the VALIDATED squashing kernel + seat bonus (the state-first debug reached ~60% success
     # with this; the flat l2_axis reward gave 0% -- policy hovered above the hole). Same reward, vision obs.
     e2e_reward_mode: str = "squashing"
     e2e_reward_pos_weight: float = 1.0
     e2e_reward_rot_weight: float = 0.25
+    # LATERAL-CENTERING reward weight -- pull the tip OVER the hole (attacks "reaches the area, misses the
+    # hole", which dominates the seating failure). Hardened default 0.5 (start; tune 0.25-1.0 via runs).
+    e2e_reward_center_weight: float = 0.5
+    e2e_keep_aux_label: bool = False  # keep the aux_label obs group -> enables the EXPLICIT ESTIMATOR
     e2e_success_bonus: float = 1.0
+
+    # ANTI-JAM contact-force penalty (2026-08-13, deploy hardening): penalize SUSTAINED contact force above
+    # e2e_contact_penalty_threshold N while NOT seated, so the policy force-searches instead of pressing
+    # ~18N onto the fins. scale sized so the MAX per-step penalty is only a few % of the main reward term
+    # (must NOT make contact timid). Tune the scale via runs; 0 disables it.
+    e2e_contact_penalty_scale: float = 0.01
+    e2e_contact_penalty_threshold: float = 12.0  # N; sustained contact above this (unseated) is penalized
+    e2e_contact_penalty_cap: float = 8.0         # N; cap on the overshoot so a spike can't dominate reward
+    # CONTROL-LATENCY DR: max action delay in control steps (0-2 = 0-133ms at 15Hz), random per episode.
+    control_latency_max_steps: int = 2
+    # Effective radial-clearance stopgap: bump the peg+socket collision rest_offset by this (m) to TIGHTEN
+    # the ~1mm radial clearance toward the real ~0.5mm without regenerating the mesh. 0 => mesh clearance as
+    # authored. NOTE: the CLEAN fix is regenerating cooling_screw/cooling_base (13mm shaft vs 14mm socket)
+    # in scripts/convert_assets.py; this offset is a coarse approximation (also shifts seating depth).
+    contact_rest_offset: float = 0.0
 
     # Real-run contact solver: supervisor OK'd cranking Factory's 192 down to 128 (~1.5x faster rollout,
     # still high-fidelity for the 1mm insertion). Applied in __post_init__ (sim + robot + both parts).
-    real_solver_iters: int = 128
+    real_solver_iters: int = 192  # was 128 (speed); back to 192 for the final run -> stiffer weld under contact impulse
 
     # Pre-insert tilt (deg), the weekend SWEEP knob -> override per run via `env.weekend_tilt_deg=X`.
     # Must be a declared field so hydra can override it. Read in __post_init__ -> self.task.pre_insert_tilt_max_deg.
@@ -436,7 +457,44 @@ class ForgeTaskCoolingInsertIiwaE2EVisionCfg(ForgeTaskCoolingInsertIiwaCameraCfg
         # Tilt curriculum -> task (ramp start_deg -> weekend_tilt_deg over tilt_curriculum_steps control steps).
         self.task.pre_insert_tilt_start_deg = float(getattr(self, "tilt_start_deg", 0.0))
         self.task.pre_insert_tilt_curriculum_steps = int(getattr(self, "tilt_curriculum_steps", 0))
-        self.task.hand_init_pos_noise = [0.010, 0.010, 0.020]
+        # Screw (held_asset) friction DR (2026-08-05): was FIXED 0.75 (num_buckets=1). PLA-on-PLA is ~0.3-0.5;
+        # randomize static+dynamic over a buffered 0.3-0.9 so the CONTACT PAIR is robust to the real
+        # (unmeasurable/drifting) friction instead of overfitting one value. Socket (fixed_asset) is already
+        # randomized 0.25-1.25 by Forge. Self-disables if the Forge material event isn't present.
+        # Recentre the CONTACT PAIR friction on ~0.5 (PLA-on-PLA), still a DR band so it's robust to the
+        # real (unmeasurable/drifting) value. Applied to both the held screw and, if present, the socket.
+        if hasattr(self, "events") and hasattr(getattr(self, "events"), "held_physics_material"):
+            _hp = self.events.held_physics_material.params
+            _hp["static_friction_range"] = (0.4, 0.7)
+            _hp["dynamic_friction_range"] = (0.4, 0.7)
+            _hp["num_buckets"] = 64
+        for _fixed_evt in ("fixed_physics_material", "fixed_asset_physics_material"):
+            if hasattr(self, "events") and hasattr(getattr(self, "events"), _fixed_evt):
+                _fp = getattr(self.events, _fixed_evt).params
+                _fp["static_friction_range"] = (0.4, 0.7)
+                _fp["dynamic_friction_range"] = (0.4, 0.7)
+                _fp["num_buckets"] = 64
+        # Grasp realism DR (2026-08-05, user): the real clamp grasp isn't perfect/repeatable ->
+        # (a) misalign tilt 10->25deg (screw crooked in the pads about the pressing axis -- the DOMINANT,
+        #     realistic grasp error). FIXED per-env, cold from step 0: the rigid weld bakes it ONCE at init
+        #     and it cannot be curriculum-ramped without the vetoed per-reset D6 drive. Pre-insert (gripper)
+        #     tilt is the SMALL secondary error (weekend_tilt_deg=12) and IS the curriculum-ramped one.
+        # (b) grasp POSITION jitter: axial +-3mm (shaft depth, never retracts the shaft into the pads)
+        # + lateral +-2mm (in-pad plane). VERIFY in-bounds with render_grasp_grid.py.
+        self.task.grasp_misalign_max_deg = 25.0
+        # Grasp position jitter widened to +-5mm (2026-08-13 deploy hardening; was 3/2mm). NOTE the axial
+        # (+z) direction retracts the shaft INTO the pads -- verify with render_grasp_grid.py that +5mm
+        # never pulls the shaft shoulder inside the jaws; drop axial to ~4mm if it does.
+        self.task.grasp_pos_jitter_axial_mm = 5.0
+        self.task.grasp_pos_jitter_lateral_mm = 5.0
+        # Secondary out-of-plane grasp tilt (about fingertip X): ~7deg from pad compliance / off-centre head.
+        self.task.grasp_misalign_secondary_deg = 7.0
+        # Lateral pre-insert offset widened +-8->+-15mm (keep z +-20mm).
+        self.task.hand_init_pos_noise = [0.015, 0.015, 0.020]
+        # Full +-180deg wrist YAW: deploy tool yaw (~50deg) exceeds the old +-45deg band and A7 limits block
+        # preinserting to nominal, so train the full range. The hole is yaw-symmetric -> this only rotates
+        # the wrist image (round peg), no geometric change to the insertion.
+        self.task.hand_init_orn_noise = [0.0, 0.0, 3.1416]
         # Widen the SOCKET placement so the restored socket-relative pose obs sees real spatial variation
         # (not a memorisable constant): X band 0.65-0.75m (nominal 0.70 +- 0.05, recentred 2cm nearer than
         # the 0.72 default per user), Y +-15cm, Z +-5cm. Y is the roomy axis -- at x~0.70 it's a base-yaw
@@ -446,7 +504,10 @@ class ForgeTaskCoolingInsertIiwaE2EVisionCfg(ForgeTaskCoolingInsertIiwaCameraCfg
         # workspace comfortably inside reach should also cut the near-singular-IK NaN crashes (the resume
         # cause). VALIDATE the corners with scripts/diag_reset_ik.py (reset-only) if reset failures spike.
         self.task.fixed_asset.init_state.pos = (0.70, 0.0, 0.05)
-        self.task.fixed_asset_init_pos_noise = [0.05, 0.15, 0.05]
+        # Socket PLACEMENT spread; X/Z raised 0.05->0.06 (2026-08-13). Y stays 0.15 (the roomy base-yaw
+        # axis). NOTE this is the PHYSICAL socket spread; the actor's noisy socket ESTIMATE that the policy
+        # must correct is fixed_asset_pos_obs_noise_bound (the +-2.5cm anchor) -- tune that separately.
+        self.task.fixed_asset_init_pos_noise = [0.08, 0.08, 0.08]
         # Crank the contact solver 192 -> real_solver_iters (128) for the real run (supervisor-approved).
         n = int(getattr(self, "real_solver_iters", 0) or 0)
         if n > 0:
@@ -456,3 +517,41 @@ class ForgeTaskCoolingInsertIiwaE2EVisionCfg(ForgeTaskCoolingInsertIiwaCameraCfg
                     props = getattr(getattr(art, "spawn", None), propname, None)
                     if props is not None and hasattr(props, "solver_position_iteration_count"):
                         props.solver_position_iteration_count = n
+
+        # --- 2026-08-13 real-robot DEPLOY HARDENING (starting defaults; tune each via runs) --------------
+        # REALISTIC DEPTH: the confirmed dominant sim2real gap (real D405 ~45% invalid, structured on fin-
+        # slots/edges + a missing socket interior; sim trained only 2% uniform). Swap to structured
+        # corruption + per-episode modality dropout + 5mm range noise + occasional hole-fill.
+        self.depth_corruption_mode = "structured"
+        self.depth_modality_dropout = True
+        self.depth_noise_std = 0.005          # 5mm range noise on valid returns (was 2mm)
+        self.depth_fill_prob = 0.30           # ~30% of episodes get interpolation-filled holes
+        # DEPTH-REALISM CURRICULUM: ramp structural corruption + modality-dropout prevalence 0->full over
+        # ~160k control steps (~1250 it @ horizon 128, ~50% of a 2500-it run) so the estimator bootstraps
+        # hole-prediction on good depth first (the biggest cold-start de-risk of the new regime).
+        self.depth_corruption_curriculum_steps = 160000
+        # WRIST-YAW CURRICULUM: ramp +-45deg -> the full +-180deg over the same window.
+        self.hand_init_yaw_curriculum_steps = 160000
+        self.hand_init_yaw_start_deg = 45.0
+        # HEAVY APPEARANCE DR (base is vivid BLUE; explicit-estimator over-trusted a clean look):
+        self.rgb_noise_std = 0.03
+        self.photo_gain_rgb = 0.30            # per-channel gain in [0.7,1.3]
+        self.photo_brightness = 0.10          # additive exposure in [-0.1,0.1]
+        self.photo_gamma = 0.20               # tone curve in [0.8,1.2]
+        self.photo_contrast = 0.20            # contrast in [0.8,1.2]
+        self.material_hue_randomize = True    # full-hue materials (spans vivid blue)
+        self.light_color_temp_range_k = (3000.0, 8000.0)  # warm->cool white balance
+        self.light_intensity_range = (1000.0, 3000.0)     # dome ~ +-50%
+        self.key_light_intensity_range = (1000.0, 3000.0)  # key ~ +-50%
+        self.cam_rot_jitter_deg = 3.0         # wrist mount roll jitter +-3deg (was 2)
+        # LONGER EPISODES: allow force-guided search (was 10s).
+        self.episode_length_s = 18.0
+        self.task.duration_s = 18.0
+        # CONTACT REALISM: effective radial-clearance stopgap (0 => authored mesh clearance; see the field
+        # doc -- the clean fix is regenerating the 13mm-shaft/14mm-socket mesh in convert_assets.py).
+        _ro = float(getattr(self, "contact_rest_offset", 0.0) or 0.0)
+        if _ro > 0.0:
+            for art in (self.task.held_asset, self.task.fixed_asset):
+                cp = getattr(getattr(art, "spawn", None), "collision_props", None)
+                if cp is not None and hasattr(cp, "rest_offset"):
+                    cp.rest_offset = _ro

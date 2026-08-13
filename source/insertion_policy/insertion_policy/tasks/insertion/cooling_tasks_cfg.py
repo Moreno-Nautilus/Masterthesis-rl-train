@@ -90,6 +90,16 @@ class CoolingInsert(FactoryTask):
     # observe this (held pose is critic-only/privileged) -> it must be inferred from vision. Distinct
     # from pre_insert_tilt (a known commanded arm pose); this is unknown grasp error. 0.0 disables it.
     grasp_misalign_max_deg: float = 10.0  # realistic upstream grasp error (was 5.0 for the old A/B)
+    # Secondary out-of-plane grasp tilt (deg) about the fingertip X axis (perpendicular to the pressing
+    # axis). Flat parallel pads mostly BLOCK this, but pad compliance / an off-centre screw head allow a
+    # few deg in practice. Baked per-env into the weld like the primary tilt. 0.0 => off (pure single-axis
+    # pressing-axis tilt, the physically-strict model). Set ~6-8 for the hardened sim2real grasp DR.
+    grasp_misalign_secondary_deg: float = 0.0
+    # Grasp POSITION DR (2026-08-05): the real clamp doesn't grab the screw at the exact same spot.
+    # Per-env jitter of where the head sits between the pads -- axial (shaft depth) + lateral (in-pad
+    # plane); y (pressing axis) is clamp-fixed. 0 => off (residual tasks unaffected). Welded task only.
+    grasp_pos_jitter_axial_mm: float = 0.0
+    grasp_pos_jitter_lateral_mm: float = 0.0
 
     # Reward keypoint coefficients (kept from PegInsert; revisit for head-flush success).
     keypoint_coef_baseline: list = [5, 4]
@@ -162,7 +172,15 @@ class ForgeTaskCoolingInsertCfg(ForgeEnvCfg):
     # pose-estimation/table-height/calibration error. Bounded PER-EPISODE (fixed within an episode) ->
     # models the real INIT socket-pose estimate (base is static during a seat, so no per-step tracking
     # needed); set to the real init-estimator accuracy (~1cm per user, 2026-08-04).
-    fixed_asset_pos_obs_noise_bound: list = [0.010, 0.010, 0.002]
+    fixed_asset_pos_obs_noise_bound: list = [0.025, 0.025, 0.005]
+    # Anchor-noise CURRICULUM (hydra: env.fixed_asset_pos_obs_noise_curriculum_steps=N + _start=[...]).
+    # Ramp the socket-anchor obs noise from _start -> _bound over N control steps; 0 => constant at _bound.
+    # 2.5cm from scratch is uncrackable (s192=29%), so learn at 1cm first and extend.
+    fixed_asset_pos_obs_noise_start: list = [0.010, 0.010, 0.002]
+    fixed_asset_pos_obs_noise_curriculum_steps: int = 0
+    # GRAVITY COMP: subtract the pre-contact gravity wrench from ft_force so the policy's force obs is pure
+    # CONTACT, matching the real robot's gravity-compensated F/T (hydra: env.use_gravity_comp=True).
+    use_gravity_comp: bool = False
 
     # --- 6-axis F/T: expose the CONTACT TORQUE channels in the policy obs ---------------------
     # Forge already feeds the 3-axis contact FORCE (`ft_force` = noisy `force_sensor_smooth[:,0:3]`)
@@ -308,7 +326,58 @@ class ForgeTaskCoolingInsertCameraCfg(ForgeTaskCoolingInsertCfg):
     # 0, like a real depth sensor). Keeps the blank-image control truly blank (added after that branch).
     rgb_noise_std: float = 0.02     # stddev on the [0,1] RGB image
     depth_noise_std: float = 0.002  # metres (2mm) on real depth returns, before far-clip normalisation
-    depth_dropout_prob: float = 0.02  # fraction of depth pixels zeroed (sensor holes)
+    depth_dropout_prob: float = 0.02  # fraction of depth pixels zeroed (LEGACY uniform mode; sensor holes)
+
+    # (6) REALISTIC (D405-like) STRUCTURED DEPTH CORRUPTION. The real D405 depth measured ~45% INVALID,
+    # structured on fin-slots/edges + a missing socket interior -- NOT the 2% uniform dropout above; that
+    # gap was the confirmed killer of the deployed vision behaviour. Setting depth_corruption_mode
+    # "structured" swaps the uniform dropout for clustered blobs + edge/gradient holes + dark-slot dropout
+    # (+ optional per-episode modality dropout + hole-fill). Default "uniform" keeps every existing task
+    # unchanged; the sim2real E2E-vision cfg turns it on. Tune the knobs (via env.<field>=...) to hit the
+    # ~0.35-0.50 invalid target. See InsertionEnv._corrupt_depth_structured.
+    depth_corruption_mode: str = "uniform"   # "uniform" (legacy per-pixel) | "structured" (D405-like)
+    depth_invalid_target_frac: float = 0.40  # documentation target for total invalid fraction (0.35-0.50)
+    depth_blob_frac: float = 0.20            # coverage of clustered dropout blobs (low-freq-noise threshold)
+    depth_blob_scale_px: int = 20            # characteristic blob size in px (coarse-noise cell size ~5-30)
+    depth_edge_drop_prob: float = 0.5        # drop prob along strong depth/luma gradients (edges)
+    depth_edge_grad_thresh: float = 0.015    # normalized depth+luma gradient magnitude that counts as an edge
+    depth_dark_drop_prob: float = 0.6        # drop prob where RGB is dark (the deep fin slots)
+    depth_dark_value_thresh: float = 0.30    # RGB luma below this = "dark" (fin-slot) region
+    depth_heavy_strength: float = 1.6        # corruption multiplier for the "heavy" modality episodes
+    depth_fill_prob: float = 0.0             # per-episode prob the synthetic holes are interpolation-filled
+    depth_fill_iters: int = 4                # 3x3 propagation passes used by the hole-fill variant
+    # MODALITY DROPOUT (per-EPISODE): p(RGB-only / heavily-corrupted depth / normal-corrupted depth). Stops
+    # the policy + estimator over-trusting the (now noisy) depth channel -> forces reading the hole from RGB
+    # when depth is bad. Off by default (all "normal"); the sim2real cfg turns it on with (0.15,0.35,0.50).
+    depth_modality_dropout: bool = False
+    depth_modality_probs: tuple = (0.15, 0.35, 0.50)  # (rgb_only, heavy, normal); need not sum to 1
+    # DEPTH-REALISM CURRICULUM: ramp the STRUCTURAL corruption (blob/edge/dark drop fractions) AND the
+    # modality-dropout prevalence from ~0 -> full over this many control steps (common_step_counter ~=
+    # iters*horizon_length; 160000 @ horizon 128 ~= 1250 it). 0 => full corruption from step 0 (no ramp).
+    # Lets the estimator first learn hole-prediction on good depth (the w2 regime), THEN adapt to the real
+    # ~45%-invalid + 15%-RGB-only sensor -- the cold-start de-risk for the hardest new gap. See
+    # InsertionEnv._depth_curric_frac / _corrupt_depth_structured / randomize_initial_state.
+    depth_corruption_curriculum_steps: int = 0
+
+    # WRIST-YAW CURRICULUM: ramp the reset yaw noise from +-hand_init_yaw_start_deg -> the full
+    # hand_init_orn_noise[2] over this many control steps (0 => full range from step 0). Yaw is irrelevant
+    # to seating a round peg but rotates the wrist IMAGE, so a full-range cold start makes the CNN/estimator
+    # job harder; this eases them in. See InsertionEnv.randomize_initial_state.
+    hand_init_yaw_curriculum_steps: int = 0
+    hand_init_yaw_start_deg: float = 45.0
+
+    # (7) FULL-HUE MATERIAL DR: the real base is vivid BLUE, which the narrow RGB-jitter-about-grey band
+    # (material_base_color/material_color_jitter) does NOT span. Enabling this draws a full-range HUE per
+    # env (HSV), so blue -- and every colour -- appears, with configurable saturation/value; the screw
+    # stays hue-correlated to the base (no screw-vs-base colour cue). Off by default (legacy RGB jitter).
+    material_hue_randomize: bool = False
+    material_saturation_range: tuple = (0.4, 1.0)
+    material_value_range: tuple = (0.3, 0.9)
+    material_hue_part_jitter: float = 0.02   # screw hue +/- this about the base hue (small => same filament)
+    # (8) LIGHT COLOUR TEMPERATURE (K): when set, tints the dome + key lights warm(3000K)->cool(8000K)
+    # instead of the grey +/- light_color_jitter tint, spanning the white balances the D405 sees. Empty/None
+    # => legacy grey jitter. See InsertionEnv._color_temp_to_rgb / _randomize_scene_light.
+    light_color_temp_range_k: tuple | None = None
 
     # (5) TRAINING IMAGE GALLERY (observability, not DR): every cam_log_interval camera reads, dump a
     # tiled montage (all envs) of exactly what the policy SEES to cam_log_dir -> watch framing / DR
@@ -316,6 +385,11 @@ class ForgeTaskCoolingInsertCameraCfg(ForgeTaskCoolingInsertCfg):
     # gitignored. (For rollout BEHAVIOUR video, use train.py --video; see auto_resume_train.sh VIDEO=1.)
     cam_log_interval: int = 2000    # camera reads between montage dumps (~15 it at 64 envs); 0 = off
     cam_log_dir: str = "renders/train_cam"
+    # When dumping the gallery, stamp the TRUE socket opening on the policy-seen wrist RGB+depth (projected
+    # via the wrist camera) so you can see if the hole is in-frame and whether depth is void/corrupted
+    # there. Off by default. (The estimator's PREDICTED hole vs GT is overlaid offline by
+    # scripts/render_estimator_overlay.py, which has the trained aux head.)
+    cam_log_overlay: bool = False
 
     def __post_init__(self):
         # Keep Fabric ENABLED (GPU PhysX is stable on Fabric; disabling it caused CUDA-700 crashes /

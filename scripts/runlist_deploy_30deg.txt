@@ -1,0 +1,34 @@
+# ===== DEPLOY RETRAIN v2 = e2e_deploy_g25t12_s192 (the LAST training) — CAD cam + 192 solver, 2026-08-06 ====
+# Builds on the 85.2% e2e_weld_curric policy. Same recipe (weld + socket-anchored + proprio), + the
+# deploy DR/realism pass. Two DISTINCT tilt errors (user's physical model), swapped emphasis:
+#   - GRASP MISALIGN 25deg = the DOMINANT error: screw crooked in the fingers (finger-dir vs shaft-dir),
+#     about the pressing axis. Set in cooling_iiwa __post_init__ (grasp_misalign_max_deg). FIXED per-env,
+#     cold from step 0 -> the rigid weld bakes it at init; can't be curriculum-ramped (would need the
+#     vetoed D6 drive). This is the primary realistic grasp error.
+#   - PRE-INSERT (gripper) tilt 20deg = the secondary error: whole arm arrives off vertical (bumped 12->20
+#     for sim2real margin, user). weekend_tilt_deg=20, curriculum-ramped 0->20 (the ONLY ramped tilt).
+#   -> worst-case screw-vs-socket ~45deg (25+20), vs the 87% run's ~28deg -- aggressive for sim2real margin.
+#      WATCH early success: cold 25deg grasp (uniform +-25, so a tail not a floor) is harder than the
+#      proven 10deg cold start; if it stalls off the line, lower grasp misalign or add the stepped re-weld
+#      curriculum (see below).
+#   - 2500 it (well beyond the LR-cascade-tested 1500 -> WATCH info/last_lr, must NOT pin 1e-6; guard kl 0.016).
+#   - softened arm PD (750/70, 375/45); action_scale 0.01; seat bonus 0.5; NO compliant-D6 grasp.
+#   - SOLVER ITERS 128->192 (cooling_iiwa real_solver_iters): 128 was soft-contact-propped (82%@128 fell to
+#     74.6% re-eval'd @192 = overfit to the mushy weld); 192 = realistic stiff contact (~1.5x slower, ~21h).
+#     success_threshold KEPT at 0.25 (=4.4mm): head-flush = tip ~3mm from bottom (real shaft ~3mm < hole),
+#     so 4.4mm correctly counts head-flush -- do NOT tighten (would demand impossible over-insertion).
+#   - SCREW FRICTION DR (static+dynamic 0.3-0.9, 64 buckets; socket already 0.25-1.25) + GRASP POS jitter
+#     (axial +-3mm, lateral +-2mm) -- both in cooling_iiwa __post_init__.
+#   - NO socket-orientation DR (policy anchors on socket POSITION only). NO clearance DR (fixed CAD parts).
+#   - CAM (FINALIZED 2026-08-06): supervisor CAD T_flange_cam + 180deg OPTICAL-AXIS roll, rendered + confirmed
+#     at the D405-matched FOV (D405 848x480 fx437 -> V-FOV 57.6deg == sim 57.7deg). Override below:
+#     wrist_cam_offset_pos=[0.05567,0.009,-0.07472] quat=[-0.18301,0.68301,-0.68301,0.18301]. DEPLOY image
+#     rule: CENTER-CROP color 848x480 -> 480x480 on the principal point (cx427.5,cy238.6 ~ centre) then
+#     resize 224 (do NOT squash/resize the full frame). (prealign+180 was the interim; CAD is the lock.)
+#
+# LAUNCH (user's go):
+#   PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True TASK=Isaac-Insertion-CoolingPeg-Iiwa-E2E-Vision-Direct-v0 \
+#   setsid bash scripts/run_chain.sh scripts/runlist_deploy_30deg.txt </dev/null >/tmp/chain_deploy.log 2>&1 &
+#
+# name              | num_envs | max_iters | eval_envs | eval_seeds | extra_overrides                                                                                                                                       | train_seed
+e2e_deploy_g25t12_s192 | 32    | 2500      | 64        | 42         | env.e2e_use_proprio_obs=True env.e2e_socket_anchored_action=True env.weekend_tilt_deg=20.0 env.tilt_curriculum_steps=128000 env.tilt_start_deg=0.0 env.e2e_success_bonus=0.5 env.wrist_cam_offset_pos=[0.05567,0.00900,-0.07472] env.wrist_cam_offset_quat=[-0.18301,0.68301,-0.68301,0.18301] | 42

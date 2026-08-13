@@ -39,6 +39,8 @@ parser.add_argument(
 parser.add_argument("--real-time", action="store_true", default=False, help="Run in real-time, if possible.")
 parser.add_argument("--num_episodes", type=int, default=512, help="Number of episodes to evaluate over.")
 parser.add_argument("--report", type=str, default="/tmp/eval_policy_report.txt", help="Where to write the report.")
+parser.add_argument("--stochastic", action="store_true", default=False, help="Sample actions (non-deterministic) instead of the mean -> tests the det-vs-stochastic gap.")
+parser.add_argument("--viz_estimator", type=str, default=None, help="Path (png) to save an EXPLICIT-ESTIMATOR visualization: the aux head's predicted hole gap vs the true gap, collected each step. Only meaningful for an estimator checkpoint (aux_head.feed_to_policy). Off by default -> the chain auto-eval is unchanged.")
 # append AppLauncher cli args
 AppLauncher.add_app_launcher_args(parser)
 # parse the arguments
@@ -210,21 +212,35 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
 
     reset_tilt, reset_xy = _reset_conditions()
     succeeded = torch.zeros(n, dtype=torch.bool, device=u.device)  # ever-seated this episode
-    rec_tilt, rec_xy, rec_succ = [], [], []  # completed-episode records
+    best_zgap = torch.full((n,), 999.0, device=u.device)  # deepest tip->socket-bottom gap (mm) this episode
+    rec_tilt, rec_xy, rec_succ, rec_zgap = [], [], [], []  # completed-episode records
     n_done = 0  # total episodes finished (each done-batch holds up to num_envs of them)
+
+    # EXPLICIT-ESTIMATOR viz (opt-in): collect the aux head's predicted hole gap vs the true gap each step.
+    _viz = args_cli.viz_estimator
+    _vz_net = getattr(getattr(agent, "model", None), "a2c_network", None) if _viz else None
+    _vz_pred, _vz_true = [], []  # predicted / true tip->socket gap (fingertip frame); pred is normalized-space
 
     while n_done < args_cli.num_episodes and simulation_app.is_running():
         with torch.inference_mode():
             obs = agent.obs_to_torch(obs)
-            actions = agent.get_action(obs, is_deterministic=agent.is_deterministic)
+            actions = agent.get_action(obs, is_deterministic=(agent.is_deterministic and not args_cli.stochastic))
+            if _viz and _vz_net is not None and getattr(_vz_net, "_estimator_pred", None) is not None:
+                # captured AFTER the forward (get_action populated _estimator_pred) but BEFORE env.step,
+                # so the true label matches the same pre-step image the prediction was computed from.
+                _vz_pred.append(_vz_net._estimator_pred.detach().float().cpu())      # (n,3) normalized
+                _vz_true.append(u._get_aux_label()[:, 1:4].detach().float().cpu())   # (n,3) raw meters
             obs, _, dones, _ = env.step(actions)
             succeeded |= u._get_curr_successes(thr)  # seated+centered+aligned at this step
+            _hb, _ = u._held_base_pose()
+            best_zgap = torch.minimum(best_zgap, (_hb[:, 2] - u.fixed_pos[:, 2]) * 1000.0)  # min tip->bottom gap (mm)
             dones = dones.nonzero(as_tuple=False).squeeze(-1)
             if len(dones) > 0:
                 n_done += len(dones)
                 rec_tilt.append(reset_tilt[dones].clone())
                 rec_xy.append(reset_xy[dones].clone())
                 rec_succ.append(succeeded[dones].clone())
+                rec_zgap.append(best_zgap[dones].clone())
                 if agent.is_rnn and agent.states is not None:
                     for s in agent.states:
                         s[:, dones, :] = 0.0
@@ -232,10 +248,12 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
                 new_tilt, new_xy = _reset_conditions()
                 reset_tilt[dones], reset_xy[dones] = new_tilt[dones], new_xy[dones]
                 succeeded[dones] = False
+                best_zgap[dones] = 999.0
 
     tilt = torch.cat(rec_tilt)[: args_cli.num_episodes]
     xy = torch.cat(rec_xy)[: args_cli.num_episodes]
     succ = torch.cat(rec_succ)[: args_cli.num_episodes].float()
+    zgap = torch.cat(rec_zgap)[: args_cli.num_episodes]
 
     def _bins(values, edges, label, unit):
         lines = [f"  success vs {label}:"]
@@ -251,6 +269,9 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
         f"episodes: {len(succ)}   overall success: {succ.mean().item():.1%}",
         f"reset tilt deg  min/mean/max: {tilt.min():.1f}/{tilt.mean():.1f}/{tilt.max():.1f}",
         f"reset xy mm     min/mean/max: {xy.min():.1f}/{xy.mean():.1f}/{xy.max():.1f}",
+        f"SEAT DEPTH (deepest tip->bottom gap, mm) min/mean/max: {zgap.min():.2f}/{zgap.mean():.2f}/{zgap.max():.2f}",
+        f"  frac reaching  <1mm: {(zgap<1).float().mean():.1%}   <2mm: {(zgap<2).float().mean():.1%}   "
+        f"<3mm: {(zgap<3).float().mean():.1%}   <4.4mm: {(zgap<4.4).float().mean():.1%}",
         _bins(tilt, [0, 5, 10, 15, 20, 25, 90], "angular error", "deg"),
         _bins(xy, [0, 3, 5, 7, 10, 50], "lateral error", "mm"),
     ]
@@ -273,6 +294,70 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
         print(f"[INFO]: eval report also saved to: {perm}")
     except Exception as exc:  # never let report-saving break an eval
         print(f"[WARN]: could not save per-run eval report: {exc}")
+
+    # ---- EXPLICIT-ESTIMATOR visualization (opt-in via --viz_estimator) --------------------------------
+    if _viz and _vz_pred:
+        pred = torch.cat(_vz_pred)  # (T*n, 3) normalized-space prediction
+        true = torch.cat(_vz_true)  # (T*n, 3) raw meters
+        # The aux head regressed the NORMALIZED label (rl_games normalize_input), so denormalize the
+        # prediction with the model's aux_label RunningMeanStd to compare in physical meters.
+        mean3, std3 = torch.zeros(3), torch.ones(3)
+        denorm_ok = False
+        try:
+            store = getattr(agent.model.running_mean_std, "running_mean_std", None)
+            aux = store["aux_label"] if (store is not None and "aux_label" in store) else None
+            if aux is not None:
+                mean3 = aux.running_mean.detach().cpu().float()[1:4]
+                std3 = torch.sqrt(aux.running_var.detach().cpu().float()[1:4] + 1e-5)
+                denorm_ok = True
+        except Exception as exc:  # fall back to normalized-space plot
+            print(f"[viz] aux_label RMS not found ({exc}); plotting in normalized space")
+        pred_m = pred * std3 + mean3 if denorm_ok else pred
+        err_mm = torch.linalg.vector_norm(pred_m - true, dim=1) * 1000.0
+        dist_mm = torch.linalg.vector_norm(true, dim=1) * 1000.0  # true tip->hole distance
+        near = dist_mm < 10.0
+        vtext = [
+            "===== ESTIMATOR VIZ =====",
+            f"samples: {len(err_mm)}   denorm: {denorm_ok}",
+            f"pred-vs-true hole-gap error (mm)  mean/median/p90: "
+            f"{err_mm.mean():.2f}/{err_mm.median():.2f}/{err_mm.quantile(0.9):.2f}",
+            f"  near hole (<10mm): mean {err_mm[near].mean():.2f}mm  (n={int(near.sum())})" if near.any() else "  (no near-hole samples)",
+            f"true tip->hole dist (mm) min/mean/max: {dist_mm.min():.1f}/{dist_mm.mean():.1f}/{dist_mm.max():.1f}",
+        ]
+        vtxt = "\n".join(vtext)
+        print("\n" + vtxt)
+        try:
+            import matplotlib
+            matplotlib.use("Agg")
+            import matplotlib.pyplot as plt
+
+            sub = torch.randperm(len(err_mm))[:4000]  # subsample for a legible scatter
+            fig, ax = plt.subplots(1, 3, figsize=(16, 5))
+            ax[0].scatter(dist_mm[sub], err_mm[sub], s=3, alpha=0.3)
+            ax[0].set_xlabel("true tip->hole dist (mm)"); ax[0].set_ylabel("estimator error (mm)")
+            ax[0].set_title("estimator error vs approach"); ax[0].grid(alpha=0.3)
+            u_mm = 1000.0
+            # lateral (x,y) accuracy: true vs predicted socket-opening position in the fingertip frame
+            ax[1].scatter(true[sub, 0] * u_mm, true[sub, 1] * u_mm, s=6, alpha=0.4, label="true", c="tab:green")
+            ax[1].scatter(pred_m[sub, 0] * u_mm, pred_m[sub, 1] * u_mm, s=6, alpha=0.4, label="pred", c="tab:red")
+            ax[1].set_xlabel("gap x (mm)"); ax[1].set_ylabel("gap y (mm)")
+            ax[1].set_title("hole position: pred vs true (fingertip frame)"); ax[1].legend(); ax[1].grid(alpha=0.3)
+            ax[1].set_aspect("equal", "box")
+            ax[2].hist(err_mm.numpy(), bins=60)
+            ax[2].set_xlabel("estimator error (mm)"); ax[2].set_ylabel("count")
+            ax[2].set_title("error distribution"); ax[2].grid(alpha=0.3)
+            fig.suptitle(f"Explicit estimator — {os.path.basename(resume_path)}")
+            fig.tight_layout()
+            out = args_cli.viz_estimator
+            if not out.endswith(".png"):
+                out = os.path.join(out, "estimator_viz.png")
+            os.makedirs(os.path.dirname(os.path.abspath(out)), exist_ok=True)
+            fig.savefig(out, dpi=120)
+            with open(os.path.splitext(out)[0] + ".txt", "w") as f:
+                f.write(vtxt + "\n")
+            print(f"[viz] saved estimator visualization -> {out}")
+        except Exception as exc:
+            print(f"[viz] plot failed ({exc}); stats above still valid")
 
     env.close()
 

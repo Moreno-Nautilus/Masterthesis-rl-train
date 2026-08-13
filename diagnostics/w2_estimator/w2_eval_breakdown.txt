@@ -1,0 +1,19 @@
+checkpoint: /home/moreno/Masterthesis-rl-train/logs/rl_games/Forge/w2_estimator_192/nn/last_Forge_ep_2000_rew_162.13815.pth
+episodes: 256   overall success: 75.0%
+reset tilt deg  min/mean/max: 0.4/9.2/19.4
+reset xy mm     min/mean/max: 0.9/8.9/33.5
+SEAT DEPTH (deepest tip->bottom gap, mm) min/mean/max: -17.35/4.87/80.89
+  frac reaching  <1mm: 4.7%   <2mm: 5.1%   <3mm: 69.1%   <4.4mm: 80.9%
+  success vs angular error:
+      0.0-  5.0deg: 73.6%  (n=53)
+      5.0- 10.0deg: 70.2%  (n=94)
+     10.0- 15.0deg: 80.0%  (n=75)
+     15.0- 20.0deg: 79.4%  (n=34)
+     20.0- 25.0deg:  nan%  (n=0)
+     25.0- 90.0deg:  nan%  (n=0)
+  success vs lateral error:
+      0.0-  3.0mm: 68.4%  (n=19)
+      3.0-  5.0mm: 77.3%  (n=22)
+      5.0-  7.0mm: 80.0%  (n=45)
+      7.0- 10.0mm: 78.1%  (n=96)
+     10.0- 50.0mm: 68.9%  (n=74)

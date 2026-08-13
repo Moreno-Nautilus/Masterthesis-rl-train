@@ -1,0 +1,158 @@
+# END-TO-END VISUOMOTOR + EXPLICIT ESTIMATOR cfg (2026-08-07).
+# Same as rl_games_e2e_vision_ppo_cfg.yaml, PLUS an explicit hole-pose estimator: an auxiliary head off
+# the 128-d CNN features is SUPERVISED (MSE) to predict the true shaft-tip -> socket-opening gap in the
+# fingertip frame (aux_label[1:4], the clean pose the wrist camera sees), and its DETACHED prediction is
+# CONCATENATED into the policy input (aux_head.feed_to_policy). The policy thus consumes a vision-predicted
+# socket location instead of relying only on the +-2.5cm socket anchor. The aux head is trained purely by
+# the supervised loss (detach); the label is privileged (train-time only, excluded from the policy input),
+# so nothing leaks at deploy -- the estimator is a learned runtime localizer running on the wrist image.
+# Requires the env to expose the aux_label group: env.e2e_keep_aux_label=True.
+# Task: Isaac-Insertion-CoolingPeg-Iiwa-E2E-Vision-Estimator-Direct-v0.
+
+params:
+  seed: 0
+  algo:
+    name: a2c_continuous
+
+  env:
+    clip_actions: 1.0
+    clip_observations: 5.0
+    # obs adds aux_label: the privileged hole-gap label the aux head regresses. The network EXCLUDES it
+    # from the policy vector (it is the aux label_key) and consumes it only for the supervised aux loss.
+    obs_groups: { obs: [policy, image, aux_label], states: [critic] }
+    concate_obs_groups: False
+
+  model:
+    name: continuous_a2c_logstd
+
+  network:
+    name: insertion_hybrid
+    separate: False
+
+    space:
+      continuous:
+        mu_activation: None
+        sigma_activation: None
+        mu_init:
+          name: default
+        sigma_init:
+          name: const_initializer
+          val: 0
+        fixed_sigma: True
+
+    cnn:
+      backbone: resnet18
+      pretrained: True
+      fc_size: 128
+      type: conv2d
+      activation: relu
+      initializer:
+        name: default
+      convs: []
+
+    # EXPLICIT ESTIMATOR. label_key names the privileged obs group; targets.hole regresses aux_label[1:4]
+    # (the 3-d tip->socket gap in the fingertip frame); feed_to_policy pipes the (detached) prediction
+    # into the policy input. hidden = the regressor width.
+    # Estimator head capacity bumped (hidden 128->256, layers 1->2) so it can recover the hole from RGB
+    # when depth is corrupted under the new realistic-depth + modality-dropout regime (2026-08-13). NOTE:
+    # this changes the head architecture -> the OLD w2_estimator_192 checkpoint (hidden128/1-layer) must be
+    # loaded with the pre-change yaml; a fresh estimator run (the intended retrain) uses this head.
+    aux_head:
+      label_key: aux_label
+      hidden: 256
+      layers: 2
+      targets:
+        hole: { slice: [1, 4], coef: 1.0 }
+      feed_to_policy: [hole]
+
+    mlp:
+      units: [512, 128, 64]
+      activation: elu
+      d2rl: False
+      initializer:
+        name: default
+      regularizer:
+        name: None
+
+    rnn:
+      name: lstm
+      units: 1024
+      layers: 2
+      before_mlp: True
+      concat_input: True
+      layer_norm: True
+
+  load_checkpoint: False
+  load_path: ""
+
+  config:
+    name: Forge
+    device: cuda:0
+    full_experiment_name: test
+    env_name: rlgpu
+    multi_gpu: False
+    ppo: True
+    mixed_precision: True
+    normalize_input: True
+    normalize_value: True
+    value_bootstrap: True
+    num_actors: 128
+    reward_shaper:
+      scale_value: 1.0
+    normalize_advantage: True
+    gamma: 0.995
+    tau: 0.95
+    learning_rate: 1.0e-4
+    lr_schedule: adaptive
+    schedule_type: standard
+    kl_threshold: 0.02
+    score_to_win: 20000
+    max_epochs: 1500
+    save_best_after: 10
+    save_frequency: 100
+    print_stats: True
+    grad_norm: 1.0
+    entropy_coef: 0.0
+    truncate_grads: True
+    e_clip: 0.2
+    horizon_length: 128
+    minibatch_size: 512
+    mini_epochs: 4
+    critic_coef: 2
+    clip_value: True
+    seq_length: 128
+    bounds_loss_coef: 0.0001
+
+    central_value_config:
+      minibatch_size: 512
+      mini_epochs: 4
+      learning_rate: 1e-4
+      lr_schedule: adaptive
+      kl_threshold: 0.02
+      clip_value: True
+      normalize_input: True
+      truncate_grads: True
+
+      network:
+        name: insertion_hybrid
+        central_value: True
+
+        mlp:
+          units: [512, 128, 64]
+          activation: elu
+          d2rl: False
+          initializer:
+            name: default
+          regularizer:
+            name: None
+
+        rnn:
+          name: lstm
+          units: 1024
+          layers: 2
+          before_mlp: True
+          concat_input: True
+          layer_norm: True
+
+    player:
+      deterministic: False

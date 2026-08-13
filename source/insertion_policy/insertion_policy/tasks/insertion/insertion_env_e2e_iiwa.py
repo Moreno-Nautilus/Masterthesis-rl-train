@@ -92,14 +92,35 @@ class InsertionEnvE2EIiwa(InsertionEnvIiwa):
         )
         self.state_space = gym.vector.utils.batch_space(self.single_observation_space["critic"], self.num_envs)
 
-        # The end-to-end policy has no auxiliary heads: drop the aux-label group the vision base added.
-        self.single_observation_space.spaces.pop("aux_label", None)
+        # The end-to-end policy has no auxiliary heads by default: drop the aux-label group the vision base
+        # added. KEEP it for the EXPLICIT ESTIMATOR (env.e2e_keep_aux_label=True): the aux head then predicts
+        # the true hole gap (aux_label[1:4]) and feeds it into the policy (see insertion_hybrid_network).
+        if not bool(getattr(self.cfg, "e2e_keep_aux_label", False)):
+            self.single_observation_space.spaces.pop("aux_label", None)
+
+        # CONTROL-LATENCY DR: delay the APPLIED action by k in [0, control_latency_max_steps] control steps
+        # (random per episode), modelling the ~0-133ms round-trip control latency at 15Hz. The policy still
+        # OBSERVES its true commanded action (prev_action); only the arm's setpoint responds late. A ring
+        # buffer of the last (max+1) commanded actions; k=0 => no delay. 0 disables it (backward compatible).
+        self._latency_max = int(getattr(self.cfg, "control_latency_max_steps", 0) or 0)
+        if self._latency_max > 0:
+            self._action_delay_buf = torch.zeros(
+                (self.num_envs, self._latency_max + 1, self.cfg.action_space), device=self.device
+            )
+            self._action_delay_steps = torch.zeros(self.num_envs, dtype=torch.long, device=self.device)
 
     # --- action: 5-DoF fingertip-relative delta ---------------------------------------------------
     def _pre_physics_step(self, action):
         """EMA-smooth the action, then compute the FIXED per-env-step IK+PD setpoint from the delta."""
         super()._pre_physics_step(action)  # EMA smoothing into self.actions (+ reset-buffer bookkeeping)
         a = self.actions
+        # Control-latency DR: the arm servos toward a DELAYED copy of the commanded action (per-env k).
+        # self.actions (what the policy observes as prev_action / EMA history) stays the true command.
+        if getattr(self, "_latency_max", 0) > 0:
+            self._action_delay_buf = torch.roll(self._action_delay_buf, shifts=1, dims=1)
+            self._action_delay_buf[:, 0] = self.actions
+            idx = self._action_delay_steps.view(-1, 1, 1).expand(-1, 1, a.shape[1])
+            a = self._action_delay_buf.gather(1, idx).squeeze(1)
         pos_scale = float(getattr(self.cfg, "e2e_pos_action_scale", 0.02))
         rot_scale = float(getattr(self.cfg, "e2e_rot_action_scale", 0.1))
 
@@ -209,6 +230,21 @@ class InsertionEnvE2EIiwa(InsertionEnvIiwa):
     def _get_observations(self):
         prev_actions = self.actions.clone()
         force_policy = self.noisy_force  # noisy 3-axis wrist contact force (NOT proprio)
+        # GRAVITY COMP: subtract the per-env pre-contact gravity baseline (captured on the first obs after
+        # reset, when the screw is above the socket = no contact) so force_policy is pure CONTACT, like the
+        # real gravity-compensated F/T. Gravity is a constant world-frame wrench, so one baseline holds.
+        if getattr(self.cfg, "use_gravity_comp", False) and hasattr(self, "_grav_pending"):
+            _p = self._grav_pending
+            if bool(_p.any()):
+                # SANITIZE the captured baseline: a transient PhysX force spike (or an un-settled sensor)
+                # at reset must NOT be frozen into _grav_base -- otherwise it subtracts a NaN/Inf every
+                # step for the WHOLE episode, poisoning the shared PPO batch (one NaN obs -> NaN grad ->
+                # NaN weights -> permanent collapse). This stateful capture is what makes gravity-comp a
+                # NaN AMPLIFIER vs the plain force obs, so guard it here.
+                self._grav_base[_p] = torch.nan_to_num(self.force_sensor_smooth[_p, 0:3], nan=0.0, posinf=0.0, neginf=0.0)
+                self._grav_pending[_p] = False
+            # also sanitize the result so a transient NaN in noisy_force itself can't leak into the obs.
+            force_policy = torch.nan_to_num(force_policy - self._grav_base, nan=0.0, posinf=0.0, neginf=0.0)
 
         policy_parts = []
         if self._debug_true_delta:
@@ -243,6 +279,39 @@ class InsertionEnvE2EIiwa(InsertionEnvIiwa):
 
         if getattr(self, "_has_camera", False):
             obs["image"] = self._get_camera_image()  # wrist RGB-D (reuses InsertionEnv machinery)
+        # EXPLICIT ESTIMATOR: expose the privileged hole-gap label so the aux head learns to predict it
+        # (and its prediction is fed into the policy in-network). Excluded from the policy input by the
+        # network (privileged label_key), so it never leaks into the deploy-time observation.
+        if bool(getattr(self.cfg, "e2e_keep_aux_label", False)):
+            obs["aux_label"] = self._get_aux_label()
+        # FINAL SAFETY NET (unattended 72h run): a single non-finite obs poisons the whole PPO batch
+        # permanently (NaN grad -> NaN weights). The feature fixes above address the known source
+        # (gravity-comp/centering); this is defense-in-depth for anything unforeseen (e.g. a rare NaN
+        # depth frame). Sanitize + warn (rate-limited) so a transient is SURVIVABLE and VISIBLE, not
+        # silently masked -- if [obs-guard] ever prints, investigate that source.
+        for _k in ("policy", "image", "critic"):
+            _v = obs.get(_k)
+            if _v is not None and not torch.isfinite(_v).all():
+                _c = getattr(self, "_nan_sanitized_count", 0) + 1
+                self._nan_sanitized_count = _c
+                if _c <= 10 or _c % 1000 == 0:
+                    print(f"[obs-guard] sanitized {int((~torch.isfinite(_v)).sum())} non-finite in "
+                          f"obs[{_k}] at step {int(self.common_step_counter)} (count={_c})", flush=True)
+                obs[_k] = torch.nan_to_num(_v, nan=0.0, posinf=0.0, neginf=0.0)
+        # gated NaN probe (DEBUG_NAN=1): print the first obs group + force-pipeline stage that goes NaN.
+        import os as _os
+        if _os.environ.get("DEBUG_NAN") and not getattr(self, "_nan_reported", False):
+            for _k, _v in obs.items():
+                if torch.isnan(_v).any() or torch.isinf(_v).any():
+                    _fss = self.force_sensor_smooth
+                    print(f"[DEBUG_NAN] step={int(self.common_step_counter)} obs[{_k}] NaN={int(torch.isnan(_v).sum())} "
+                          f"Inf={int(torch.isinf(_v).sum())} | force_policy_nan={int(torch.isnan(force_policy).sum())} "
+                          f"grav_base_nan={int(torch.isnan(self._grav_base).sum()) if hasattr(self,'_grav_base') else 'na'} "
+                          f"grav_pending={int(self._grav_pending.sum()) if hasattr(self,'_grav_pending') else 'na'} "
+                          f"noisy_force_nan={int(torch.isnan(self.noisy_force).sum())} "
+                          f"force_sensor_smooth_nan={int(torch.isnan(_fss).sum())}/{_fss.numel()}", flush=True)
+                    self._nan_reported = True
+                    break
         return obs
 
     # --- reward: -L2 position + shaft-axis orientation to the seated pose --------------------------
@@ -282,10 +351,32 @@ class InsertionEnvE2EIiwa(InsertionEnvIiwa):
         if bonus != 0.0:
             rew_buf = rew_buf + bonus * curr_successes.float()
 
+        # Lateral-centering reward: pull the tip OVER the hole -- attacks the "reaches the area, misses
+        # the hole" failure that dominates under the 2.5cm anchor noise. Behind a weight (default 0 => no-op).
+        _wc = float(getattr(self.cfg, "e2e_reward_center_weight", 0.0))
+        if _wc > 0.0:
+            _tp, _ = self._held_base_pose()
+            _xyd = torch.linalg.vector_norm(self.fixed_pos[:, 0:2] - _tp[:, 0:2], dim=1)
+            # sanitize: a NaN held-base pose would put a NaN in the reward buffer -> NaN advantages/losses.
+            rew_buf = rew_buf - _wc * torch.nan_to_num(_xyd, nan=0.0, posinf=0.0, neginf=0.0)
+
+        # ANTI-JAM contact-force penalty: penalize SUSTAINED contact force above a threshold while NOT
+        # seated -> discourages "press down on the fins" and nudges toward a force-guided lateral search.
+        # Sized so the MAX per-step penalty is only a few % of the main reward term (must not make contact
+        # timid). Weight 0 => off (default; backward compatible). See e2e_contact_penalty_scale/threshold.
+        contact_force = torch.linalg.vector_norm(self.force_sensor_smooth[:, 0:3], dim=-1)
+        _wj = float(getattr(self.cfg, "e2e_contact_penalty_scale", 0.0))
+        if _wj > 0.0:
+            thr = float(getattr(self.cfg, "e2e_contact_penalty_threshold", 12.0))
+            cap = float(getattr(self.cfg, "e2e_contact_penalty_cap", 8.0))  # cap the overshoot (N) so a
+            over = torch.nn.functional.relu(contact_force - thr).clamp(max=cap) * (~curr_successes).float()  # force spike can't dominate the reward
+            rew_buf = rew_buf - _wj * torch.nan_to_num(over, nan=0.0, posinf=0.0, neginf=0.0)
+
         log_dict = {
             "neg_tip_l2": -tip_dist,
             "neg_keypoint_l2": -keypoint_dist,
             "shaft_axis_error": shaft_axis_error,
+            "contact_force": contact_force,  # realized wrist contact-force magnitude (N) -- verify ~10-20N
             "success": curr_successes.float(),
         }
         self.prev_actions = self.actions.clone()
@@ -350,3 +441,9 @@ class InsertionEnvE2EIiwa(InsertionEnvIiwa):
         self.prev_actions[:] = 0.0
         self._ctrl_target_pos = None
         self._ctrl_target_quat = None
+        # Control-latency DR: resample each env's delay and clear its action history for the new episode.
+        if getattr(self, "_latency_max", 0) > 0:
+            self._action_delay_steps[env_ids] = torch.randint(
+                0, self._latency_max + 1, (len(env_ids),), device=self.device
+            )
+            self._action_delay_buf[env_ids] = 0.0

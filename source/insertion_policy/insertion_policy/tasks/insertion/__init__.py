@@ -73,6 +73,18 @@ gym.register(
         "rl_games_cfg_entry_point": f"{__name__}.agents:rl_games_e2e_vision_ppo_cfg.yaml",
     },
 )
+# Same E2E vision env, PLUS the EXPLICIT ESTIMATOR: aux head predicts the hole gap (aux_label[1:4]) and
+# feeds the prediction into the policy. Uses the estimator agent yaml (aux_head + aux_label in obs_groups);
+# the run must also pass env.e2e_keep_aux_label=True so the env exposes the aux_label obs group.
+gym.register(
+    id="Isaac-Insertion-CoolingPeg-Iiwa-E2E-Vision-Estimator-Direct-v0",
+    entry_point=f"{__name__}.insertion_env_e2e_iiwa:InsertionEnvE2EIiwa",
+    disable_env_checker=True,
+    kwargs={
+        "env_cfg_entry_point": f"{__name__}.cooling_iiwa_tasks_cfg:ForgeTaskCoolingInsertIiwaE2EVisionCfg",
+        "rl_games_cfg_entry_point": f"{__name__}.agents:rl_games_e2e_vision_estimator_ppo_cfg.yaml",
+    },
+)
 
 # Generalization target ("across parts"): pb-assembly SCREW insertion (pb_screw into pb_base's Ø10 hole).
 # Same InsertionEnv; only the parts/geometry differ (pb_tasks_cfg). Vision variant reuses the cooling

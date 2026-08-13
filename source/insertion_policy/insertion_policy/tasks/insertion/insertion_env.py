@@ -157,6 +157,13 @@ class InsertionEnv(ForgeEnv):
             self._photo_brightness = torch.zeros((self.num_envs, 1, 1, 3), device=self.device)
             self._photo_contrast = torch.ones((self.num_envs, 1, 1, 3), device=self.device)
             self._photo_gamma = torch.ones((self.num_envs, 1, 1, 1), device=self.device)
+            # Realistic-depth DR (sim2real): per-EPISODE modality + fill state, resampled at reset.
+            #  _depth_modality in {0=RGB-only (depth zeroed), 1=heavily-corrupted depth, 2=normal-corrupted
+            #  depth}; default 2 (all "normal") so with depth_modality_dropout OFF nothing changes.
+            #  _depth_fill flags episodes whose synthetic holes get interpolation-filled (mimics the D405's
+            #  hole-filling post-proc); default False. Both are no-ops unless the cfg knobs enable them.
+            self._depth_modality = torch.full((self.num_envs,), 2, dtype=torch.long, device=self.device)
+            self._depth_fill = torch.zeros(self.num_envs, dtype=torch.bool, device=self.device)
             self._cam_log_counter = 0  # drives the periodic training image gallery (cam_log_interval)
             # NOTE: _appearance_shader_paths / _material_dr_failed / _light_dr_failed are initialized at
             # the TOP of __init__ (before super), and _setup_part_materials populates the shader paths
@@ -286,6 +293,26 @@ class InsertionEnv(ForgeEnv):
         else:
             angles = torch.zeros(self.num_envs, device=self.device)
         self._weld_misalign_signed = angles
+        # Optional SECONDARY out-of-plane grasp tilt (about fingertip X) -- flat pads mostly block this, but
+        # pad compliance / an off-centre head allow a few deg. Baked per-env like the primary Y tilt so the
+        # weld frame and reset pose agree. 0 => off (the pure single-axis pressing-axis tilt).
+        sec_deg = float(getattr(self.cfg_task, "grasp_misalign_secondary_deg", 0.0))
+        if sec_deg > 0.0:
+            self._weld_misalign_secondary = math.radians(sec_deg) * (
+                2.0 * torch.rand(self.num_envs, device=self.device) - 1.0
+            )
+        else:
+            self._weld_misalign_secondary = torch.zeros(self.num_envs, device=self.device)
+        # Per-env grasp POSITION DR (2026-08-05): axial (z, shaft depth) + lateral (x, in-pad plane) jitter
+        # of where the head sits between the pads. Sampled ONCE per env (like the misalign above) so the
+        # weld frame (built from get_handheld_asset_relative_pose just below) and any later reset-written
+        # pose agree -- no first-step snap. y (finger pressing axis) is clamp-fixed -> not jittered.
+        _axial_m = float(getattr(self.cfg_task, "grasp_pos_jitter_axial_mm", 0.0)) * 1e-3
+        _lat_m = float(getattr(self.cfg_task, "grasp_pos_jitter_lateral_mm", 0.0)) * 1e-3
+        _jit = torch.zeros((self.num_envs, 3), device=self.device)
+        _jit[:, 2] = _axial_m * (2.0 * torch.rand(self.num_envs, device=self.device) - 1.0)
+        _jit[:, 0] = _lat_m * (2.0 * torch.rand(self.num_envs, device=self.device) - 1.0)
+        self._weld_pos_jitter = _jit
 
         # TCP->screw = flip_z * inverse(held_asset_relative_pose), per env -- the clamp's exact hand->screw tf.
         rel_pos, rel_quat = self.get_handheld_asset_relative_pose()  # per-env, includes the baked misalign
@@ -520,11 +547,25 @@ class InsertionEnv(ForgeEnv):
         if getattr(self, "_weld_held", False):
             old_held_noise = self.cfg_task.held_asset_pos_noise
             self.cfg_task.held_asset_pos_noise = [0.0, 0.0, 0.0]
+        # WRIST-YAW CURRICULUM: temporarily shrink the reset yaw noise toward hand_init_yaw_start_deg early
+        # on, ramping to the full configured yaw over hand_init_yaw_curriculum_steps. Restored in finally so
+        # cfg_task.hand_init_orn_noise[2] always reads the true max.
+        old_orn_noise = None
+        _yaw_steps = int(getattr(self.cfg, "hand_init_yaw_curriculum_steps", 0) or 0)
+        if _yaw_steps > 0:
+            _frac = min(1.0, max(0.0, float(self.common_step_counter) / float(_yaw_steps)))
+            _yaw_start = math.radians(float(getattr(self.cfg, "hand_init_yaw_start_deg", 45.0)))
+            _yaw_max = float(self.cfg_task.hand_init_orn_noise[2])
+            _cur = min(_yaw_start + (_yaw_max - _yaw_start) * _frac, _yaw_max)
+            old_orn_noise = list(self.cfg_task.hand_init_orn_noise)
+            self.cfg_task.hand_init_orn_noise = [old_orn_noise[0], old_orn_noise[1], _cur]
         try:
             super().randomize_initial_state(env_ids)
         finally:
             if old_held_noise is not None:
                 self.cfg_task.held_asset_pos_noise = old_held_noise
+            if old_orn_noise is not None:
+                self.cfg_task.hand_init_orn_noise = old_orn_noise
         if getattr(self, "_weld_held", False):
             self._set_welded_gripper_state(env_ids)
             self._sync_welded_held_pose_from_parent(env_ids)
@@ -535,12 +576,32 @@ class InsertionEnv(ForgeEnv):
         obs_noise_bound = getattr(self.cfg, "fixed_asset_pos_obs_noise_bound", None)
         if obs_noise_bound is not None:
             bound = torch.tensor(obs_noise_bound, device=self.device, dtype=torch.float32)
+            # Socket-anchor obs-noise CURRICULUM: ramp the bound from _start -> _bound over
+            # fixed_asset_pos_obs_noise_curriculum_steps control steps (0 => constant at _bound). Lets the
+            # policy learn hole-finding at low anchor error first, then extend to the required 2.5cm --
+            # from-scratch at 2.5cm doesn't crack it (s192). Same common_step_counter ramp as the tilt curric.
+            _nramp = int(getattr(self.cfg, "fixed_asset_pos_obs_noise_curriculum_steps", 0) or 0)
+            _nstart = getattr(self.cfg, "fixed_asset_pos_obs_noise_start", None)
+            if _nramp > 0 and _nstart is not None:
+                _start = torch.tensor(_nstart, device=self.device, dtype=torch.float32)
+                _frac = min(1.0, max(0.0, float(self.common_step_counter) / float(_nramp)))
+                bound = _start + (bound - _start) * _frac
+                self._cur_obs_noise_bound = bound.tolist()  # for logging/inspection
             sample = 2.0 * torch.rand((len(env_ids), 3), device=self.device) - 1.0
             self.init_fixed_pos_obs_noise[env_ids] = sample * bound
         # Forge's reset leaves the screw vertical (yaw noise only), so the upstream angular error is
         # absent. Add it now by tilting the grasped screw about its shaft tip.
         if hasattr(self, "_socket_table"):
             self._apply_pre_insert_tilt(env_ids)
+        # GRAVITY COMP: flag these envs to capture their pre-contact force baseline (= the constant
+        # world-frame gravity wrench) on the next obs; the E2E obs subtracts it so ft_force is pure
+        # CONTACT -- matching the real robot's gravity-compensated F/T (else the sim force has an
+        # orientation-independent gravity offset the real one won't). Only if use_gravity_comp.
+        if getattr(self.cfg, "use_gravity_comp", False):
+            if not hasattr(self, "_grav_pending"):
+                self._grav_pending = torch.zeros(self.num_envs, dtype=torch.bool, device=self.device)
+                self._grav_base = torch.zeros((self.num_envs, 3), device=self.device)
+            self._grav_pending[env_ids] = True
         # Resample per-episode camera extrinsics jitter (camera-pose DR; no-ops when the knobs are 0).
         if getattr(self, "_has_camera", False):
             if self.cfg.cam_pos_jitter > 0.0:
@@ -553,6 +614,26 @@ class InsertionEnv(ForgeEnv):
                 )
             # Appearance DR: per-env photometric params + global scene material/light randomization.
             self._randomize_appearance(env_ids)
+            # Realistic-depth MODALITY dropout (per-episode): sample which depth regime each env gets this
+            # episode -- RGB-only (depth zeroed) / heavily-corrupted / normal-corrupted -- so the policy +
+            # estimator can't over-trust the (now noisy) depth channel and must read the hole from RGB too.
+            if getattr(self.cfg, "depth_modality_dropout", False):
+                probs = torch.tensor(
+                    getattr(self.cfg, "depth_modality_probs", (0.15, 0.35, 0.50)), device=self.device
+                ).clamp(min=0.0)
+                sample = torch.multinomial(probs, len(env_ids), replacement=True)
+                # Curriculum: ramp dropout PREVALENCE 0->full -- keep an episode's sampled rgb-only/heavy
+                # modality only with prob `curric`, else force "normal" (index 2). So early training is
+                # mostly normal depth and rgb-only/heavy episodes phase in over the ramp.
+                _cf = self._depth_curric_frac()
+                if _cf < 1.0:
+                    keep = torch.rand(len(env_ids), device=self.device) < _cf
+                    sample = torch.where(keep, sample, torch.full_like(sample, 2))
+                self._depth_modality[env_ids] = sample
+            # Interpolation-fill variant: flag some episodes to have their synthetic depth holes filled.
+            _fill_p = float(getattr(self.cfg, "depth_fill_prob", 0.0))
+            if _fill_p > 0.0:
+                self._depth_fill[env_ids] = torch.rand(len(env_ids), device=self.device) < _fill_p
             # Temporal frame-stack: flag these envs so their frame history is reset to the new episode's
             # first frame (no cross-episode motion bleed); consumed in the next _get_camera_image.
             if getattr(self, "_frame_stack", 1) > 1:
@@ -580,6 +661,13 @@ class InsertionEnv(ForgeEnv):
         # Grip the head, not below it (correct for the shoulder-origin, two-diameter screw).
         head_height = self.cfg_task.held_asset_cfg.height - self.cfg_task.screw_shaft_length
         held_asset_relative_pos[:, 2] = head_height - self.cfg_task.robot_cfg.franka_fingerpad_length
+        # Grasp POSITION DR: add the per-env axial(z)+lateral(x) jitter. Welded path reuses the offset
+        # stashed in _weld_held_asset so the weld and the reset pose agree (see there). +z retracts the
+        # screw INTO the pads, so keep the axial bound small (never pull the shaft shoulder in).
+        if getattr(self, "_weld_held", False):
+            _jit = getattr(self, "_weld_pos_jitter", None)
+            if _jit is not None:
+                held_asset_relative_pos = held_asset_relative_pos + _jit
         max_deg = getattr(self.cfg_task, "grasp_misalign_max_deg", 0.0)
         n = self.num_envs
         # Physical grasp tilt: a cylindrical head between flat parallel pads can only tip ABOUT THE
@@ -603,6 +691,20 @@ class InsertionEnv(ForgeEnv):
             axis[:, 1] = 1.0  # fingertip-frame Y = finger pressing/closing axis
             misalign_quat = torch_utils.quat_from_angle_axis(mag, axis)
             held_asset_relative_quat = torch_utils.quat_mul(misalign_quat, held_asset_relative_quat)
+        # Secondary out-of-plane tilt about fingertip X (pad compliance / off-centre head). Welded path
+        # reuses the per-env angle baked in _weld_held_asset; non-weld samples per grasp. 0 => no-op.
+        sec_deg = float(getattr(self.cfg_task, "grasp_misalign_secondary_deg", 0.0))
+        if welded:
+            sec = getattr(self, "_weld_misalign_secondary", torch.zeros(n, device=self.device))
+        elif sec_deg > 0.0:
+            sec = math.radians(sec_deg) * (2.0 * torch.rand(n, device=self.device) - 1.0)
+        else:
+            sec = torch.zeros(n, device=self.device)
+        if welded or sec_deg > 0.0:
+            axis2 = torch.zeros((n, 3), device=self.device)
+            axis2[:, 0] = 1.0  # fingertip-frame X = out-of-plane (perpendicular to the pressing axis)
+            sec_quat = torch_utils.quat_from_angle_axis(sec, axis2)
+            held_asset_relative_quat = torch_utils.quat_mul(sec_quat, held_asset_relative_quat)
         # Stash the per-episode signed grasp tilt (rad) as the label for the auxiliary grasp head. Set
         # for ALL envs every reset (resets are synchronized), so it matches each env's current episode.
         # This is the COMMANDED tilt; the realized angle drifts a little under gravity sag, which is
@@ -919,9 +1021,25 @@ class InsertionEnv(ForgeEnv):
             n = len(screw_paths)
             if n == 0:
                 return
-            scene = base + (2.0 * torch.rand(n, 3) - 1.0) * jit  # per-env shared colour
-            screw_c = (scene + (2.0 * torch.rand(n, 3) - 1.0) * pjit).clamp(0.0, 1.0).tolist()
-            base_c = (scene + (2.0 * torch.rand(n, 3) - 1.0) * pjit).clamp(0.0, 1.0).tolist()
+            if bool(getattr(cfg, "material_hue_randomize", False)):
+                # FULL-HUE randomization (HSV): the real base is vivid BLUE, which the narrow RGB-jitter-
+                # about-grey band does NOT span. Draw a full-range hue per env (so blue, and every other
+                # colour, appears) with configurable saturation/value, then convert to RGB. The screw stays
+                # CORRELATED to the base (same hue +/- a small jitter) so there's no screw-vs-base colour
+                # cue to exploit (same filament in reality), while the between-env hue spread is the DR.
+                s_lo, s_hi = (float(x) for x in getattr(cfg, "material_saturation_range", (0.4, 1.0)))
+                v_lo, v_hi = (float(x) for x in getattr(cfg, "material_value_range", (0.3, 0.9)))
+                hue = torch.rand(n)
+                sat = s_lo + (s_hi - s_lo) * torch.rand(n)
+                val = v_lo + (v_hi - v_lo) * torch.rand(n)
+                scene = self._hsv_to_rgb(hue, sat, val)
+                hjit = float(getattr(cfg, "material_hue_part_jitter", 0.02))
+                screw_c = self._hsv_to_rgb((hue + (2.0 * torch.rand(n) - 1.0) * hjit) % 1.0, sat, val).clamp(0.0, 1.0).tolist()
+                base_c = scene.clamp(0.0, 1.0).tolist()
+            else:
+                scene = base + (2.0 * torch.rand(n, 3) - 1.0) * jit  # per-env shared colour
+                screw_c = (scene + (2.0 * torch.rand(n, 3) - 1.0) * pjit).clamp(0.0, 1.0).tolist()
+                base_c = (scene + (2.0 * torch.rand(n, 3) - 1.0) * pjit).clamp(0.0, 1.0).tolist()
             screw_r = (r_lo + (r_hi - r_lo) * torch.rand(n)).tolist()
             base_r = (r_lo + (r_hi - r_lo) * torch.rand(n)).tolist()
 
@@ -939,6 +1057,43 @@ class InsertionEnv(ForgeEnv):
         except Exception as exc:  # noqa: BLE001
             carb.log_warn(f"[InsertionEnv] part-material DR disabled after error: {exc}")
             self._material_dr_failed = True
+
+    @staticmethod
+    def _hsv_to_rgb(h, s, v):
+        """Vectorized HSV->RGB on CPU tensors (h,s,v each (n,) in [0,1]); returns (n,3) RGB in [0,1]."""
+        i = (h * 6.0).floor()
+        f = h * 6.0 - i
+        p = v * (1.0 - s)
+        q = v * (1.0 - f * s)
+        t = v * (1.0 - (1.0 - f) * s)
+        i = (i % 6).long()
+        r = torch.stack([v, q, p, p, t, v], dim=1).gather(1, i.unsqueeze(1)).squeeze(1)
+        g = torch.stack([t, v, v, q, p, p], dim=1).gather(1, i.unsqueeze(1)).squeeze(1)
+        b = torch.stack([p, p, t, v, v, q], dim=1).gather(1, i.unsqueeze(1)).squeeze(1)
+        return torch.stack([r, g, b], dim=1)
+
+    @staticmethod
+    def _color_temp_to_rgb(kelvin):
+        """Approximate a blackbody colour-temperature (K) as a normalized RGB tint (peak channel = 1).
+
+        Tanner Helland's piecewise fit, clamped to [0,1]; used to tint the scene lights so the wrist
+        image spans warm(~3000K)->cool(~8000K) white balances the D405 will see under different cell
+        lighting. Returns a 3-tuple in [0,1].
+        """
+        t = max(1000.0, min(40000.0, float(kelvin))) / 100.0
+        if t <= 66.0:
+            r = 255.0
+            g = 99.4708025861 * math.log(t) - 161.1195681661
+        else:
+            r = 329.698727446 * ((t - 60.0) ** -0.1332047592)
+            g = 288.1221695283 * ((t - 60.0) ** -0.0755148492)
+        if t >= 66.0:
+            b = 255.0
+        elif t <= 19.0:
+            b = 0.0
+        else:
+            b = 138.5177312231 * math.log(t - 10.0) - 305.0447927307
+        return tuple(max(0.0, min(255.0, x)) / 255.0 for x in (r, g, b))
 
     def _randomize_scene_light(self):
         """Per reset: dome (ambient) intensity+colour, and the key light's DIRECTION+intensity.
@@ -958,11 +1113,20 @@ class InsertionEnv(ForgeEnv):
                 a = p.GetAttribute(f"inputs:{name}")
                 return a if (a and a.IsValid()) else p.GetAttribute(name)
 
+            # Optional COLOUR-TEMPERATURE tint (warm 3000K -> cool 8000K) shared by dome + key, so the
+            # wrist image spans the white balances the D405 sees under different cell lighting. When the
+            # range is unset, falls back to the legacy grey +/- light_color_jitter dome tint.
+            temp_rng = getattr(cfg, "light_color_temp_range_k", None)
+            temp_rgb = None
+            if temp_rng and float(temp_rng[1]) > 0.0:
+                kelvin = float(temp_rng[0]) + (float(temp_rng[1]) - float(temp_rng[0])) * torch.rand(1).item()
+                temp_rgb = self._color_temp_to_rgb(kelvin)
+
             # --- dome ambient: intensity + colour ---
             rng = getattr(cfg, "light_intensity_range", None)
             jit = float(getattr(cfg, "light_color_jitter", 0.0))
             do_intensity = bool(rng) and float(rng[1]) > 0.0
-            if do_intensity or jit > 0.0:
+            if do_intensity or jit > 0.0 or temp_rgb is not None:
                 dome = prim_utils.get_prim_at_path("/World/Light")
                 if not (dome and dome.IsValid()):
                     self._light_dr_failed = True
@@ -972,7 +1136,11 @@ class InsertionEnv(ForgeEnv):
                     a = _attr(dome, "intensity")
                     if a and a.IsValid():
                         a.Set(lo + (hi - lo) * torch.rand(1).item())
-                if jit > 0.0:
+                if temp_rgb is not None:
+                    a = _attr(dome, "color")
+                    if a and a.IsValid():
+                        a.Set(Gf.Vec3f(*temp_rgb))
+                elif jit > 0.0:
                     c = [min(1.0, max(0.0, 0.75 + (2.0 * torch.rand(1).item() - 1.0) * jit)) for _ in range(3)]
                     a = _attr(dome, "color")
                     if a and a.IsValid():
@@ -987,6 +1155,10 @@ class InsertionEnv(ForgeEnv):
                     a = _attr(key, "intensity")
                     if a and a.IsValid():
                         a.Set(float(krng[0]) + (float(krng[1]) - float(krng[0])) * torch.rand(1).item())
+                if temp_rgb is not None:
+                    a = _attr(key, "color")
+                    if a and a.IsValid():
+                        a.Set(Gf.Vec3f(*temp_rgb))
                 # tilt straight-down by a random elevation about a random azimuth -> overhead but varied.
                 elev = math.radians(elev_lo + (elev_hi - elev_lo) * torch.rand(1).item())
                 az = 2.0 * math.pi * torch.rand(1).item()
@@ -1073,6 +1245,11 @@ class InsertionEnv(ForgeEnv):
         rgb = rgb01 - torch.mean(rgb01, dim=(1, 2), keepdim=True)
 
         depth = out["depth"].clone()
+        if depth.dim() == 4:
+            depth = depth.squeeze(-1)  # (N,H,W); a trailing 1-channel axis is re-added at the end
+        # ``finite`` = the sensor's ORIGINAL real returns. The socket interior (a no-hit void) is already
+        # non-finite here, so it stays a real void through every branch below (never filled) -- matching
+        # the real D405, whose depth is missing over the hole interior.
         finite = torch.isfinite(depth)
         depth[~finite] = 0.0
         far = float(self.cfg.tiled_camera.spawn.clipping_range[1])
@@ -1080,11 +1257,17 @@ class InsertionEnv(ForgeEnv):
         if d_ns > 0.0:  # range noise on REAL returns only (no-hit stays 0)
             depth = torch.where(finite, depth + d_ns * torch.randn_like(depth), depth)
         depth = torch.clamp(depth, 0.0, far) / far
-        d_drop = float(getattr(cfg, "depth_dropout_prob", 0.0))
-        if d_drop > 0.0:  # per-pixel no-return holes, like a real depth sensor
-            depth[torch.rand_like(depth) < d_drop] = 0.0
-        if depth.dim() == 3:
-            depth = depth.unsqueeze(-1)
+        mode = str(getattr(cfg, "depth_corruption_mode", "uniform"))
+        if mode == "structured":
+            # Aggressive, D405-like STRUCTURED corruption (clustered blobs + edge/gradient holes + dark-
+            # region dropout + per-episode heavy/normal/RGB-only modality + optional hole-fill). Replaces
+            # the legacy uniform per-pixel dropout for the sim2real vision run. See _corrupt_depth_structured.
+            depth = self._corrupt_depth_structured(depth, finite, rgb01)
+        else:
+            d_drop = float(getattr(cfg, "depth_dropout_prob", 0.0))
+            if d_drop > 0.0:  # legacy per-pixel no-return holes, like a real depth sensor
+                depth[torch.rand_like(depth) < d_drop] = 0.0
+        depth = depth.unsqueeze(-1)  # (N,H,W,1)
 
         if getattr(self.cfg, "write_image_to_file", False):
             from isaaclab.sensors import save_images_to_file
@@ -1105,8 +1288,13 @@ class InsertionEnv(ForgeEnv):
                 d = str(getattr(self.cfg, "cam_log_dir", "renders/train_cam"))
                 os.makedirs(d, exist_ok=True)
                 tag = f"{self._cam_log_counter:08d}"
-                save_images_to_file(rgb01, f"{d}/rgb_{tag}.png")
-                save_images_to_file(depth.expand(-1, -1, -1, 3) if depth.shape[-1] == 1 else depth,
+                rgb_log, depth_log = rgb01, depth
+                # Optional: stamp the TRUE socket opening on the policy-seen frame (cam_log_overlay) so the
+                # gallery shows whether the hole is in-frame and whether depth is void/corrupted there.
+                if bool(getattr(self.cfg, "cam_log_overlay", False)):
+                    rgb_log, depth_log = self._draw_true_hole_overlay(rgb01, depth)
+                save_images_to_file(rgb_log, f"{d}/rgb_{tag}.png")
+                save_images_to_file(depth_log.expand(-1, -1, -1, 3) if depth_log.shape[-1] == 1 else depth_log,
                                     f"{d}/depth_{tag}.png")
             self._cam_log_counter += 1
 
@@ -1136,3 +1324,132 @@ class InsertionEnv(ForgeEnv):
             self._frame_reset_mask = torch.zeros_like(m)
         b, h, w, c = frame.shape
         return self._frame_hist.permute(0, 2, 3, 1, 4).reshape(b, h, w, n * c)
+
+    # --- realistic (D405-like) structured depth corruption ----------------------------------------
+    def _depth_curric_frac(self):
+        """Depth-corruption curriculum fraction in [0,1] (1.0 when the knob is 0 = no ramp)."""
+        steps = int(getattr(self.cfg, "depth_corruption_curriculum_steps", 0) or 0)
+        if steps <= 0:
+            return 1.0
+        return min(1.0, max(0.0, float(self.common_step_counter) / float(steps)))
+
+    def _corrupt_depth_structured(self, depth, finite, rgb01):
+        """Turn a clean sim depth map into a real-D405-like one (measured ~45% invalid, structured).
+
+        ``depth`` is (N,H,W) in [0,1] (no-hit already 0); ``finite`` (N,H,W bool) marks the sensor's
+        ORIGINAL real returns (so the socket-interior void is preserved and never filled); ``rgb01`` is
+        (N,H,W,3) in [0,1] used for the dark-slot + gradient cues. Returns the corrupted (N,H,W) depth.
+
+        Four structured invalidation sources, each cfg-weighted, combined into a synthetic-hole mask that
+        is applied ONLY to originally-valid pixels (``& finite``):
+          * clustered BLOBS   -- low-frequency-noise thresholding (contiguous drop regions, size set by
+                                 ``depth_blob_scale_px``, coverage by ``depth_blob_frac``),
+          * EDGE / gradient   -- drop along strong depth+luma gradients (occlusion boundaries, fin edges),
+          * DARK-region       -- high drop prob where RGB is dark (the deep fin slots that swallow the IR),
+          * per-episode heavy/normal/RGB-only MODALITY (``_depth_modality``) scales the whole thing and,
+            for RGB-only episodes, zeros depth entirely.
+        Optionally (``_depth_fill``) the synthetic holes are interpolation-filled (mimicking the sensor's
+        hole-fill post-proc) -- the socket void is still left empty.
+        """
+        import torch.nn.functional as F
+
+        cfg = self.cfg
+        n, h, w = depth.shape
+        # DEPTH CURRICULUM: scale the structural drop fractions by the ramp fraction (0->1) so early
+        # training sees near-clean depth and full ~45%-invalid corruption only later.
+        curric = self._depth_curric_frac()
+        # Per-env corruption strength (heavy modality gets a multiplier; normal/RGB-only = 1.0).
+        strength = torch.ones((n, 1, 1), device=self.device)
+        heavy_mult = float(getattr(cfg, "depth_heavy_strength", 1.6))
+        strength[self._depth_modality == 1] = heavy_mult
+        strength = strength * curric
+        luma = rgb01.mean(dim=-1)  # (N,H,W)
+
+        drop = torch.zeros((n, h, w), dtype=torch.bool, device=self.device)
+
+        # (1) Clustered blobs via low-frequency noise: coarse random field upsampled -> contiguous regions.
+        blob_frac = float(getattr(cfg, "depth_blob_frac", 0.20))
+        if blob_frac > 0.0:
+            scale = max(2, int(getattr(cfg, "depth_blob_scale_px", 20)))
+            ch, cw = max(1, h // scale), max(1, w // scale)
+            coarse = torch.rand((n, 1, ch, cw), device=self.device)
+            field = F.interpolate(coarse, size=(h, w), mode="bilinear", align_corners=False).squeeze(1)
+            drop |= field < (blob_frac * strength).clamp(max=1.0)
+
+        # (2) Edge / gradient holes: strong depth OR luma gradient -> unreliable return.
+        edge_p = float(getattr(cfg, "depth_edge_drop_prob", 0.5))
+        if edge_p > 0.0:
+            thr = float(getattr(cfg, "depth_edge_grad_thresh", 0.015))
+            dgx = (depth - torch.roll(depth, 1, dims=2)).abs()
+            dgy = (depth - torch.roll(depth, 1, dims=1)).abs()
+            lgx = (luma - torch.roll(luma, 1, dims=2)).abs()
+            lgy = (luma - torch.roll(luma, 1, dims=1)).abs()
+            edge = (dgx + dgy > thr) | (lgx + lgy > thr)
+            drop |= edge & (torch.rand((n, h, w), device=self.device) < (edge_p * strength).clamp(max=1.0))
+
+        # (3) Dark-region dropout: the fin slots read low RGB and swallow the projected IR pattern.
+        dark_p = float(getattr(cfg, "depth_dark_drop_prob", 0.6))
+        if dark_p > 0.0:
+            dark_thr = float(getattr(cfg, "depth_dark_value_thresh", 0.30))
+            dark = luma < dark_thr
+            drop |= dark & (torch.rand((n, h, w), device=self.device) < (dark_p * strength).clamp(max=1.0))
+
+        synth_holes = drop & finite  # only invalidate originally-valid pixels (keep the socket void as-is)
+        depth = torch.where(synth_holes, torch.zeros_like(depth), depth)
+
+        # (4) Interpolation-fill variant (per-episode): fill ONLY the synthetic holes from valid neighbours,
+        # leaving the socket void empty. A few 3x3 propagation passes (cheap; runs at the render cadence).
+        if bool(self._depth_fill.any()):
+            known = (finite & ~synth_holes).float()
+            d = depth.clone()
+            v = known
+            for _ in range(int(getattr(cfg, "depth_fill_iters", 4))):
+                d_sum = F.avg_pool2d((d * v).unsqueeze(1), 3, 1, 1).squeeze(1) * 9.0
+                v_sum = F.avg_pool2d(v.unsqueeze(1), 3, 1, 1).squeeze(1) * 9.0
+                fill_here = synth_holes & (v_sum > 0) & (v < 0.5)
+                d = torch.where(fill_here, d_sum / v_sum.clamp(min=1e-6), d)
+                v = (v.bool() | fill_here).float()
+            fill_env = self._depth_fill.view(n, 1, 1)
+            depth = torch.where(fill_env & synth_holes, d, depth)
+
+        # Per-episode RGB-only modality: zero depth entirely for those envs (policy sees RGB alone).
+        depth = depth * (self._depth_modality != 0).float().view(n, 1, 1)
+        return depth
+
+    # --- diagnostic overlay: mark the TRUE socket opening on the policy-seen wrist image -----------
+    def _draw_true_hole_overlay(self, rgb01, depth):
+        """Stamp a marker at the projected TRUE socket-opening on COPIES of the wrist RGB+depth.
+
+        Reuses the wrist camera's own intrinsics/extrinsics to project ``_socket_opening_pos()`` into the
+        image the policy sees, so the periodic gallery shows WHERE the hole actually is (and whether depth
+        is void there). Returns (rgb_marked, depth_marked); the live obs tensors are untouched. The
+        estimator's PREDICTED hole (pred-vs-GT) is overlaid offline by scripts/render_estimator_overlay.py,
+        which has the trained aux head. Best-effort: any failure returns the inputs unchanged.
+        """
+        try:
+            from isaaclab.utils.math import quat_rotate_inverse
+
+            cam = self._tiled_camera
+            K = cam.data.intrinsic_matrices  # (N,3,3)
+            pos = cam.data.pos_w             # (N,3) world
+            quat = cam.data.quat_w_ros       # (N,4) ROS optical frame
+            hole_w = self._socket_opening_pos() + self.scene.env_origins
+            p_cam = quat_rotate_inverse(quat, hole_w - pos)  # (N,3) optical frame
+            z = p_cam[:, 2].clamp(min=1e-4)
+            u = (K[:, 0, 0] * p_cam[:, 0] / z + K[:, 0, 2]).round().long()
+            v = (K[:, 1, 1] * p_cam[:, 1] / z + K[:, 1, 2]).round().long()
+            rgb_m, depth_m = rgb01.clone(), depth.clone()
+            _, hh, ww, _ = rgb_m.shape
+            r = 3
+            for e in range(rgb_m.shape[0]):
+                if not (0 <= int(u[e]) < ww and 0 <= int(v[e]) < hh) or z[e] <= 1e-4:
+                    continue
+                y0, y1 = max(0, int(v[e]) - r), min(hh, int(v[e]) + r + 1)
+                x0, x1 = max(0, int(u[e]) - r), min(ww, int(u[e]) + r + 1)
+                rgb_m[e, y0:y1, x0:x1, 0] = 1.0  # red marker on RGB
+                rgb_m[e, y0:y1, x0:x1, 1:] = 0.0
+                depth_m[e, y0:y1, x0:x1, :] = 1.0  # white marker on depth
+            return rgb_m, depth_m
+        except Exception as exc:  # noqa: BLE001
+            carb.log_warn(f"[InsertionEnv] true-hole overlay failed: {exc}")
+            return rgb01, depth
