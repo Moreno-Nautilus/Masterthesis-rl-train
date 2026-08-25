@@ -59,15 +59,42 @@ if not getattr(_XformPrimView, "_insertion_usd_pose_patch", False):
     _XformPrimView._insertion_usd_pose_patch = True
 
 # --- rl_games dict-obs input-normalization fix --------------------------------------------------
-# rl_games normalizes dict observations with torch.jit.script(RunningMeanStdObs(obs_shape)), but this
-# rl_games/torch version can't infer the Dict[str,Tensor] input type when scripting -> compile error
-# ("'Tensor' object has no attribute 'items'"), so normalize_input=True crashes our hybrid
-# (proprio+image) dict obs at model build. The EAGER module works fine; only the JIT compile fails.
-# We intercept torch.jit.script for that one class and return it un-scripted, so we can normalize the
-# proprio + privileged critic state (which Forge needs; force obs are large) while the image stays
-# pre-normalized in-env. Everything else still scripts normally.
+# Two problems with rl_games' dict-obs input normalization, both patched here:
+#
+# (1) rl_games builds `torch.jit.script(RunningMeanStdObs(obs_shape))`, but this rl_games/torch version
+#     can't infer the Dict[str,Tensor] input type when scripting -> compile error ("'Tensor' object has
+#     no attribute 'items'"). The EAGER module works fine; we intercept torch.jit.script for that class
+#     and return it un-scripted.
+#
+# (2) RunningMeanStdObs standardizes EVERY dict key -- including the wrist image. That double-normalizes
+#     the image (it is already normalized in-env) and feeds the frozen pretrained ResNet an out-of-distribution
+#     input unlike the ImageNet statistics it was trained on. This was a real preprocessing bug, but it did
+#     not cause the 2026-08-20 1e36 explosion; sparse GPU-memory bit flips did. Use a subclass that ONLY
+#     normalizes 1-D keys (proprio + privileged critic state, which Forge needs -- force is large-magnitude)
+#     and passes multi-dim (image) keys THROUGH untouched. The image is normalized purely in-env, with the
+#     ImageNet mean/std the ResNet expects (see _get_camera_image, RGB-only branch).
 import torch as _torch  # noqa: E402
+import torch.nn as _nn  # noqa: E402
+from rl_games.algos_torch.running_mean_std import RunningMeanStd as _RMS  # noqa: E402
 from rl_games.algos_torch.running_mean_std import RunningMeanStdObs as _RMSObs  # noqa: E402
+
+
+class _ImageSkipRMSObs(_RMSObs):
+    """RunningMeanStdObs that normalizes only 1-D obs keys; multi-dim (image) keys pass through unchanged."""
+
+    def __init__(self, insize, epsilon=1e-05, per_channel=False, norm_only=False):
+        _nn.Module.__init__(self)  # skip parent __init__ (it would build a normalizer for the image too)
+        self._passthrough = {k for k, v in insize.items() if len(v) != 1}
+        self.running_mean_std = _nn.ModuleDict(
+            {k: _RMS(v, epsilon, per_channel, norm_only) for k, v in insize.items() if len(v) == 1}
+        )
+
+    def forward(self, input, denorm: bool = False):
+        return {
+            k: (v if k in self._passthrough else self.running_mean_std[k](v, denorm))
+            for k, v in input.items()
+        }
+
 
 if not getattr(_torch.jit, "_insertion_rmsobs_patch", False):
     _orig_jit_script = _torch.jit.script
@@ -78,6 +105,14 @@ if not getattr(_torch.jit, "_insertion_rmsobs_patch", False):
         return _orig_jit_script(obj, *args, **kwargs)
 
     _torch.jit.script = _jit_script_skip_rmsobs
+    # Substitute the image-skipping subclass everywhere rl_games constructs the dict normalizer (the actor
+    # model + the asymmetric central-value critic). The critic obs is 1-D state only, so this is a no-op
+    # there, but we patch both references for safety.
+    import rl_games.algos_torch.central_value as _rl_cv  # noqa: E402
+    import rl_games.algos_torch.models as _rl_models  # noqa: E402
+
+    _rl_models.RunningMeanStdObs = _ImageSkipRMSObs
+    _rl_cv.RunningMeanStdObs = _ImageSkipRMSObs
     _torch.jit._insertion_rmsobs_patch = True
 
 
@@ -109,7 +144,15 @@ class InsertionEnv(ForgeEnv):
         # Vision variant: a wrist RGB-D camera adds an "image" observation group alongside Forge's
         # "policy" (proprio) and "critic" (state) groups. The rl_games wrapper consumes it via
         # obs_groups={"obs": ["policy", "image"], "states": ["critic"]} + concate_obs_groups=False.
-        self._has_camera = getattr(self.cfg, "tiled_camera", None) is not None
+        # Keep the image observation available for a synthetic blank-image isolation even when the
+        # TiledCamera sensor itself is disabled. Normal vision and state configurations are unchanged.
+        self._has_camera = getattr(self.cfg, "tiled_camera", None) is not None or bool(
+            getattr(self.cfg, "blank_image", False)
+        )
+        # RGB-only path (E2E sim2real rebuild): 3-channel RGB, no depth branch / no depth DR. Default off
+        # keeps the residual/state RGB-D vision tasks untouched. When on, image_channels must be 3 and the
+        # camera's data_types drops "depth" (both set in the E2E-vision cfg __post_init__).
+        self._rgb_only = bool(getattr(self.cfg, "rgb_only", False))
         if self._has_camera:
             h, w, c = self.cfg.image_height, self.cfg.image_width, self.cfg.image_channels
             # Temporal frame-stack: the OBSERVED image has c*frame_stack channels (last N frames stacked
@@ -164,6 +207,9 @@ class InsertionEnv(ForgeEnv):
             #  hole-filling post-proc); default False. Both are no-ops unless the cfg knobs enable them.
             self._depth_modality = torch.full((self.num_envs,), 2, dtype=torch.long, device=self.device)
             self._depth_fill = torch.zeros(self.num_envs, dtype=torch.bool, device=self.device)
+            # IMAGE DROPOUT (§8): per-episode mask of envs whose RGB image is zeroed this episode (sampled
+            # at reset with a curriculum-ramped rate). All-False => no-op.
+            self._image_dropout = torch.zeros(self.num_envs, dtype=torch.bool, device=self.device)
             self._cam_log_counter = 0  # drives the periodic training image gallery (cam_log_interval)
             # NOTE: _appearance_shader_paths / _material_dr_failed / _light_dr_failed are initialized at
             # the TOP of __init__ (before super), and _setup_part_materials populates the shader paths
@@ -236,16 +282,16 @@ class InsertionEnv(ForgeEnv):
         """
         quat = torch.tensor([1.0, 0.0, 0.0, 0.0], device=self.device).repeat(self.num_envs, 1)
         pos = torch.zeros((self.num_envs, 3), device=self.device)
-        if parent_body == "gripper_tcp":
+        if parent_body == "pdz_gripper_tcp":
             return quat, pos
 
         pad_target = self._weld_gripper_dof_pos()
         closed_y = float(getattr(self.cfg, "weld_finger_closed_origin_y", 0.04))
         tcp_z = float(getattr(self.cfg, "weld_tcp_from_finger_z", 0.1455))
         lateral = closed_y - pad_target
-        if parent_body == "left_finger_link":
+        if parent_body == "pdz_gripper_left_finger_link":
             pos[:, 1] = -lateral
-        elif parent_body == "right_finger_link":
+        elif parent_body == "pdz_gripper_right_finger_link":
             pos[:, 1] = lateral
         else:
             raise ValueError(f"Unsupported weld_held_parent_body={parent_body!r}")
@@ -322,7 +368,7 @@ class InsertionEnv(ForgeEnv):
             flip_z, torch.zeros((self.num_envs, 3), device=self.device), inv_quat, inv_pos
         )
 
-        parent_body = str(getattr(self.cfg, "weld_held_parent_body", "gripper_tcp"))
+        parent_body = str(getattr(self.cfg, "weld_held_parent_body", "pdz_gripper_tcp"))
         parent_tcp_quat, parent_tcp_pos = self._weld_parent_to_tcp_pose(parent_body)
         f0_quat, f0_pos = torch_utils.tf_combine(
             parent_tcp_quat, parent_tcp_pos, tcp_screw_quat, tcp_screw_pos
@@ -382,7 +428,7 @@ class InsertionEnv(ForgeEnv):
             env_ids = torch.as_tensor(env_ids, device=self.device, dtype=torch.long)
         else:
             env_ids = env_ids.to(device=self.device, dtype=torch.long)
-        parent_body = str(getattr(self, "_weld_parent_body", getattr(self.cfg, "weld_held_parent_body", "gripper_tcp")))
+        parent_body = str(getattr(self, "_weld_parent_body", getattr(self.cfg, "weld_held_parent_body", "pdz_gripper_tcp")))
         parent_idx = self._robot.body_names.index(parent_body)
         parent_pos = self._robot.data.body_pos_w[env_ids, parent_idx]
         parent_quat = self._robot.data.body_quat_w[env_ids, parent_idx]
@@ -407,8 +453,11 @@ class InsertionEnv(ForgeEnv):
         table_cfg = sim_utils.UsdFileCfg(
             usd_path=f"{ISAAC_NUCLEUS_DIR}/Props/Mounts/SeattleLabTable/table_instanceable.usd"
         )
+        # Table centred on the plate PLACEMENT centroid (§5: x~[0.40,0.65], y~[-0.55,-0.20] -> ~0.525,-0.375),
+        # not the world origin. Was y=0.0, which left the far -y placements (base edge reaches y~-0.61)
+        # hanging off the table -> base tipped/fell in renders (2026-08-24).
         table_cfg.func(
-            "/World/envs/env_.*/Table", table_cfg, translation=(0.55, 0.0, 0.0), orientation=(0.70711, 0.0, 0.0, 0.70711)
+            "/World/envs/env_.*/Table", table_cfg, translation=(0.55, -0.375, 0.0), orientation=(0.70711, 0.0, 0.0, 0.70711)
         )
 
         self._robot = Articulation(self.cfg.robot)
@@ -435,6 +484,10 @@ class InsertionEnv(ForgeEnv):
         if getattr(self.cfg, "scene_camera", None) is not None:
             self._scene_camera = TiledCamera(self.cfg.scene_camera)
 
+        if self._weld_held:
+            # Factory enables Fabric-only cloning in Isaac Sim 5.x. These custom per-env FixedJoints are
+            # authored through USD after cloning, so every clone must also exist on the USD stage.
+            self.scene.cfg.clone_in_fabric = False
         self.scene.clone_environments(copy_from_source=False)
         if self.device == "cpu":
             self.scene.filter_collisions()
@@ -543,6 +596,38 @@ class InsertionEnv(ForgeEnv):
         # parent __init__, which may itself trigger a reset.)
         if hasattr(self, "_socket_table"):
             self._sample_sockets(env_ids)
+        # CUSTOM PLATE PLACEMENT (§5): sample the base pose from explicit ranges with a reach-radius
+        # rejection + a bimodal yaw. Pre-super we write the (reach-valid) xy + z centre into the fixed
+        # asset's default_root_state and force Factory to (a) add ONLY z noise (xy already sampled within
+        # reach) and (b) place at the NOMINAL yaw; the bimodal yaw delta is applied post-super. Restored in
+        # the finally block. Takes precedence over base_y_clusters. None/False => legacy behaviour.
+        _custom = bool(getattr(self.cfg_task, "fixed_asset_custom_placement", False))
+        _saved_pos_noise = None
+        _saved_orn = None
+        if _custom:
+            xr = list(self.cfg_task.fixed_asset_xy_ranges)
+            reach = float(self.cfg_task.fixed_asset_reach_radius)
+            _x, _y = self._sample_custom_fixed_xy(env_ids, xr, reach)
+            ds = self._fixed_asset.data.default_root_state
+            ds[env_ids, 0] = _x
+            ds[env_ids, 1] = _y
+            ds[env_ids, 2] = float(self.cfg_task.fixed_asset_z_center)
+            _saved_pos_noise = list(self.cfg_task.fixed_asset_init_pos_noise)
+            self.cfg_task.fixed_asset_init_pos_noise = [0.0, 0.0, float(self.cfg_task.fixed_asset_z_noise)]
+            _saved_orn = (self.cfg_task.fixed_asset_init_orn_deg, self.cfg_task.fixed_asset_init_orn_range_deg)
+            self.cfg_task.fixed_asset_init_orn_deg = float(self.cfg_task.fixed_asset_yaw_nominal_deg)
+            self.cfg_task.fixed_asset_init_orn_range_deg = 0.0
+        else:
+            # BIMODAL base-Y placement (deploy places the base off to the LEFT or RIGHT, not in front): pick
+            # a Y cluster per env and write it into the fixed asset's default_root_state BEFORE the Factory
+            # placement below, so the base lands at cluster +- noise AND the robot hover (placed relative to
+            # the socket inside super()) stays aligned. None => the centred single box (unchanged behaviour).
+            _clusters = getattr(self.cfg_task, "base_y_clusters", None)
+            if _clusters:
+                _ct = torch.tensor(_clusters, device=self.device, dtype=torch.float32)
+                _idx = torch.randint(0, len(_clusters), (len(env_ids),), device=self.device)
+                self._fixed_asset.data.default_root_state[env_ids, 1] = _ct[_idx]
+
         old_held_noise = None
         if getattr(self, "_weld_held", False):
             old_held_noise = self.cfg_task.held_asset_pos_noise
@@ -566,6 +651,16 @@ class InsertionEnv(ForgeEnv):
                 self.cfg_task.held_asset_pos_noise = old_held_noise
             if old_orn_noise is not None:
                 self.cfg_task.hand_init_orn_noise = old_orn_noise
+            if _saved_pos_noise is not None:
+                self.cfg_task.fixed_asset_init_pos_noise = _saved_pos_noise
+            if _saved_orn is not None:
+                self.cfg_task.fixed_asset_init_orn_deg, self.cfg_task.fixed_asset_init_orn_range_deg = _saved_orn
+        # Custom placement: apply the BIMODAL yaw delta on top of the nominal-yaw plate. PENDING-ANCHOR: the
+        # hover was placed above the NOMINAL-yaw socket, so for the wide-yaw tail the tip starts laterally
+        # off the (now-rotated) socket -- the anchor-driven lateral spawn re-derives the hover from the final
+        # yaw once that section lands. For the common (nominal +-3deg) case the offset is sub-mm.
+        if _custom:
+            self._apply_fixed_yaw_bimodal(env_ids)
         if getattr(self, "_weld_held", False):
             self._set_welded_gripper_state(env_ids)
             self._sync_welded_held_pose_from_parent(env_ids)
@@ -634,10 +729,82 @@ class InsertionEnv(ForgeEnv):
             _fill_p = float(getattr(self.cfg, "depth_fill_prob", 0.0))
             if _fill_p > 0.0:
                 self._depth_fill[env_ids] = torch.rand(len(env_ids), device=self.device) < _fill_p
+            # IMAGE DROPOUT (§8): flag this episode's envs whose RGB image is zeroed (rate curriculum-ramped).
+            _idr = self._image_dropout_rate()
+            if _idr > 0.0:
+                self._image_dropout[env_ids] = torch.rand(len(env_ids), device=self.device) < _idr
+            else:
+                self._image_dropout[env_ids] = False
             # Temporal frame-stack: flag these envs so their frame history is reset to the new episode's
             # first frame (no cross-episode motion bleed); consumed in the next _get_camera_image.
             if getattr(self, "_frame_stack", 1) > 1:
                 self._frame_reset_mask[env_ids] = True
+
+    def _sample_custom_fixed_xy(self, env_ids, xy_ranges, reach):
+        """Per-env base xy in the robot-base frame, rejection-sampled so radial <= reach (§5).
+
+        xy_ranges = [x_lo, x_hi, y_lo, y_hi]. The plate is placed with the robot at the env origin, so the
+        env-local xy IS the reach vector. Vectorized rejection with a bounded retry; any envs still outside
+        after the retries are radially clamped onto the reach circle (never spawns an unreachable plate).
+        """
+        n = len(env_ids)
+        x_lo, x_hi, y_lo, y_hi = (float(v) for v in xy_ranges)
+        x = torch.empty(n, device=self.device)
+        y = torch.empty(n, device=self.device)
+        remaining = torch.arange(n, device=self.device)
+        r2 = reach * reach
+        for _ in range(20):
+            k = int(remaining.numel())
+            if k == 0:
+                break
+            xs = x_lo + (x_hi - x_lo) * torch.rand(k, device=self.device)
+            ys = y_lo + (y_hi - y_lo) * torch.rand(k, device=self.device)
+            ok = (xs * xs + ys * ys) <= r2
+            sel = remaining[ok]
+            x[sel] = xs[ok]
+            y[sel] = ys[ok]
+            remaining = remaining[~ok]
+        if int(remaining.numel()) > 0:  # fallback: clamp the stragglers onto the reach circle
+            k = int(remaining.numel())
+            xs = x_lo + (x_hi - x_lo) * torch.rand(k, device=self.device)
+            ys = y_lo + (y_hi - y_lo) * torch.rand(k, device=self.device)
+            r = torch.sqrt(xs * xs + ys * ys).clamp(min=1e-6)
+            scale = (0.99 * reach) / r
+            x[remaining] = xs * scale
+            y[remaining] = ys * scale
+        return x, y
+
+    def _apply_fixed_yaw_bimodal(self, env_ids):
+        """Rotate the placed plate in place about world-Z by a per-env BIMODAL yaw delta (§5).
+
+        (1 - wide_frac) of envs get a small nominal jitter (+- nominal_halfwidth); wide_frac get a wide
+        mis-fixtured yaw (magnitude ~ U[wide_lo, wide_hi], random sign). Applied on top of the nominal yaw
+        Factory already placed (rotation about the plate root, position unchanged), then a settle step so
+        fixed_pos/quat refresh. NOTE: the hover was placed above the NOMINAL-yaw socket, so the wide-yaw
+        (~20%) tail spawns the tip a bit off the swung socket -- a realistic mis-fixtured-plate offset the
+        policy closes from vision (on top of the injected goal-anchor error).
+        """
+        n = len(env_ids)
+        hw = math.radians(float(self.cfg_task.fixed_asset_yaw_nominal_halfwidth_deg))
+        w_lo, w_hi = (math.radians(float(v)) for v in self.cfg_task.fixed_asset_yaw_wide_deg)
+        wide_frac = float(self.cfg_task.fixed_asset_yaw_wide_frac)
+
+        is_wide = torch.rand(n, device=self.device) < wide_frac
+        narrow = (2.0 * torch.rand(n, device=self.device) - 1.0) * hw
+        sign = torch.where(torch.rand(n, device=self.device) < 0.5, -1.0, 1.0)
+        wide = sign * (w_lo + (w_hi - w_lo) * torch.rand(n, device=self.device))
+        delta = torch.where(is_wide, wide, narrow)
+
+        z_axis = torch.zeros((n, 3), device=self.device)
+        z_axis[:, 2] = 1.0
+        q_delta = torch_utils.quat_from_angle_axis(delta, z_axis)
+        pos_w = self._fixed_asset.data.root_pos_w[env_ids]
+        quat_w = self._fixed_asset.data.root_quat_w[env_ids]
+        new_quat = torch_utils.quat_mul(q_delta, quat_w)
+        self._fixed_asset.write_root_pose_to_sim(torch.cat([pos_w, new_quat], dim=-1), env_ids=env_ids)
+        self._fixed_asset.write_root_velocity_to_sim(torch.zeros((n, 6), device=self.device), env_ids=env_ids)
+        self._fixed_asset.reset(env_ids)
+        self.step_sim_no_action()
 
     def get_handheld_asset_relative_pose(self):
         """Grip the screw HEAD between the fingerpads, then add the rotational grasp misalignment.
@@ -713,22 +880,27 @@ class InsertionEnv(ForgeEnv):
         return held_asset_relative_pos, held_asset_relative_quat
 
     def _apply_pre_insert_tilt(self, env_ids):
-        """Inject the angular pre-insert error (the upstream orientation uncertainty).
+        """Inject the ANCHOR / goal-estimate error physically at reset (angular + lateral/z + wrist yaw).
 
-        Factory's reset leaves the screw vertical (only yaw noise), so the ~20-25 deg angular error
-        never appears and the orientation-aware reward/success are never exercised. Here we rigidly
-        rotate the already-grasped screw AND the wrist together about the screw's shaft tip, by a
-        uniform angle in [0, pre_insert_tilt_max_deg] about a random horizontal axis. Pivoting about
-        the tip keeps it over the socket mouth (preserving the lateral pre-insert offset) while the
-        body angles -- a realistic angled pre-insert, not a tip swung out of the socket. Uses the
-        live grasp poses, so it stays correct after the iiwa/gripper swap (no hard-coded geometry).
+        Legacy behaviour (goal_anchor_injection off): rigidly rotate the already-grasped screw AND the
+        wrist together about the screw's shaft tip by a curriculumed angle in [0, pre_insert_tilt_max_deg]
+        about a random horizontal axis (the ``pre-insert tilt``). Pivoting about the tip keeps the tip over
+        the socket mouth while the body angles.
+
+        GOAL-ANCHOR mode (§4, goal_anchor_injection): this subsumes the pre-insert tilt. We inject the FULL
+        goal-estimate error e = (lateral radial, z, angular), all curriculumed, so the peg physically starts
+        misaligned from the TRUE seated pose by e (the robot drove to its NOISY estimate). Concretely we
+        rigidly (a) rotate the assembly about the tip by the angular error (the shaft-axis error vs the true
+        hole axis) composed with a half-normal WRIST YAW about vertical (image-only, yaw-symmetric), and
+        (b) TRANSLATE it by e_pos (lateral radial <= goal_anchor_lat_max, z <= goal_anchor_z_max). The
+        injected (e_pos, tilt) are stashed as ``_goal_err_pos`` / ``_goal_err_rot_quat`` so the E2E policy
+        obs can build the noisy goal delta (which is ~0 at reset -> the policy "thinks it's at the goal").
+        The reward/critic still target the CLEAN true seated pose. Uses live grasp poses (iiwa-swap-safe).
         """
+        n = self.num_envs
+        inject = bool(getattr(self.cfg_task, "goal_anchor_injection", False))
+        # --- angular error (curriculumed pre-insert tilt) ---
         final_deg = float(self.cfg_task.pre_insert_tilt_max_deg)
-        if final_deg <= 0.0:
-            return
-        # Tilt CURRICULUM: linearly ramp the effective max tilt from start->final over the first
-        # pre_insert_tilt_curriculum_steps control steps (0 => constant at final). common_step_counter
-        # counts control steps (~= iters * horizon_length). Stashed for logging/inspection.
         start_deg = float(getattr(self.cfg_task, "pre_insert_tilt_start_deg", 0.0))
         ramp = int(getattr(self.cfg_task, "pre_insert_tilt_curriculum_steps", 0) or 0)
         if ramp > 0:
@@ -737,20 +909,57 @@ class InsertionEnv(ForgeEnv):
         else:
             cur_deg = final_deg
         self._cur_pre_insert_tilt_deg = cur_deg
-        if cur_deg <= 0.0:
+        # --- wrist yaw (half-normal, image-only) ---
+        yaw_max = math.radians(float(getattr(self.cfg_task, "wrist_yaw_max_deg", 0.0))) \
+            if bool(getattr(self.cfg_task, "wrist_yaw_halfnormal", False)) else 0.0
+        # Nothing to do only if NO error source is active (legacy no-op when tilt ramps to 0).
+        if not inject and cur_deg <= 0.0 and yaw_max <= 0.0:
             return
 
         # No gravity while we re-pose (mirror Factory's reset; the screw also has gravity disabled).
         physics_sim_view = sim_utils.SimulationContext.instance().physics_sim_view
         physics_sim_view.set_gravity(carb.Float3(0.0, 0.0, 0.0))
 
-        # Sample an isotropic tilt of the vertical screw axis: magnitude in [0, max], random azimuth.
-        n = self.num_envs
-        max_rad = math.radians(cur_deg)
-        mag = max_rad * torch.rand(n, device=self.device)
+        # Angular tilt of the vertical screw axis: magnitude in [0, max], random azimuth. Half-normal
+        # (biased to 0) when configured: |N| with sigma = max/2 so most mass is near 0 and ~2 sigma
+        # reaches the effective max; clamped to [0, max]. Else uniform [0, max] (legacy).
+        max_rad = math.radians(max(0.0, cur_deg))
+        if max_rad <= 0.0:
+            mag = torch.zeros(n, device=self.device)
+        elif bool(getattr(self.cfg_task, "pre_insert_tilt_halfnormal", False)):
+            mag = (torch.abs(torch.randn(n, device=self.device)) * (max_rad * 0.5)).clamp(0.0, max_rad)
+        else:
+            mag = max_rad * torch.rand(n, device=self.device)
         az = 2.0 * math.pi * torch.rand(n, device=self.device)
         axis = torch.stack([torch.cos(az), torch.sin(az), torch.zeros_like(az)], dim=1)
         tilt_quat = torch_utils.quat_from_angle_axis(mag, axis)
+
+        # Wrist YAW about world-Z (half-normal, biased to 0), composed with the tilt: yaw first (spins the
+        # tool about vertical -> rotates the wrist IMAGE, doesn't change the screw axis), then the tilt. The
+        # stored goal-orientation error is the TILT ONLY (yaw is yaw-symmetric for the round peg).
+        if yaw_max > 0.0:
+            yaw_mag = (torch.abs(torch.randn(n, device=self.device)) * (yaw_max * 0.5)).clamp(0.0, yaw_max)
+            yaw_sign = torch.where(torch.rand(n, device=self.device) < 0.5, -1.0, 1.0)
+            z_axis = torch.zeros((n, 3), device=self.device)
+            z_axis[:, 2] = 1.0
+            yaw_quat = torch_utils.quat_from_angle_axis(yaw_mag * yaw_sign, z_axis)
+            rot_quat = torch_utils.quat_mul(tilt_quat, yaw_quat)
+        else:
+            rot_quat = tilt_quat
+
+        # Lateral + z goal-estimate error (curriculumed radial disk + z), applied as a rigid translation
+        # of the assembly so the tip starts OFF the true hole by e_pos. Off (0) unless goal_anchor_injection.
+        e_pos = torch.zeros((n, 3), device=self.device)
+        if inject:
+            g_ramp = int(getattr(self.cfg_task, "goal_anchor_curriculum_steps", 0) or 0)
+            g_frac = 1.0 if g_ramp <= 0 else min(1.0, max(0.0, float(self.common_step_counter) / float(g_ramp)))
+            lat_max = float(getattr(self.cfg_task, "goal_anchor_lat_max", 0.0)) * g_frac
+            z_max = float(getattr(self.cfg_task, "goal_anchor_z_max", 0.0)) * g_frac
+            r = lat_max * torch.rand(n, device=self.device)             # radial <= lat_max
+            th = 2.0 * math.pi * torch.rand(n, device=self.device)
+            e_pos[:, 0] = r * torch.cos(th)
+            e_pos[:, 1] = r * torch.sin(th)
+            e_pos[:, 2] = z_max * (2.0 * torch.rand(n, device=self.device) - 1.0)
 
         # Capture the vertical grasp BEFORE moving (resets are all-env at once): pivot (shaft tip),
         # the screw pose, and the arm joints, so envs whose IK can't reach the tilted pose fall back
@@ -760,20 +969,34 @@ class InsertionEnv(ForgeEnv):
         held_pos0, held_quat0 = self.held_pos.clone(), self.held_quat.clone()
         saved_joint_pos = self.joint_pos.clone()
 
-        # Tilt the wrist target about the tip and IK the arm there (teleports joints; screw floats).
-        new_ft_pos = tip + torch_utils.quat_apply(tilt_quat, ft_pos - tip)
-        new_ft_quat = torch_utils.quat_mul(tilt_quat, ft_quat)
+        # Rotate the wrist target about the tip (rot = yaw . tilt) AND translate the assembly by e_pos, then
+        # IK the arm there (teleports joints; screw floats). e_pos shifts the tip OFF the true hole (the
+        # physical goal-estimate error); rot applies the tilt+yaw.
+        new_ft_pos = tip + e_pos + torch_utils.quat_apply(rot_quat, ft_pos - tip)
+        new_ft_quat = torch_utils.quat_mul(rot_quat, ft_quat)
         pos_err, aa_err = self.set_pos_inverse_kinematics(new_ft_pos, new_ft_quat, env_ids)
         ik_failed = (torch.linalg.norm(pos_err, dim=1) > 1e-3) | (torch.linalg.norm(aa_err, dim=1) > 1e-3)
         failed_env_ids = env_ids[ik_failed.nonzero(as_tuple=False).squeeze(-1)]
 
-        # Carry the screw rigidly with the same tilt about the tip (tip stays put, body angles by the
-        # sampled angle). Envs where IK failed keep the original vertical grasp -> arm + screw stay
-        # consistent (no contact shove, no out-of-range tilt).
-        new_held_pos = tip + torch_utils.quat_apply(tilt_quat, held_pos0 - tip)
-        new_held_quat = torch_utils.quat_mul(tilt_quat, held_quat0)
+        # Carry the screw rigidly with the same transform (tip -> tip + e_pos, body rotated by rot). Envs
+        # where IK failed keep the original vertical grasp -> arm + screw stay consistent (no contact shove,
+        # no out-of-range pose) AND their injected goal error is zeroed below (they start ~at the true hole).
+        new_held_pos = tip + e_pos + torch_utils.quat_apply(rot_quat, held_pos0 - tip)
+        new_held_quat = torch_utils.quat_mul(rot_quat, held_quat0)
         new_held_pos[failed_env_ids] = held_pos0[failed_env_ids]
         new_held_quat[failed_env_ids] = held_quat0[failed_env_ids]
+
+        # Stash the injected goal-estimate error (world frame) for the E2E noisy-goal obs: e_pos + the
+        # TILT-only rotation (yaw excluded -- yaw-symmetric). Written per-env (partial-reset safe). Zero it
+        # for IK-failed envs (they kept the vertical grasp over the true hole, so their true goal == estimate).
+        # Guarded by hasattr: the E2E buffers are created after super().__init__(), so the init-time reset
+        # (which may run inside super) just skips this -- the first training reset fills them properly.
+        if inject and hasattr(self, "_goal_err_pos"):
+            self._goal_err_pos[env_ids] = e_pos[env_ids]
+            self._goal_err_rot_quat[env_ids] = tilt_quat[env_ids]
+            if len(failed_env_ids) > 0:
+                self._goal_err_pos[failed_env_ids] = 0.0
+                self._goal_err_rot_quat[failed_env_ids] = self._identity_quat[failed_env_ids]
         if len(failed_env_ids) > 0:
             self.joint_pos[failed_env_ids] = saved_joint_pos[failed_env_ids]
             self.joint_vel[:] = 0.0
@@ -982,14 +1205,15 @@ class InsertionEnv(ForgeEnv):
         def _half(width, shape):  # uniform in [-width, +width]
             return (2.0 * torch.rand(shape, device=self.device) - 1.0) * width
 
+        af = self._appearance_curric_frac()  # appearance-DR curriculum (scales the aug ranges 0->full)
         if getattr(cfg, "photo_gain_rgb", 0.0) > 0.0:
-            self._photo_gain[env_ids] = 1.0 + _half(cfg.photo_gain_rgb, (m, 1, 1, 3))
+            self._photo_gain[env_ids] = 1.0 + _half(cfg.photo_gain_rgb * af, (m, 1, 1, 3))
         if getattr(cfg, "photo_brightness", 0.0) > 0.0:
-            self._photo_brightness[env_ids] = _half(cfg.photo_brightness, (m, 1, 1, 3))
+            self._photo_brightness[env_ids] = _half(cfg.photo_brightness * af, (m, 1, 1, 3))
         if getattr(cfg, "photo_contrast", 0.0) > 0.0:
-            self._photo_contrast[env_ids] = 1.0 + _half(cfg.photo_contrast, (m, 1, 1, 3))
+            self._photo_contrast[env_ids] = 1.0 + _half(cfg.photo_contrast * af, (m, 1, 1, 3))
         if getattr(cfg, "photo_gamma", 0.0) > 0.0:
-            self._photo_gamma[env_ids] = 1.0 + _half(cfg.photo_gamma, (m, 1, 1, 1))
+            self._photo_gamma[env_ids] = 1.0 + _half(cfg.photo_gamma * af, (m, 1, 1, 1))
 
         self._randomize_part_materials()
         self._randomize_scene_light()
@@ -1021,7 +1245,18 @@ class InsertionEnv(ForgeEnv):
             n = len(screw_paths)
             if n == 0:
                 return
-            if bool(getattr(cfg, "material_hue_randomize", False)):
+            if bool(getattr(cfg, "material_per_part_colors", False)):
+                # PER-PART COLOURS (RGB-only rebuild): the screw and base get DISTINCT base colours (red
+                # screw, blue base), each with its OWN per-env jitter about that colour. No shared scene
+                # colour -- the two parts are genuinely different (matches the real hardware), so the policy
+                # CAN key on the screw-vs-base contrast (it exists on hardware). Curriculum-scaled jitter.
+                af = self._appearance_curric_frac()
+                screw_base = torch.tensor(getattr(cfg, "material_screw_color", (0.7, 0.05, 0.05)))
+                base_base = torch.tensor(cfg.material_base_color)
+                cj = jit * af  # per-env half-range about each part's own colour
+                screw_c = (screw_base + (2.0 * torch.rand(n, 3) - 1.0) * cj).clamp(0.0, 1.0).tolist()
+                base_c = (base_base + (2.0 * torch.rand(n, 3) - 1.0) * cj).clamp(0.0, 1.0).tolist()
+            elif bool(getattr(cfg, "material_hue_randomize", False)):
                 # FULL-HUE randomization (HSV): the real base is vivid BLUE, which the narrow RGB-jitter-
                 # about-grey band does NOT span. Draw a full-range hue per env (so blue, and every other
                 # colour, appears) with configurable saturation/value, then convert to RGB. The screw stays
@@ -1030,7 +1265,9 @@ class InsertionEnv(ForgeEnv):
                 s_lo, s_hi = (float(x) for x in getattr(cfg, "material_saturation_range", (0.4, 1.0)))
                 v_lo, v_hi = (float(x) for x in getattr(cfg, "material_value_range", (0.3, 0.9)))
                 hue = torch.rand(n)
-                sat = s_lo + (s_hi - s_lo) * torch.rand(n)
+                # Appearance curriculum: scale saturation 0->full so early materials are near-grey (easy,
+                # consistent) and the vivid full-hue palette (incl. blue) phases in over the ramp.
+                sat = (s_lo + (s_hi - s_lo) * torch.rand(n)) * self._appearance_curric_frac()
                 val = v_lo + (v_hi - v_lo) * torch.rand(n)
                 scene = self._hsv_to_rgb(hue, sat, val)
                 hjit = float(getattr(cfg, "material_hue_part_jitter", 0.02))
@@ -1239,10 +1476,38 @@ class InsertionEnv(ForgeEnv):
             rgb01 = torch.pow(rgb01, self._photo_gamma)
         ch_mean = rgb01.mean(dim=(1, 2), keepdim=True)
         rgb01 = torch.clamp((rgb01 - ch_mean) * self._photo_contrast + ch_mean, 0.0, 1.0)
-        rgb_ns = float(getattr(cfg, "rgb_noise_std", 0.0))
+        rgb_ns = float(getattr(cfg, "rgb_noise_std", 0.0)) * self._appearance_curric_frac()
         if rgb_ns > 0.0:
             rgb01 = torch.clamp(rgb01 + rgb_ns * torch.randn_like(rgb01), 0.0, 1.0)
         rgb = rgb01 - torch.mean(rgb01, dim=(1, 2), keepdim=True)
+
+        # RGB-ONLY path (E2E sim2real rebuild): no depth channel, no depth DR. Emit the 3-channel RGB frame
+        # (+ optional periodic gallery of the RGB the policy sees) and return before any depth processing.
+        if getattr(self, "_rgb_only", False):
+            log_int = int(getattr(self.cfg, "cam_log_interval", 0))
+            if log_int > 0:
+                if self._cam_log_counter % log_int == 0:
+                    import os
+
+                    from isaaclab.sensors import save_images_to_file
+
+                    d = str(getattr(self.cfg, "cam_log_dir", "renders/train_cam"))
+                    os.makedirs(d, exist_ok=True)
+                    save_images_to_file(rgb01, f"{d}/rgb_{self._cam_log_counter:08d}.png")
+                self._cam_log_counter += 1
+            if getattr(self.cfg, "write_image_to_file", False):
+                from isaaclab.sensors import save_images_to_file
+
+                save_images_to_file(rgb01, "/tmp/wrist_rgb.png")
+            # ImageNet-normalize (the mean/std the FROZEN pretrained ResNet-18 was trained on) so the encoder
+            # receives an in-distribution input. A per-image mean subtraction or downstream RunningMeanStd
+            # standardization is the wrong preprocessing contract for this backbone. The image is not
+            # normalized again in rl_games (see _ImageSkipRMSObs at module top).
+            if not hasattr(self, "_imagenet_mean"):
+                self._imagenet_mean = torch.tensor([0.485, 0.456, 0.406], device=self.device).view(1, 1, 1, 3)
+                self._imagenet_std = torch.tensor([0.229, 0.224, 0.225], device=self.device).view(1, 1, 1, 3)
+            rgb_norm = (rgb01 - self._imagenet_mean) / self._imagenet_std
+            return self._stack_frames(self._apply_image_dropout(rgb_norm))  # (num_envs, H, W, 3[*frame_stack])
 
         depth = out["depth"].clone()
         if depth.dim() == 4:
@@ -1299,7 +1564,15 @@ class InsertionEnv(ForgeEnv):
             self._cam_log_counter += 1
 
         frame = torch.cat([rgb, depth], dim=-1)  # (num_envs, H, W, c) -- this timestep's processed frame
-        return self._stack_frames(frame)
+        return self._stack_frames(self._apply_image_dropout(frame))
+
+    def _apply_image_dropout(self, frame):
+        """§8: zero the whole image for episodes flagged in self._image_dropout (per-episode sensor dropout).
+        No-op when the mask is all-False. Applied to the processed frame before temporal stacking."""
+        m = getattr(self, "_image_dropout", None)
+        if m is None or not bool(m.any()):
+            return frame
+        return torch.where(m.view(-1, 1, 1, 1), torch.zeros_like(frame), frame)
 
     def _stack_frames(self, frame):
         """Temporal frame-stack: return the last N processed frames stacked on the channel axis.
@@ -1332,6 +1605,31 @@ class InsertionEnv(ForgeEnv):
         if steps <= 0:
             return 1.0
         return min(1.0, max(0.0, float(self.common_step_counter) / float(steps)))
+
+    def _appearance_curric_frac(self):
+        """Appearance-DR curriculum fraction in [0,1] (1.0 when the knob is 0 = no ramp).
+
+        Scales the photometric aug ranges + RGB sensor noise + material saturation from ~0 (near-clean,
+        consistent images -> the CNN gets an easy visual foothold like w2) up to the full hardened
+        appearance DR. Part of the v2 early-foothold fix.
+        """
+        steps = int(getattr(self.cfg, "appearance_curriculum_steps", 0) or 0)
+        if steps <= 0:
+            return 1.0
+        return min(1.0, max(0.0, float(self.common_step_counter) / float(steps)))
+
+    def _image_dropout_rate(self):
+        """Current image-dropout probability (§8): ramps 0 -> image_dropout_prob starting at
+        image_dropout_start_steps over image_dropout_curriculum_steps control steps (0 => full at start)."""
+        prob = float(getattr(self.cfg, "image_dropout_prob", 0.0) or 0.0)
+        if prob <= 0.0:
+            return 0.0
+        start = int(getattr(self.cfg, "image_dropout_start_steps", 0) or 0)
+        ramp = int(getattr(self.cfg, "image_dropout_curriculum_steps", 0) or 0)
+        if ramp <= 0:
+            return prob if self.common_step_counter >= start else 0.0
+        frac = (float(self.common_step_counter) - float(start)) / float(ramp)
+        return prob * min(1.0, max(0.0, frac))
 
     def _corrupt_depth_structured(self, depth, finite, rgb01):
         """Turn a clean sim depth map into a real-D405-like one (measured ~45% invalid, structured).

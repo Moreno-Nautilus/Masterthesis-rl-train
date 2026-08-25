@@ -48,6 +48,15 @@ parser.add_argument("--seed", type=int, default=None, help="Environment seed.")
 parser.add_argument("--warmup", type=int, default=2, help="Zero-action env steps before dumping (warms the camera pipeline; keep small to stay near the pre-insert start).")
 parser.add_argument("--env_index", type=int, default=0, help="Which env's obs to dump.")
 parser.add_argument("--out", type=str, default="/tmp/sim_obs.npz", help="Output npz path.")
+parser.add_argument(
+    "--env_yaml",
+    type=str,
+    default=None,
+    help="Path to the run's saved params/env.yaml. When given, the obs-composition flags "
+    "(e2e_use_proprio_obs / e2e_goal_obs / e2e_use_velocity_obs / e2e_keep_aux_label / "
+    "e2e_force_in_tcp_frame / image_* / frame_stack) are copied from it so the dumped obs matches "
+    "THAT checkpoint's contract exactly. Without it, the legacy w2_estimator_192 contract is forced.",
+)
 AppLauncher.add_app_launcher_args(parser)
 args_cli, hydra_args = parser.parse_known_args()
 
@@ -95,10 +104,33 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
         args_cli.seed = random.randint(0, 10000)
     env_cfg.seed = args_cli.seed if args_cli.seed is not None else getattr(env_cfg, "seed", 42)
 
-    # Force the obs flags to the DEPLOY contract (21-d policy + training-only aux_label). These are off
-    # in the task default but were ON for w2_estimator_192 (see the module docstring).
-    env_cfg.e2e_use_proprio_obs = True
-    env_cfg.e2e_keep_aux_label = True
+    # Obs composition is config-driven. Prefer copying the exact flags from the run's saved env.yaml
+    # (so the dump matches THAT checkpoint's obs contract); otherwise fall back to the legacy
+    # w2_estimator_192 contract (21-d proprio policy + training-only aux_label).
+    if args_cli.env_yaml:
+        import yaml
+
+        with open(args_cli.env_yaml) as _f:
+            _saved = yaml.unsafe_load(_f)
+        # These are the only keys that change the EMITTED obs (policy-vector layout + image tensor).
+        _obs_keys = (
+            "e2e_use_proprio_obs",
+            "e2e_goal_obs",
+            "e2e_use_velocity_obs",
+            "e2e_keep_aux_label",
+            "e2e_force_in_tcp_frame",
+            "image_height",
+            "image_width",
+            "image_channels",
+            "frame_stack",
+        )
+        for _k in _obs_keys:
+            if _k in _saved:
+                setattr(env_cfg, _k, _saved[_k])
+                print(f"[dump_sim_obs] env.yaml override: {_k} = {_saved[_k]}")
+    else:
+        env_cfg.e2e_use_proprio_obs = True
+        env_cfg.e2e_keep_aux_label = True
 
     env = gym.make(args_cli.task, cfg=env_cfg, render_mode=None)
     u = env.unwrapped

@@ -77,12 +77,14 @@ class InsertionHybridBuilder(A2CBuilder):
 
             cnn_params = params.get("cnn")
             convs = (cnn_params or {}).get("convs") or _DEFAULT_CONVS
-            # Optional pretrained backbone (end-to-end visuomotor): cnn.backbone == "resnet18" swaps the
-            # from-scratch Nature CNN for a frozen ImageNet ResNet-18 whose input conv is inflated to the
-            # image's channel count (RGB weights copied; extra channels = mean of the RGB weights) and
-            # kept TRAINABLE so depth adapts. Everything else (LSTM/MLP/heads, projection FC) is unchanged.
+            # Optional pretrained backbone (end-to-end visuomotor): ResNet-18 and EfficientNet-B0 are
+            # fully-frozen ImageNet encoders on plain 3-channel RGB. Only the downstream projection FC +
+            # LSTM/MLP/aux heads train.
             backbone = (cnn_params or {}).get("backbone")
+            self._image_backbone = backbone
             self._image_is_resnet = bool(self._image_key is not None and backbone == "resnet18")
+            self._image_is_efficientnet = bool(self._image_key is not None and backbone == "efficientnet_b0")
+            self._image_is_imagenet_encoder = self._image_is_resnet or self._image_is_efficientnet
 
             # Measure the CNN's flattened output with a throwaway module (cannot store an nn.Module
             # before nn.Module.__init__ runs inside the parent constructor). ResNet-18's pooled feature
@@ -92,6 +94,8 @@ class InsertionHybridBuilder(A2CBuilder):
                 c, h, w = image_chw
                 if self._image_is_resnet:
                     cnn_out = 512
+                elif self._image_is_efficientnet:
+                    cnn_out = 1280
                 else:
                     with torch.no_grad():
                         cnn_out = self._make_cnn(c, convs)(torch.zeros(1, c, h, w)).flatten(1).shape[1]
@@ -120,11 +124,22 @@ class InsertionHybridBuilder(A2CBuilder):
             super().__init__(parent_params, **parent_kwargs)
 
             # Now that nn.Module is initialized, build the real CNN + projection FC that forward() uses.
+            self._resnet_finetune_tail = False
             if self._image_key is not None:
                 if self._image_is_resnet:
                     pretrained = bool((cnn_params or {}).get("pretrained", True))
                     weights_path = (cnn_params or {}).get("weights_path")
-                    self._image_cnn = self._build_resnet18(image_chw[0], pretrained, weights_path)
+                    # Optional top-block (layer4) fine-tuning at a reduced effective LR (supervisor 2026-08-22).
+                    self._resnet_finetune_tail = bool((cnn_params or {}).get("finetune_tail", False))
+                    _ft_scale = float((cnn_params or {}).get("finetune_grad_scale", 0.1))
+                    self._image_cnn = self._build_resnet18(
+                        image_chw[0], pretrained, weights_path,
+                        finetune_tail=self._resnet_finetune_tail, finetune_grad_scale=_ft_scale,
+                    )
+                elif self._image_is_efficientnet:
+                    pretrained = bool((cnn_params or {}).get("pretrained", True))
+                    weights_path = (cnn_params or {}).get("weights_path")
+                    self._image_cnn = self._build_efficientnet_b0(image_chw[0], pretrained, weights_path)
                 else:
                     self._image_cnn = self._make_cnn(image_chw[0], convs)
                 self._image_proj = nn.Sequential(nn.Linear(self._cnn_out, self._proj_dim), nn.ReLU())
@@ -171,17 +186,18 @@ class InsertionHybridBuilder(A2CBuilder):
             return nn.Sequential(*layers)
 
         @staticmethod
-        def _build_resnet18(in_channels, pretrained, weights_path=None):
-            """ImageNet ResNet-18 encoder, input conv inflated to ``in_channels``, backbone FROZEN.
+        def _build_resnet18(in_channels, pretrained, weights_path=None, finetune_tail=False, finetune_grad_scale=0.1):
+            """ImageNet ResNet-18 encoder for plain 3-channel RGB, backbone frozen (optional layer4 fine-tune).
 
-            - conv1 (3ch) -> (in_channels)ch: copy the RGB weights; init each extra (depth) channel to the
-              MEAN of the RGB conv weights (a sane grey-world init). conv1 is kept TRAINABLE so the depth
-              channel adapts; every other backbone param is frozen.
-            - fc is replaced by Identity so forward() returns the 512-d global-average-pooled feature.
+            - RGB-only: the wrist camera emits a normal 3-channel RGB frame (no depth, no frame-stack), which
+              is exactly ImageNet's native input, so conv1 is used UNMODIFIED -- no channel inflation.
+            - Every backbone param is frozen (conv1 included). fc is replaced by Identity so forward()
+              returns the 512-d global-average-pooled feature; only the downstream projection FC + LSTM/MLP
+              (and aux heads) train.
             - BatchNorm stays in eval mode at forward time (see forward()) so the frozen running stats are
               used, not noisy RL-minibatch stats. Robust to being offline: if the pretrained download fails
-              we fall back to random init (still trainable conv1) with a warning; an optional local
-              ``weights_path`` (a torchvision resnet18 state_dict) is loaded first if given.
+              we fall back to random init with a warning; an optional local ``weights_path`` (a torchvision
+              resnet18 state_dict) is loaded first if given.
             """
             import warnings
 
@@ -208,24 +224,80 @@ class InsertionHybridBuilder(A2CBuilder):
                     except Exception as exc:  # noqa: BLE001
                         warnings.warn(f"[insertion_hybrid] local ResNet-18 weights load failed ({exc}); random init.")
 
-            old_conv = net.conv1  # Conv2d(3, 64, k=7, s=2, p=3, bias=False)
-            new_conv = nn.Conv2d(in_channels, 64, kernel_size=7, stride=2, padding=3, bias=False)
-            with torch.no_grad():
-                w = old_conv.weight  # (64, 3, 7, 7)
-                if in_channels >= 3:
-                    new_conv.weight[:, :3] = w
-                    if in_channels > 3:
-                        new_conv.weight[:, 3:] = w.mean(dim=1, keepdim=True).repeat(1, in_channels - 3, 1, 1)
-                else:
-                    new_conv.weight[:] = w[:, :in_channels]
-            net.conv1 = new_conv
-
-            for p in net.parameters():
-                p.requires_grad = False
-            for p in net.conv1.parameters():  # keep ONLY the (inflated) input conv trainable
-                p.requires_grad = True
+            if in_channels != 3:
+                raise ValueError(
+                    f"insertion_hybrid ResNet-18 encoder is RGB-only (3ch); got in_channels={in_channels}. "
+                    "Depth and frame-stack channel inflation were removed -- keep image_channels=3 and "
+                    "frame_stack=1 (the LSTM carries temporal state)."
+                )
             net.fc = nn.Identity()  # forward() returns the 512-d pooled feature
+            # The ImageNet encoder is a fixed feature extractor. Frozen Parameters are intentionally kept as
+            # Parameters so checkpoints retain the standard torchvision state layout; Adam ignores entries
+            # whose gradients are None.
+            for p in net.parameters():
+                p.requires_grad_(False)
+            if finetune_tail:
+                # Unfreeze ONLY the top residual block (layer4) for task fine-tuning. rl_games uses a single
+                # optimizer LR for all params, so we approximate a smaller backbone LR with a gradient-scale
+                # hook (grad *= finetune_grad_scale). BN stays frozen in eval() at forward time (see forward),
+                # so running stats never drift on RL minibatches -- this + torch_compile OFF avoids the
+                # frozen-backbone in-place NaN history. forward() runs the frozen stem under no_grad and only
+                # layer4+pool with grad, so activation memory only grows for the top block.
+                for p in net.layer4.parameters():
+                    p.requires_grad_(True)
+                    if finetune_grad_scale != 1.0:
+                        p.register_hook(lambda g, s=finetune_grad_scale: g * s)
             return net
+
+        @staticmethod
+        def _build_efficientnet_b0(in_channels, pretrained, weights_path=None):
+            """Fully-frozen ImageNet EfficientNet-B0 encoder returning its 1280-d pooled feature."""
+            import warnings
+
+            from torchvision.models import efficientnet_b0
+
+            try:
+                from torchvision.models import EfficientNet_B0_Weights
+
+                default_weights = EfficientNet_B0_Weights.IMAGENET1K_V1
+            except Exception:  # very old torchvision
+                default_weights = None
+
+            net = None
+            if pretrained:
+                try:
+                    net = efficientnet_b0(weights=default_weights)
+                except Exception as exc:  # noqa: BLE001 (offline / download failure)
+                    warnings.warn(f"[insertion_hybrid] EfficientNet-B0 pretrained load failed ({exc}); random init.")
+            if net is None:
+                net = efficientnet_b0(weights=None)
+                if weights_path:
+                    try:
+                        net.load_state_dict(torch.load(weights_path, map_location="cpu"), strict=False)
+                    except Exception as exc:  # noqa: BLE001
+                        warnings.warn(
+                            f"[insertion_hybrid] local EfficientNet-B0 weights load failed ({exc}); random init."
+                        )
+
+            if in_channels != 3:
+                raise ValueError(f"EfficientNet-B0 encoder is RGB-only (3ch); got in_channels={in_channels}.")
+            net.classifier = nn.Identity()
+            for p in net.parameters():
+                p.requires_grad_(False)
+            return net
+
+        def _resnet_forward_finetune(self, img):
+            """ResNet-18 forward with the frozen stem (conv1..layer3) under no_grad and the trainable
+            layer4 + avgpool under grad. Only the layer3 activation is retained for the layer4 backward,
+            so activation memory grows only for the top block. BN is already in eval() (see forward)."""
+            net = self._image_cnn
+            with torch.cuda.amp.autocast(dtype=torch.bfloat16):
+                with torch.no_grad():
+                    x = net.conv1(img); x = net.bn1(x); x = net.relu(x); x = net.maxpool(x)
+                    x = net.layer1(x); x = net.layer2(x); x = net.layer3(x)
+                x = net.layer4(x)
+                x = net.avgpool(x)
+            return torch.flatten(x, 1)
 
         def forward(self, obs_dict):
             obs = obs_dict["obs"]
@@ -233,16 +305,111 @@ class InsertionHybridBuilder(A2CBuilder):
             # label), preserving dict order.
             proprio = [v for k, v in obs.items() if k != self._image_key and k != self._aux_label_key]
             feat = torch.cat(proprio, dim=1) if proprio else None
+            cnn_feat = None
             self._aux_loss = None
             self._estimator_pred = None  # last explicit-estimator prediction (for viz/logging)
             if self._image_cnn is not None:
-                img = obs[self._image_key].permute(0, 3, 1, 2).contiguous()  # BHWC -> BCHW
+                image_obs = obs[self._image_key]
+                img = image_obs.permute(0, 3, 1, 2).contiguous()  # BHWC -> BCHW
+                import os as _os_dbg
+                _debug_nan = bool(_os_dbg.environ.get("DEBUG_NAN"))
+                _input_raw_max = float(img.abs().max()) if _debug_nan else None
+                if self._image_is_imagenet_encoder:
+                    # The camera path emits RGB in [0, 1], then ImageNet-normalizes it, so valid values are
+                    # bounded by roughly [-2.12, 2.64]. A few sparse rollout-buffer pixels have been observed
+                    # with corrupted finite exponents (up to 1e22); contain them at this explicit interface.
+                    img = torch.nan_to_num(img, nan=0.0, posinf=2.65, neginf=-2.12).clamp(-2.12, 2.65)
+                _probe_weight = None
+                _probe_name = None
+                _first_weight = None
                 if self._image_is_resnet:
+                    _probe_weight = self._image_cnn.layer4[0].conv2.weight
+                    _probe_name = "l4conv2"
+                    _first_weight = self._image_cnn.conv1.weight
+                elif self._image_is_efficientnet:
+                    _probe_weight = self._image_cnn.features[8][0].weight
+                    _probe_name = "features8conv"
+                    _first_weight = self._image_cnn.features[0][0].weight
+                _probe_pre = float(_probe_weight.abs().max()) if _debug_nan and _probe_weight is not None else None
+                if self._image_is_imagenet_encoder:
                     # Keep the frozen backbone's BatchNorm on its ImageNet running stats regardless of the
-                    # agent toggling model.train()/eval(); the trainable conv1 still gets gradients (eval
-                    # mode gates BN/dropout, not autograd).
+                    # agent toggling model.train()/eval().
                     self._image_cnn.eval()
-                cnn_feat = self._image_proj(self._image_cnn(img).flatten(1))  # cnn_out -> proj_dim
+                if self._image_is_imagenet_encoder:
+                    # Encode in BF16 (not fp16); bf16 keeps fp32's exponent range at fp16's memory cost.
+                    if self._image_is_resnet and self._resnet_finetune_tail:
+                        cnn_out = self._resnet_forward_finetune(img)  # frozen stem no_grad, layer4 with grad
+                    else:
+                        with torch.cuda.amp.autocast(dtype=torch.bfloat16), torch.no_grad():
+                            cnn_out = self._image_cnn(img).flatten(1)
+                else:
+                    cnn_out = self._image_cnn(img).flatten(1)
+                # The projection remains outside no_grad and trains on the detached encoder features.
+                with torch.cuda.amp.autocast(dtype=torch.bfloat16, enabled=self._image_is_imagenet_encoder):
+                    cnn_feat = self._image_proj(cnn_out)
+                if _debug_nan:
+                    self._dbg_cnn_out = cnn_out  # Raw backbone output for the NaN probe.
+                    _n = getattr(self, "_dbg_fwd_n", 0) + 1
+                    self._dbg_fwd_n = _n
+                    _rawmax = float(cnn_out.abs().max())
+                    _cfmax = float(cnn_feat.abs().max())
+                    # One-shot: when the RAW backbone output explodes, immediately re-run the SAME img through
+                    # the SAME module in a clean eager fp32 no-autocast no_grad context. If the re-run is ~6.5
+                    # while the in-place forward was 1e31, the transient lives in the autocast/compile path.
+                    if _rawmax > 1e4 and not getattr(self, "_dbg_reforward_done", False):
+                        self._dbg_reforward_done = True
+                        with torch.no_grad():
+                            with torch.autocast("cuda", enabled=False):
+                                _re = self._image_cnn(img.float()).flatten(1)
+                        print(f"[cnn-dbg] RE-FORWARD (eager fp32, same img+module): "
+                              f"in_place_raw={_rawmax:.3g} -> reforward={float(_re.abs().max()):.3g}", flush=True)
+                    if _n <= 10 or _rawmax > 1e4:
+                        _c1 = float(_first_weight.abs().max()) if _first_weight is not None else float("nan")
+                        _pj = float(self._image_proj[0].weight.abs().max())
+                        _probe_post = float(_probe_weight.abs().max()) if _probe_weight is not None else float("nan")
+                        import torch.nn as _nn_dbg
+                        _bnv = _bnm = 0.0
+                        _bntrain = 0
+                        for _m in self._image_cnn.modules():
+                            if isinstance(_m, _nn_dbg.BatchNorm2d):
+                                if _m.running_var is not None:
+                                    _bnv = max(_bnv, float(_m.running_var.max()))
+                                    _bnm = max(_bnm, float(_m.running_mean.abs().max()))
+                                if _m.training:
+                                    _bntrain += 1
+                        print(f"[cnn-dbg] fwd={_n} input_raw={_input_raw_max:.3g} "
+                              f"img_absmax={float(img.abs().max()):.3g} "
+                              f"encoder_out={_rawmax:.3g} cnn_feat={_cfmax:.3g} "
+                              f"{_probe_name}_w={_probe_pre:.3g}->{_probe_post:.3g} "
+                              f"conv1_w={_c1:.3g} proj_w={_pj:.3g} | cnn.training={self._image_cnn.training} "
+                              f"bn_in_train={_bntrain} bn_var_max={_bnv:.3g} bn_mean_absmax={_bnm:.3g}", flush=True)
+                    # Dump the EXACT triggering frame (BCHW, as fed to the backbone) + the raw pre-conv
+                    # obs image on the first explosion, so it can be replayed against a bare frozen
+                    # resnet18 in isolation (scripts/repro_resnet_nan.py). One dump per process.
+                    if _rawmax > 1e4 and not getattr(self, "_dbg_frame_dumped", False):
+                        self._dbg_frame_dumped = True
+                        _row_max = cnn_out.detach().float().abs().amax(dim=1)  # (B,) per-env backbone max
+                        _bad = torch.nonzero(_row_max > 1e4, as_tuple=False).flatten()
+                        _dump = {
+                            "img_bchw": img.detach().float().cpu(),          # exact backbone input
+                            "obs_image_bhwc": obs[self._image_key].detach().float().cpu(),  # pre-permute obs
+                            "encoder_out": cnn_out.detach().float().cpu(),
+                            "resnet_out": cnn_out.detach().float().cpu(),  # compatibility with replay script
+                            "bad_rows": _bad.detach().cpu(),
+                            "fwd_n": _n,
+                            # Snapshot the backbone state so a failing run can be diffed against ImageNet.
+                            "backbone_state": {k: v.detach().float().cpu()
+                                               for k, v in self._image_cnn.state_dict().items()},
+                            "first_conv_weight": _first_weight.detach().float().cpu(),
+                        }
+                        _p = f"/tmp/resnet_nan_frame_fwd{_n}.pt"
+                        torch.save(_dump, _p)
+                        print(f"[cnn-dbg] DUMPED triggering frame -> {_p} "
+                              f"(bad_rows={_bad.tolist()} of B={img.shape[0]}, img shape={tuple(img.shape)})",
+                              flush=True)
+                        raise RuntimeError("Frozen image encoder produced an invalid-magnitude feature; dump saved.")
+                if feat is not None:
+                    cnn_feat = cnn_feat.to(feat.dtype)  # match proprio dtype for the cat below
                 # Compute the aux loss only on training forwards (skipped during rollout/eval, where the
                 # heads are unused) and only when the privileged label is present.
                 if self.training and self._aux_heads is not None and self._aux_label_key in obs:
@@ -258,7 +425,31 @@ class InsertionHybridBuilder(A2CBuilder):
                 feat = torch.cat(parts, dim=1)
             fused = dict(obs_dict)
             fused["obs"] = feat
-            return super().forward(fused)
+            out = super().forward(fused)
+            # One-shot NaN probe (DEBUG_NAN=1): identify whether the actor mean or central value head failed,
+            # then print the normalized inputs and image stages that fed it.
+            import os as _os
+            if _os.environ.get("DEBUG_NAN") and not getattr(self, "_output_nan_probed", False):
+                head_out = out[0]
+                if not torch.isfinite(head_out).all():
+                    self._output_nan_probed = True
+                    head_name = "actor mu" if self._image_cnn is not None else "central value"
+
+                    def _st(t):
+                        if t is None:
+                            return "None"
+                        fin = torch.isfinite(t)
+                        amax = float(t[fin].abs().max()) if bool(fin.any()) else float("nan")
+                        return f"nonfinite={int((~fin).sum())}/{t.numel()} absmax_finite={amax:.3g}"
+
+                    print(f"[nan-probe] {head_name.upper()} NON-FINITE at first occurrence:", flush=True)
+                    for _k, _v in obs.items():
+                        print(f"  norm_obs[{_k}]: {_st(_v)}", flush=True)
+                    print(f"  resnet_out(pre-proj): {_st(getattr(self, '_dbg_cnn_out', None))}", flush=True)
+                    print(f"  cnn_feat: {_st(cnn_feat)}", flush=True)
+                    print(f"  fused_feat: {_st(feat)}", flush=True)
+                    print(f"  {head_name}: {_st(head_out)}", flush=True)
+            return out
 
         def _compute_aux_loss(self, cnn_feat, label):
             # float32 for the regression (cnn_feat may be bf16 under autocast). Per-target MEAN MSE so a

@@ -190,7 +190,7 @@ def main():
     o = u.scene.env_origins
     ft = u.fingertip_midpoint_pos + o
     center = ft + torch.tensor([0.0, 0.0, -0.018], device=dev)
-    eyes = center + torch.tensor([0.075, 0.05, 0.022], device=dev)
+    eyes = center + torch.tensor([0.0, -0.13, 0.03], device=dev)  # FRONT view (from the D405/-Y side)
     u._scene_camera.set_world_poses_from_view(eyes, center)
     for _ in range(2):
         if sweep is not None:  # keep the screw pinned (correct orientation) while re-aiming

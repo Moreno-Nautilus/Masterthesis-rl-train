@@ -28,6 +28,7 @@ parser.add_argument("--checkpoint", type=str, required=True, help="Path to model
 parser.add_argument("--num_envs", type=int, default=16)
 parser.add_argument("--n_clips", type=int, default=10, help="How many envs (clips) to record.")
 parser.add_argument("--view", type=str, default="scene", choices=["wrist", "scene"])
+parser.add_argument("--stills", action="store_true", help="save a PNG of the settled frame per clip (no video)")
 parser.add_argument("--frames", type=int, default=160, help="Number of frames (sim steps) to record.")
 parser.add_argument("--fps", type=int, default=20)
 parser.add_argument("--out_dir", type=str, default="diagnostics/renders")
@@ -77,6 +78,8 @@ def _scene_frame(u, env_idx):
 def _wrist_frame(u, env_idx, far):
     out = u._tiled_camera.data.output
     rgb = out["rgb"][env_idx, :, :, :3].clamp(0, 255).to(torch.uint8).cpu().numpy()
+    if "depth" not in out:  # RGB-only config (current pdz/e2e setup) -> just the RGB POV
+        return rgb
     depth = out["depth"][env_idx].clone().float()
     depth[~torch.isfinite(depth)] = 0.0
     depth = (depth.clamp(0.0, far) / far * 255.0).to(torch.uint8).cpu().numpy()
@@ -165,10 +168,16 @@ def main(env_cfg, agent_cfg: dict):
     os.makedirs(args_cli.out_dir, exist_ok=True)
     import imageio.v2 as imageio
 
-    for e in range(n_clips):
-        out = os.path.join(args_cli.out_dir, f"{args_cli.prefix}_{e:02d}.mp4")
-        imageio.mimwrite(out, clips[e], fps=args_cli.fps, macro_block_size=None)
-        print(f"[OK] wrote {out}  ({len(clips[e])} frames)")
+    if args_cli.stills:  # PNG of the last (settled) frame per clip -- faster than encoding video
+        for e in range(n_clips):
+            out = os.path.join(args_cli.out_dir, f"{args_cli.prefix}_{e:02d}.png")
+            imageio.imwrite(out, clips[e][-1])
+            print(f"[OK] wrote {out}")
+    else:
+        for e in range(n_clips):
+            out = os.path.join(args_cli.out_dir, f"{args_cli.prefix}_{e:02d}.mp4")
+            imageio.mimwrite(out, clips[e], fps=args_cli.fps, macro_block_size=None)
+            print(f"[OK] wrote {out}  ({len(clips[e])} frames)")
 
 
 if __name__ == "__main__":

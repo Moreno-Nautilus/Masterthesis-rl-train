@@ -29,12 +29,14 @@
 docker/artifacts/
 *.tmp
 
+/Masterthesis-train-serl
+
+
 # Isaac-Sim packman
 _isaac_sim*
 _repo
 _build
 .lastformat
-
 /DECISIONS.md
 /PLANNING.md
 *.mp4
@@ -43,3 +45,21 @@ _build
 /renders
 /logs
 /outputs
+/diagnostics
+.claude
+.codex
+.agents
+AGENTS:md
+CLAUDE.md
+# Robot / CAD asset binaries + generated USD (bulky; regenerate via build_*/convert_* scripts)
+*.usd
+*.usda
+*.stl
+*.obj
+*.urdf
+*.xacro
+*.tar.gz
+# Isaac Lab URDF-converter split output
+**/configuration/
+*.txt
+*.md

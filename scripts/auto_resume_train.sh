@@ -1,8 +1,7 @@
 #!/bin/bash
-# Auto-resume training watchdog — works around the stochastic PhysX GPU CUDA-700 crash on the
-# vision task (rendering + GPU PhysX on this rc.36 Isaac Sim build; ~1h MTBF). The crash HANGS the
-# process holding the GPU, so we watch the log for the crash signature OR a progress stall, hard-kill
-# the run + any orphaned GPU proc, then relaunch with --checkpoint from the latest saved checkpoint.
+# Auto-resume training watchdog for unattended vision runs. If Isaac Sim exits or stalls while still
+# holding the GPU, watch the log/progress, hard-kill the process, and relaunch from the latest saved
+# checkpoint.
 # rl_games restores epoch_num from the checkpoint, so training continues toward --max_iterations.
 #
 # Usage: scripts/auto_resume_train.sh <experiment_name> <task_id> <num_envs> <max_iter> [seed_ckpt]
@@ -15,8 +14,10 @@ ENVS="${3:?num_envs}"
 MAX="${4:?max_iterations}"
 SEED="${5:-}"                       # optional: checkpoint to warm-start the first attempt
 EXTRA="${EXTRA_OVERRIDES:-}"        # optional extra hydra overrides, e.g. EXTRA_OVERRIDES="env.blank_image=true"
-PY=/home/moreno/miniconda3/envs/isaaclab/bin/python
-EXPERIENCE="${EXPERIENCE:-/home/moreno/Masterthesis-rl-train/apps/isaaclab.python.headless.rendering.physx1065.kit}"
+PY="${PY:-/home/moreno/miniconda3/envs/isaaclab51/bin/python}"
+# Empty selects Isaac Lab 2.3.2's stock Isaac Sim 5.1 rendering experience. Set EXPERIENCE explicitly
+# only for a compatible 5.1 custom Kit file; the old PhysX 106.5 experience belongs to Isaac Sim 4.5.
+EXPERIENCE="${EXPERIENCE:-}"
 NN_DIR="logs/rl_games/Forge/${NAME}/nn"
 LOG="/tmp/${NAME}.log"              # current attempt's stdout (overwritten each attempt)
 MASTER="/tmp/${NAME}_master.log"    # watchdog audit trail (persists)

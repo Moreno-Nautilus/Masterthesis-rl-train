@@ -48,6 +48,15 @@ def main() -> None:
     # Vision variant: dump a rendered RGB/depth frame to /tmp to sanity-check the wrist mount pose.
     if hasattr(env_cfg, "write_image_to_file"):
         env_cfg.write_image_to_file = True
+    # SMOKE_FULL_DR=1: zero the DR curricula so the smoke exercises the injection at FULL magnitude (the
+    # goal-anchor lateral/angular error otherwise ramps to ~0 at step 0 -> nothing to see). Diagnostic only.
+    if _os.environ.get("SMOKE_FULL_DR"):
+        for _obj, _attr in ((getattr(env_cfg, "task", None), "goal_anchor_curriculum_steps"),
+                            (getattr(env_cfg, "task", None), "pre_insert_tilt_curriculum_steps"),
+                            (env_cfg, "image_dropout_start_steps"), (env_cfg, "anchor_dropout_start_steps")):
+            if _obj is not None and hasattr(_obj, _attr):
+                setattr(_obj, _attr, 0)
+        emit("SMOKE_FULL_DR=1 -> zeroed DR curricula (full-magnitude injection)")
     env = gym.make(args_cli.task, cfg=env_cfg)
     emit(f"created env OK | action_space={env.action_space} obs_space={env.observation_space}")
 
@@ -57,10 +66,14 @@ def main() -> None:
     if isinstance(obs, dict) and "image" in obs:
         img = obs["image"]
         emit(f"reset OK | obs['image'] shape={tuple(img.shape)} dtype={img.dtype}")
-        rgb, depth = img[..., :3], img[..., 3]
+        rgb = img[..., :3]
         emit(f"  rgb   min/mean/max = {rgb.min():.3f}/{rgb.mean():.3f}/{rgb.max():.3f}")
-        emit(f"  depth min/mean/max = {depth.min():.3f}/{depth.mean():.3f}/{depth.max():.3f}")
-        emit("  wrote /tmp/wrist_rgb.png and /tmp/wrist_depth.png")
+        if img.shape[-1] >= 4:  # RGB-D path (residual/state vision tasks)
+            depth = img[..., 3]
+            emit(f"  depth min/mean/max = {depth.min():.3f}/{depth.mean():.3f}/{depth.max():.3f}")
+            emit("  wrote /tmp/wrist_rgb.png and /tmp/wrist_depth.png")
+        else:  # RGB-only path (E2E sim2real rebuild)
+            emit("  RGB-only (3ch): wrote /tmp/wrist_rgb.png")
 
     # --- geometry diagnostic (env 0, relative to its env origin) ---
     try:

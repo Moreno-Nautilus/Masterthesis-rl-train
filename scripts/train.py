@@ -262,6 +262,79 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
             wandb.config.update({"env_cfg": env_cfg.to_dict()})
             wandb.config.update({"agent_cfg": agent_cfg})
 
+    # DEBUG: DEBUG_ANOMALY=1 makes autograd throw at the exact op that first produces a NaN/Inf (slow;
+    # use for a short run to root-cause the yaw NaN).
+    import os as _os
+    if _os.environ.get("DEBUG_ANOMALY"):
+        import torch as _torch
+        _torch.autograd.set_detect_anomaly(True)
+        print("[DEBUG_ANOMALY] autograd anomaly detection ON", flush=True)
+
+    if _os.environ.get("DEBUG_OPTIMIZER"):
+        import torch as _torch
+
+        _adam_step = _torch.optim.Adam.step
+
+        def _checked_adam_step(optimizer, *step_args, **step_kwargs):
+            step_num = getattr(optimizer, "_nan_probe_step", 0) + 1
+            optimizer._nan_probe_step = step_num
+
+            def _check_tensors(stage, tensors):
+                largest = (0.0, "none")
+                for name, tensor in tensors:
+                    if tensor is None or not _torch.is_tensor(tensor):
+                        continue
+                    finite = _torch.isfinite(tensor)
+                    if not bool(finite.all()):
+                        count = int((~finite).sum())
+                        print(
+                            f"[optimizer-probe] step={step_num} {stage} {name} "
+                            f"NONFINITE={count}/{tensor.numel()} shape={tuple(tensor.shape)}",
+                            flush=True,
+                        )
+                        raise FloatingPointError(f"Adam {stage} became nonfinite at {name}")
+                    absmax = float(tensor.abs().max()) if tensor.numel() else 0.0
+                    if absmax > largest[0]:
+                        largest = (absmax, name)
+                return largest
+
+            params = [
+                (f"group{group_idx}.param{param_idx}", param)
+                for group_idx, group in enumerate(optimizer.param_groups)
+                for param_idx, param in enumerate(group["params"])
+            ]
+            grad_max = _check_tensors("grad-before", ((name, param.grad) for name, param in params))
+            param_max = _check_tensors("param-before", params)
+            if _torch.cuda.is_available():
+                _torch.cuda.synchronize()
+
+            result = _adam_step(optimizer, *step_args, **step_kwargs)
+
+            if _torch.cuda.is_available():
+                _torch.cuda.synchronize()
+            param_after_max = _check_tensors("param-after", params)
+            state_after_max = _check_tensors(
+                "state-after",
+                (
+                    (f"group{group_idx}.param{param_idx}.{state_name}", state_tensor)
+                    for group_idx, group in enumerate(optimizer.param_groups)
+                    for param_idx, param in enumerate(group["params"])
+                    for state_name, state_tensor in optimizer.state[param].items()
+                ),
+            )
+            if step_num <= 2:
+                print(
+                    f"[optimizer-probe] step={step_num} finite "
+                    f"grad_max={grad_max[0]:.3g}@{grad_max[1]} "
+                    f"param={param_max[0]:.3g}->{param_after_max[0]:.3g} "
+                    f"state_max={state_after_max[0]:.3g}@{state_after_max[1]}",
+                    flush=True,
+                )
+            return result
+
+        _torch.optim.Adam.step = _checked_adam_step
+        print("[DEBUG_OPTIMIZER] synchronized Adam finite-value probe ON", flush=True)
+
     if args_cli.checkpoint is not None:
         runner.run({"train": True, "play": False, "sigma": train_sigma, "checkpoint": resume_path})
     else:

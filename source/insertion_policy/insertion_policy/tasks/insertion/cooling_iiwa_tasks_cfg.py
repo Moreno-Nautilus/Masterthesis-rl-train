@@ -38,7 +38,7 @@ from .cooling_tasks_cfg import (
     ForgeTaskCoolingInsertCfg,
 )
 
-ROBOT_USD = os.path.join(ASSET_DIR, "robots", "kuka_iiwa7_y_gripper.usd")
+ROBOT_USD = os.path.join(ASSET_DIR, "robots", "kuka_iiwa7_pdz_gripper.usd")  # NEW pdz gripper (2026-08-24)
 
 # Folded, tool-DOWN reset seed for the iiwa (deg -> rad), TCP ~ (0.72, 0, 0.15) pointing straight down
 # (probe_iiwa.py sweep). Used as the reset IK seed AND the OSC null-space posture, so the arm stays in a
@@ -85,8 +85,8 @@ IIWA_GRIPPER_CFG = ArticulationCfg(
             "joint5": IIWA_RESET_JOINTS[4],
             "joint6": IIWA_RESET_JOINTS[5],
             "joint7": IIWA_RESET_JOINTS[6],
-            "left_finger_joint": 0.04,  # start open (both fingers now [0,0.04], 0=closed .. 0.04=open)
-            "right_finger_joint": 0.04,  # symmetric with left (build_iiwa_gripper_usd.py fixed its range)
+            "pdz_gripper_left_finger_joint": 0.0,  # start open (both fingers now [0,0.04], 0=closed .. 0.04=open)
+            "pdz_gripper_right_finger_joint": 0.0,  # symmetric with left (build_iiwa_gripper_usd.py fixed its range)
         },
         pos=(0.0, 0.0, 0.0),
         rot=(1.0, 0.0, 0.0, 0.0),
@@ -116,7 +116,7 @@ IIWA_GRIPPER_CFG = ArticulationCfg(
         # Gripper: both finger joints PD-position-controlled (right is a PhysX mimic of left, but the
         # base env commands both indices to the same target, so driving both is consistent).
         "gripper": ImplicitActuatorCfg(
-            joint_names_expr=["left_finger_joint", "right_finger_joint"],
+            joint_names_expr=["pdz_gripper_left_finger_joint", "pdz_gripper_right_finger_joint"],
             # Closing FORCE (found 2026-08-03): 100N drove the jaws THROUGH the 20mm SDF head (finger<->screw
             # penetration); 20N still penetrated ~2-3/50. 10N: drives fully closed (on/off), holds the 6g screw,
             # gentle enough not to ram through the head. Lower stiffness (2000) softens the approach. NOTE: if
@@ -152,7 +152,7 @@ class ForgeCoolingInsertIiwa(ForgeCoolingInsert):
     # depth sweep (scripts/render_grasp_grid.py --sweep) + user read put the head-clamped + shaft-out zone at
     # ~0.012-0.015 (h=0.017 too retracted, small values too far out). 0.012: pads on the head, shaft out, head
     # up in the jaws. VERIFY the physics grip across the randomized distribution with render_grasp_grid.py (grid v3).
-    robot_cfg: RobotCfg = RobotCfg(robot_usd=ROBOT_USD, franka_fingerpad_length=0.012, friction=0.75)
+    robot_cfg: RobotCfg = RobotCfg(robot_usd=ROBOT_USD, franka_fingerpad_length=0.003, friction=0.75)
 
     def __post_init__(self):
         # Move the insertion target OUT from the iiwa base (Franka: 0.60 m). The iiwa is a big arm; a
@@ -195,17 +195,15 @@ class ForgeTaskCoolingInsertIiwaCameraCfg(ForgeTaskCoolingInsertCameraCfg):
     # mesh at ~5cm -> gripper_base (0.042,0,0.088) = fingertip (0.042,0,-0.058). This keeps the cam ON the
     # D405 mount (not floated out) and un-occluded. (Note the vendor camera bump mesh is a placeholder
     # shape, not the actual D405.) TODO sim2real: set from the real D405 bracket + intrinsics.
-    wrist_cam_offset_pos: tuple = (0.042, 0.0, -0.058)
-    # Rigid-mount orientation via a FIXED look-at: eye -> this aim point, both fixed in the fingertip
-    # frame (rigid GoPro-style mount, not socket-tracking). Aim toward the socket/insertion region so the
-    # workspace sits centred in the wrist view (sweep-tuned with the moved-out mount).
+    # NEW pdz D405 (2026-08-24): eye = the D405 COLOR/DEPTH optical origin read off the converted pdz USD,
+    # expressed in the pdz_gripper_tcp frame (CAD: flange-frame [0.009,-0.05056,0.06293], tcp=flange+0.1355z).
+    wrist_cam_offset_pos: tuple = (0.009, -0.05056, -0.07257)
+    # Look-at is OVERRIDDEN by the verbatim quat below.
     wrist_cam_look_target_pos: tuple = (0.0, 0.0, 0.07)
-    # Real D405 orientation from the vendor USD Camera prim, ROLLED 180deg about the optical axis to match
-    # how the D405 is physically mounted (the real camera image shows the fingers at the BOTTOM converging
-    # up; the un-rolled vendor quat put them at the TOP). vendor (0.18869,-0.68132,0.68158,-0.18881) *
-    # 180deg-about-local-z (0,0,0,1) = below. look dir stays (-0.514,0,0.857) down-and-forward along the
-    # tool. InsertionEnvIiwa uses this verbatim (overrides the look-at above). quat (w,x,y,z).
-    wrist_cam_offset_quat: tuple | None = (0.18881, 0.68158, 0.68132, 0.18869)
+    # quat=None -> the env builds the camera from the LOOK-AT (eye -> wrist_cam_look_target_pos) in the
+    # correct OpenGL (-Z fwd) convention. The raw ROS optical quat pointed the camera BACKWARD (user
+    # 2026-08-24), so use the look-at (eye = the real D405 mount pos, aim = the insertion point).
+    wrist_cam_offset_quat: tuple | None = None
 
     def __post_init__(self):
         super().__post_init__()
@@ -231,27 +229,49 @@ class ForgeTaskCoolingInsertIiwaCameraCfg(ForgeTaskCoolingInsertCameraCfg):
 # tight-contact solver) can oscillate; too soft tracks the IK target sluggishly. gravity stays off.
 IIWA_GRIPPER_E2E_CFG = IIWA_GRIPPER_CFG.replace(
     actuators={
-        "iiwa_arm1": ImplicitActuatorCfg(
-            joint_names_expr=["joint[1-4]"],
-            stiffness=750.0,   # softened from 1000 (2026-08-05) -> gentler contact / less weld-snap; still ~2.5x KUKA ref
-            damping=70.0,
+        # 2026-08-19: split into 4 arm groups so J6/J7 get the real iiwa7 40 Nm effort cap (was lumped with
+        # J5 at 110). Stiffness/damping here are the MIDPOINTS of the per-episode DR ranges (§10 table);
+        # the actual per-env, per-episode gain DR is applied at reset (see InsertionEnvE2EIiwa dynamics DR).
+        # EFFORT sticker: 176/110/110/40 Nm from the iiwa7 R800 datasheet -- >>> CONFIRM J6/J7 = 40 Nm <<<.
+        "iiwa_arm_j12": ImplicitActuatorCfg(
+            joint_names_expr=["joint[1-2]"],
+            stiffness=562.0,   # DR 375-750 midpoint
+            damping=60.0,      # DR 50-70 midpoint
             friction=0.0,
             armature=0.0,
             effort_limit_sim=176.0,
             velocity_limit_sim=100.0,
         ),
-        "iiwa_arm2": ImplicitActuatorCfg(
-            joint_names_expr=["joint[5-7]"],
-            stiffness=375.0,   # softened from 500 (2026-08-05), same ~25% cut as arm1
-            damping=45.0,
+        "iiwa_arm_j34": ImplicitActuatorCfg(
+            joint_names_expr=["joint[3-4]"],
+            stiffness=562.0,   # DR 375-750 midpoint
+            damping=60.0,      # DR 50-70 midpoint
             friction=0.0,
             armature=0.0,
             effort_limit_sim=110.0,
             velocity_limit_sim=100.0,
         ),
+        "iiwa_arm_j5": ImplicitActuatorCfg(
+            joint_names_expr=["joint5"],
+            stiffness=281.0,   # DR 187-375 midpoint
+            damping=38.0,      # DR 32-45 midpoint
+            friction=0.0,
+            armature=0.0,
+            effort_limit_sim=110.0,
+            velocity_limit_sim=100.0,
+        ),
+        "iiwa_arm_j67": ImplicitActuatorCfg(
+            joint_names_expr=["joint[6-7]"],
+            stiffness=281.0,   # DR 187-375 midpoint
+            damping=38.0,      # DR 32-45 midpoint
+            friction=0.0,
+            armature=0.0,
+            effort_limit_sim=40.0,   # iiwa7 wrist J6/J7 cap (was 110 when lumped with J5)
+            velocity_limit_sim=100.0,
+        ),
         # Gripper unchanged (PhysX PD position control; both finger joints commanded to the same target).
         "gripper": ImplicitActuatorCfg(
-            joint_names_expr=["left_finger_joint", "right_finger_joint"],
+            joint_names_expr=["pdz_gripper_left_finger_joint", "pdz_gripper_right_finger_joint"],
             # Closing FORCE (found 2026-08-03): 100N drove the jaws THROUGH the 20mm SDF head (finger<->screw
             # penetration); 20N still penetrated ~2-3/50. 10N: drives fully closed (on/off), holds the 6g screw,
             # gentle enough not to ram through the head. Lower stiffness (2000) softens the approach. NOTE: if
@@ -318,6 +338,9 @@ class ForgeTaskCoolingInsertIiwaE2ECfg(ForgeTaskCoolingInsertIiwaCfg):
     e2e_reward_mode: str = "squashing"
     e2e_reward_pos_weight: float = 1.0
     e2e_reward_rot_weight: float = 0.25
+    # Seat dead-zone (m): zero the position reward once the tip is within this of the target (= physically
+    # seated), so the policy doesn't press past the ~2.5mm-unreachable residual ("crash down"). 0 => off.
+    e2e_seat_deadzone: float = 0.0
     e2e_reward_center_weight: float = 0.0  # lateral-centering reward weight (hole-finding under noise); 0 => off
     e2e_keep_aux_label: bool = False  # keep the aux_label obs group -> enables the EXPLICIT ESTIMATOR
     e2e_success_bonus: float = 1.0
@@ -329,8 +352,8 @@ class ForgeTaskCoolingInsertIiwaE2ECfg(ForgeTaskCoolingInsertIiwaCfg):
     # iiwa hover-IK servo burning its retry budget on straggler envs, so a smaller budget cuts it further.
     debug_solver_iters: int = 48       # PhysX position-iteration count (0 = keep the inherited 192)
     debug_reset_ik_budget: int = 8     # iiwa reset hover-IK retry cap (InsertionEnvE2EIiwa._reset_idx; 25 default)
-    weld_held_parent_body: str = "left_finger_link"
-    weld_gripper_closed_half_gap: float = 0.002  # q=0 collision faces are ~4mm apart, so contact q = r - 2mm
+    weld_held_parent_body: str = "pdz_gripper_tcp"
+    weld_gripper_closed_half_gap: float = 0.006  # q=0 collision faces are ~4mm apart, so contact q = r - 2mm
 
     # Reset hover-IK convergence tolerance (root-caused via diag_reset_ik.py): Factory demands 1mm/0.057deg,
     # which the iiwa DLS can't hit for ~30% of the random targets -> ~22 wasted retries. 5mm/2deg accepts
@@ -359,18 +382,61 @@ class ForgeTaskCoolingInsertIiwaE2ECfg(ForgeTaskCoolingInsertIiwaCfg):
 
 @configclass
 class ForgeTaskCoolingInsertIiwaE2EVisionCfg(ForgeTaskCoolingInsertIiwaCameraCfg):
-    """The real end-to-end visuomotor task: wrist RGB-D + force -> 5-DoF delta, no proprio. Inherits the
-    full appearance-DR + wrist-cam pipeline; adds the high-gain PD arm + E2E action/reward. 224px RGB-D
-    (the confirmed resolution win + ResNet-18-native). Launch with the rl_games_e2e_vision cfg."""
+    """The real end-to-end visuomotor task: wrist RGB + force -> 6-DoF delta, no proprio. Inherits the
+    full appearance-DR + wrist-cam pipeline; adds the high-gain PD arm + E2E action/reward. The policy
+    receives a full, aspect-preserving 320x180 downscale of the real D405 color stream."""
 
-    action_space: int = 5
+    # 6-DoF action (2026-08-19 rebuild): [dx, dy, dz, rot_a, rot_b, rot_yaw] -- yaw RE-ENABLED (the round
+    # peg is yaw-invariant to SEAT, but the wrist must be able to counter-rotate to stay in reach / keep
+    # the socket framed). Translation delta is rotated into the TCP frame; all 3 rot axes compose in the
+    # body frame. See InsertionEnvE2EIiwa._pre_physics_step. The state debug cfg keeps action_space=5.
+    action_space: int = 6
+    e2e_disable_yaw: bool = False  # yaw ON (guarded by e2e_yaw_action_bound + e2e_max_joint_delta); NaN was the CNN, not yaw.
+    # YAW BOUND (2026-08-20 fix): cumulatively clamp the commanded wrist yaw to +-this (rad) from the reset
+    # orientation, so the free (unrewarded) yaw DOF can't wind into the iiwa wrist singularity / joint limit
+    # -- the NaN chain (see PLANNING/memory). +-90deg lets the wrist counter-rotate for framing/reach but
+    # stays in one branch (0==360 respected, no wrap). 0 => unbounded (the old NaN-prone behaviour).
+    e2e_yaw_action_bound: float = 1.5708
+    # Minimal per-substep IK joint-delta clamp (rad): caps how far any arm joint can move in one control
+    # substep, so a near-singular DLS-IK demand can't produce a lurch -> huge angvel -> fp16 critic NaN.
+    # ~0.1 rad only bites on extreme lurches (normal tracking is ~0.01-0.02 rad/substep). 0 => off.
+    e2e_max_joint_delta: float = 0.1
     robot: ArticulationCfg = IIWA_GRIPPER_E2E_CFG
     debug_true_delta_obs: bool = False
+    # FULL EE-RELATIVE action (2026-08-19): rotate the translation delta into the TCP frame before applying
+    # (target = tip + R(tip_quat) . (pos_scale . a[0:3])) instead of adding it in the world frame. Default
+    # False preserves the state-scaffold behaviour; True on the vision rebuild.
+    e2e_translation_in_tcp_frame: bool = True
+    # Force obs expressed in the TCP frame (2026-08-19): rotate the signed 3-axis wrist force into the
+    # fingertip frame so the policy reads body-relative contact (matches the real gravity-compensated F/T,
+    # which is reported in the tool frame). Default False keeps the world-frame force of the older path.
+    e2e_force_in_tcp_frame: bool = True
+    # ACTION SAFETY BOX (world frame, metres): clamp the IK target to +-this around the GOAL centre (the
+    # noisy assembly goal G = fixed_pos + goal_err_pos) so the peg can't wander far from the hole (§4).
+    e2e_action_safety_box: float = 0.05
+    # GOAL / ANCHOR obs (§4): append the EE-frame 6-DoF delta to the NOISY assembly goal G to the policy obs
+    # (the seated target pose as a delta from the current TCP). True on the vision rebuild; the critic gets
+    # the CLEAN true goal (already via the true-delta term). Anchor-dropout corrupts G in the obs only.
+    e2e_goal_obs: bool = True
+    # Small yaw regularization (yaw is now actionable) so the wrist doesn't wind to its joint limit. Penalty
+    # = w * (yaw_action)^2 in _get_rewards. Small so it doesn't suppress useful counter-rotation. 0 => off.
+    e2e_reward_yaw_reg_weight: float = 0.01
     # Add proprio + NOISY socket-relative pose (+-8mm) back into the policy obs (res224 recipe). The pure-E2E
     # graft dropped these -> 2% vs res224's 65%; vision refines the coarse pose. Default False keeps the
     # locked pure-E2E task intact; set True per-run via `env.e2e_use_proprio_obs=True`. DEVIATES from the
     # supervisor-locked pure-E2E spec -> flag before committing the direction. Socket still varies (+-5cm/360deg).
     e2e_use_proprio_obs: bool = False
+    # VELOCITY-ONLY obs (weekend Run C): append the EE-frame fingertip linear+angular velocity (6) to the
+    # policy obs -- NO pose, NO absolute state (unlike e2e_use_proprio_obs's 13-dim pose+vel block). The raw
+    # world-frame fingertip velocities are rotated into the TCP frame (quat_rotate_inverse) so the signal is
+    # EE-relative and deploy-consistent (real iiwa: joint vel -> Jacobian -> EE vel). Small obs noise mimics a
+    # real velocity estimate; the LSTM otherwise infers velocity from the per-step goal delta, so this tests
+    # whether an explicit velocity channel helps near-contact damping. Default False (baseline unchanged).
+    e2e_use_velocity_obs: bool = False
+    e2e_velocity_obs_noise: float = 0.01   # std of gaussian obs noise on the EE-frame velocity (m/s, rad/s)
+    # PER-STEP angular obs noise (deg) on the goal-axis estimate (supervisor 2026-08-22), resampled every
+    # step, distinct from the per-episode tilt bias. 0 => off. ~0.5deg models a live perception-jitter.
+    e2e_goal_ang_obs_noise_deg: float = 0.0
     # Factory-style socket-anchored action: confine the IK target to a +-bound box around the (noisy) socket
     # -> kills the hover / surface-search (res224's mechanism). Set per-run via `env.e2e_socket_anchored_action=True`.
     # Reuses the socket pose we already feed; `bound` = the deploy pose-error tolerance (bigger = safer but
@@ -380,8 +446,8 @@ class ForgeTaskCoolingInsertIiwaE2EVisionCfg(ForgeTaskCoolingInsertIiwaCameraCfg
     # Rigid one-pad grasp: __post_init__ converts the held screw to a RigidObject and welds it to one finger
     # pad. Both pads are reset/targeted at the calibrated head-contact aperture. See InsertionEnv._weld_held_asset.
     weld_held_to_gripper: bool = False
-    weld_held_parent_body: str = "left_finger_link"
-    weld_gripper_closed_half_gap: float = 0.002
+    weld_held_parent_body: str = "pdz_gripper_tcp"
+    weld_gripper_closed_half_gap: float = 0.006
 
     e2e_pos_action_scale: float = 0.01  # metres (was 0.02 for the 85% run; halved -> gentler contact/deploy)
     e2e_rot_action_scale: float = 0.1   # radians (~5.7 deg) per unit tilt action
@@ -391,8 +457,13 @@ class ForgeTaskCoolingInsertIiwaE2EVisionCfg(ForgeTaskCoolingInsertIiwaCameraCfg
     e2e_reward_pos_weight: float = 1.0
     e2e_reward_rot_weight: float = 0.25
     # LATERAL-CENTERING reward weight -- pull the tip OVER the hole (attacks "reaches the area, misses the
-    # hole", which dominates the seating failure). Hardened default 0.5 (start; tune 0.25-1.0 via runs).
-    e2e_reward_center_weight: float = 0.5
+    # hole", which dominates the seating failure). 2026-08-19 rebuild: 15 with a small saturating cap
+    # (~1.5-2cm, see e2e_reward_center_cap) so max/step = 15*cap ~ 0.30, comparable to the main term.
+    e2e_reward_center_weight: float = 15.0
+    # CAP (m) on the centering distance so the penalty stays FLAT beyond the cap instead of growing without
+    # bound (v1 blew up: uncapped wc*xy over long episodes hit ~ -1000/episode when the tip drifted to the
+    # box edge -> entropy/sigma collapse). 0 => uncapped (legacy). v2 sets 0.03 (3cm = "not centered").
+    e2e_reward_center_cap: float = 0.0
     e2e_keep_aux_label: bool = False  # keep the aux_label obs group -> enables the EXPLICIT ESTIMATOR
     e2e_success_bonus: float = 1.0
 
@@ -400,11 +471,53 @@ class ForgeTaskCoolingInsertIiwaE2EVisionCfg(ForgeTaskCoolingInsertIiwaCameraCfg
     # e2e_contact_penalty_threshold N while NOT seated, so the policy force-searches instead of pressing
     # ~18N onto the fins. scale sized so the MAX per-step penalty is only a few % of the main reward term
     # (must NOT make contact timid). Tune the scale via runs; 0 disables it.
-    e2e_contact_penalty_scale: float = 0.01
-    e2e_contact_penalty_threshold: float = 12.0  # N; sustained contact above this (unseated) is penalized
+    e2e_contact_penalty_scale: float = 0.02  # modest scale (max/step a few % of the main term -- don't make contact timid)
+    e2e_contact_penalty_threshold: float = 6.5   # N; sustained contact above this (unseated) is penalized (2026-08-19: was 12)
     e2e_contact_penalty_cap: float = 8.0         # N; cap on the overshoot so a spike can't dominate reward
+    # SEAT SHAPING (fine-seat of the chamfer-free ~1mm hole):
+    # (a) CENTER-THEN-DESCEND gate: penalize the tip going below the socket rim while laterally off-centre
+    #     (> thresh) -> centre first, then descend. Weight 0 => off. Penalty ~ w * below-rim-depth(m); with
+    #     socket depth ~0.0175m, w~15 gives a max ~0.26/step -- comparable to the main reward. Tune via runs.
+    e2e_reward_descend_gate_weight: float = 0.0
+    e2e_reward_descend_center_thresh: float = 0.005  # m; xy miss beyond this counts as "off-centre"
+    # (b) CONTACT COMPLIANCE: scale the high-gain arm PD stiffness (<1 = softer -> the peg can slide into the
+    #     hole instead of rigidly jamming). Damping scaled by sqrt to stay ~critically damped. 1.0 = current
+    #     gains. SMOKE for control stability before using <1 on a full run (soft gains + tight-contact solver
+    #     can oscillate). Applied in __post_init__ to a COPY of the robot cfg (shared object untouched).
+    e2e_arm_stiffness_scale: float = 1.0
+    # ISOLATION TEST-A (2026-08-20 NaN debug): restore the wrist (J6/J7) to the proven 85%-run actuator
+    # (110 Nm effort, 375 stiffness, 45 damping) and turn OFF per-episode dynamics-gain DR, to test whether
+    # the weakened/randomized wrist (not the yaw DOF) is what drove the violent contact -> fp16 NaN. Applied
+    # in __post_init__. False => the rebuild's split wrist (40 Nm / 281 / gain-DR). NOTE: read in __post_init__
+    # so it must be toggled via this DEFAULT (env.* hydra overrides land after __post_init__).
+    e2e_wrist_proven: bool = False
+    # ANCHOR DROPOUT (2026-08-16, staged for the post-deploy run): on this fraction of episodes the socket
+    # anchor is corrupted IN THE POLICY OBS ONLY (big noise; the action box keeps the good anchor) so the
+    # policy can't over-rely on it and must localise the hole from vision. Root fix for the tiny-anchor
+    # fragility (orange peaked 70% then collapsed). 0 => off. Try ~0.3 with ~10cm dropout noise.
+    anchor_dropout_prob: float = 0.0
+    anchor_dropout_noise: float = 0.10   # m; std of the big obs-only goal-G noise on dropout episodes
+    # Anchor-dropout schedule (§8): ramp 0 -> anchor_dropout_prob from anchor_dropout_start_steps over
+    # anchor_dropout_curriculum_steps control steps (same ~ep800 schedule as image-dropout). Mutually
+    # exclusive with image-dropout (enforced in _reset_idx).
+    anchor_dropout_start_steps: int = 0
+    anchor_dropout_curriculum_steps: int = 0
+    # DYNAMICS DR (§10, 2026-08-19): per-env, per-EPISODE randomization of the arm joint PD gains
+    # (stiffness/damping over the §10 ranges), joint friction, armature, and link mass/inertia (+-few %).
+    # Effort stays FIXED at the physical iiwa7 caps (not randomized). Applied at reset via the articulation
+    # write APIs (see InsertionEnvE2EIiwa._apply_dynamics_dr). 0/False => off (backward compatible).
+    e2e_dynamics_dr: bool = False
+    # Ramp the dynamics-DR STRENGTH 0 -> 1 over this many env-steps (0 => full DR from step 0). Early
+    # lag/variation-free foothold, matching the tilt/latency/obs-noise curricula.
+    e2e_dynamics_dr_curriculum_steps: int = 0
+    e2e_dr_joint_friction_range: tuple = (0.0, 0.05)   # per-arm-joint Coulomb friction (Nm), U[lo,hi]
+    e2e_dr_armature_range: tuple = (0.0, 0.02)          # per-arm-joint added armature (kg m^2), U[lo,hi]
+    e2e_dr_mass_frac: float = 0.03                      # link mass/inertia +- this fraction (3%)
     # CONTROL-LATENCY DR: max action delay in control steps (0-2 = 0-133ms at 15Hz), random per episode.
     control_latency_max_steps: int = 2
+    # Latency CURRICULUM: ramp the effective max delay 0 -> control_latency_max_steps over this many control
+    # steps (0 => full from step 0). Part of the v2 early-foothold fix (learn lag-free first).
+    control_latency_curriculum_steps: int = 0
     # Effective radial-clearance stopgap: bump the peg+socket collision rest_offset by this (m) to TIGHTEN
     # the ~1mm radial clearance toward the real ~0.5mm without regenerating the mesh. 0 => mesh clearance as
     # authored. NOTE: the CLEAN fix is regenerating cooling_screw/cooling_base (13mm shaft vs 14mm socket)
@@ -417,7 +530,8 @@ class ForgeTaskCoolingInsertIiwaE2EVisionCfg(ForgeTaskCoolingInsertIiwaCameraCfg
 
     # Pre-insert tilt (deg), the weekend SWEEP knob -> override per run via `env.weekend_tilt_deg=X`.
     # Must be a declared field so hydra can override it. Read in __post_init__ -> self.task.pre_insert_tilt_max_deg.
-    weekend_tilt_deg: float = 15.0
+    # 2026-08-19 rebuild default 10deg (was 15), half-normal biased to 0 + curriculumed (see __post_init__).
+    weekend_tilt_deg: float = 10.0
     # Tilt CURRICULUM (declared for hydra: `env.tilt_curriculum_steps=76800 env.tilt_start_deg=0`). Ramp the
     # effective pre-insert tilt from tilt_start_deg -> weekend_tilt_deg over this many control steps
     # (~= iters*horizon_length; 128*600=76800 -> ~600 it). 0 => off (constant at weekend_tilt_deg).
@@ -434,10 +548,13 @@ class ForgeTaskCoolingInsertIiwaE2EVisionCfg(ForgeTaskCoolingInsertIiwaCameraCfg
     reset_ik_rot_tol: float = 0.035    # radians (~2 deg)
     debug_reset_ik_budget: int = 6     # hover-IK retry cap (name is historical; applies to the real run)
 
-    # 224px single-frame RGB-D (ResNet-18 ImageNet-native; the 224>160 win from prior screens). Heavier
-    # than 160px -> may need fewer envs (memory). frame_stack stays 1 (the LSTM carries temporal state).
-    image_height: int = 224
-    image_width: int = 224
+    # Full 16:9 single-frame RGB, downscaled to 320x180 without cropping or anisotropic distortion.
+    # frame_stack stays 1 (the LSTM carries temporal state).
+    # RGB-ONLY (2026-08-19 rebuild): 3 channels, no depth branch / no depth DR (see rgb_only + __post_init__).
+    image_height: int = 180
+    image_width: int = 320
+    image_channels: int = 3
+    rgb_only: bool = True
 
     def __post_init__(self):
         super().__post_init__()
@@ -446,17 +563,38 @@ class ForgeTaskCoolingInsertIiwaE2EVisionCfg(ForgeTaskCoolingInsertIiwaCameraCfg
         # real_solver_iters loop below so the rigidified held asset gets the iteration count too.
         self.weld_held_to_gripper = True
         _rigidify_held_for_weld(self.task)
-        self.tiled_camera.width = 224
-        self.tiled_camera.height = 224
+        self.tiled_camera.width = 320
+        self.tiled_camera.height = 180
+        # RGB-ONLY (2026-08-19): render RGB only (drop "depth" from the camera data_types -> no depth
+        # buffer allocated/rendered).
+        self.tiled_camera.data_types = ["rgb"]
+        # Full D405 FOV at its native 16:9 aspect. With the 20.955mm aperture, 11mm gives approximately
+        # 87deg horizontal and 57deg vertical FOV, matching the measured color intrinsics without squashing.
+        self.tiled_camera.spawn.focal_length = 11.0
         # Pre-insert tilt is now a SWEEP knob (2026-07-31): the first vision run showed the wrist camera
         # resolves POSITION (tip closing) but not fine ORIENTATION -- shaft-axis stuck ~35-40deg, screw
         # arrives angled, won't seat. So the weekend maps success-vs-tilt instead of running one config
         # blind. __post_init__ reads `weekend_tilt_deg` (override it per run) -> the override propagates
         # through here regardless of default. Lateral kept +-10mm (vision handles position OK).
-        self.task.pre_insert_tilt_max_deg = float(getattr(self, "weekend_tilt_deg", 15.0))
-        # Tilt curriculum -> task (ramp start_deg -> weekend_tilt_deg over tilt_curriculum_steps control steps).
-        self.task.pre_insert_tilt_start_deg = float(getattr(self, "tilt_start_deg", 0.0))
-        self.task.pre_insert_tilt_curriculum_steps = int(getattr(self, "tilt_curriculum_steps", 0))
+        # §4 GOAL/ANCHOR angular budget: the injected shaft-axis error ramps 0 -> 25deg (half-normal, biased
+        # to 0). With the small baked grasp misalign (3deg, §10) the TOTAL start misalignment stays within
+        # the 30deg cap (vector sum; smoke-verified worst ~30), ramping from ~0 over ~1000it. This SUBSUMES
+        # the old standalone pre-insert tilt (0->10deg). Curriculum ~128000 control steps (128*1000). Tuning
+        # knob (§4): drop this below 25 if the policy stalls on orientation.
+        self.task.pre_insert_tilt_max_deg = 25.0
+        self.task.pre_insert_tilt_start_deg = 0.0
+        self.task.pre_insert_tilt_curriculum_steps = 128000
+        self.task.pre_insert_tilt_halfnormal = True
+        # §4 GOAL/ANCHOR lateral+z estimate error, injected PHYSICALLY at reset (peg starts off the true
+        # hole; obs delta-to-noisy-G ~ 0). Radial xy <= 1.75cm, z <= 0.8cm, both ramp 0 -> max over ~1000it.
+        self.task.goal_anchor_injection = True
+        self.task.goal_anchor_lat_max = 0.0175
+        self.task.goal_anchor_z_max = 0.008
+        self.task.goal_anchor_curriculum_steps = 128000
+        # §4/§6 WRIST YAW start = half-normal (biased to 0) about vertical, +-45deg, injected in the reset
+        # re-pose (Factory's uniform hover yaw is turned OFF below). Yaw-symmetric -> rotates the image only.
+        self.task.wrist_yaw_halfnormal = True
+        self.task.wrist_yaw_max_deg = 45.0
         # Screw (held_asset) friction DR (2026-08-05): was FIXED 0.75 (num_buckets=1). PLA-on-PLA is ~0.3-0.5;
         # randomize static+dynamic over a buffered 0.3-0.9 so the CONTACT PAIR is robust to the real
         # (unmeasurable/drifting) friction instead of overfitting one value. Socket (fixed_asset) is already
@@ -465,8 +603,8 @@ class ForgeTaskCoolingInsertIiwaE2EVisionCfg(ForgeTaskCoolingInsertIiwaCameraCfg
         # real (unmeasurable/drifting) value. Applied to both the held screw and, if present, the socket.
         if hasattr(self, "events") and hasattr(getattr(self, "events"), "held_physics_material"):
             _hp = self.events.held_physics_material.params
-            _hp["static_friction_range"] = (0.4, 0.7)
-            _hp["dynamic_friction_range"] = (0.4, 0.7)
+            _hp["static_friction_range"] = (0.3, 0.8)
+            _hp["dynamic_friction_range"] = (0.3, 0.8)
             _hp["num_buckets"] = 64
         for _fixed_evt in ("fixed_physics_material", "fixed_asset_physics_material"):
             if hasattr(self, "events") and hasattr(getattr(self, "events"), _fixed_evt):
@@ -481,20 +619,41 @@ class ForgeTaskCoolingInsertIiwaE2EVisionCfg(ForgeTaskCoolingInsertIiwaCameraCfg
         #     tilt is the SMALL secondary error (weekend_tilt_deg=12) and IS the curriculum-ramped one.
         # (b) grasp POSITION jitter: axial +-3mm (shaft depth, never retracts the shaft into the pads)
         # + lateral +-2mm (in-pad plane). VERIFY in-bounds with render_grasp_grid.py.
-        self.task.grasp_misalign_max_deg = 25.0
-        # Grasp position jitter widened to +-5mm (2026-08-13 deploy hardening; was 3/2mm). NOTE the axial
-        # (+z) direction retracts the shaft INTO the pads -- verify with render_grasp_grid.py that +5mm
-        # never pulls the shaft shoulder inside the jaws; drop axial to ~4mm if it does.
-        self.task.grasp_pos_jitter_axial_mm = 5.0
-        self.task.grasp_pos_jitter_lateral_mm = 5.0
-        # Secondary out-of-plane grasp tilt (about fingertip X): ~7deg from pad compliance / off-centre head.
-        self.task.grasp_misalign_secondary_deg = 7.0
-        # Lateral pre-insert offset widened +-8->+-15mm (keep z +-20mm).
-        self.task.hand_init_pos_noise = [0.015, 0.015, 0.020]
-        # Full +-180deg wrist YAW: deploy tool yaw (~50deg) exceeds the old +-45deg band and A7 limits block
-        # preinserting to nominal, so train the full range. The hole is yaw-symmetric -> this only rotates
-        # the wrist image (round peg), no geometric change to the insertion.
-        self.task.hand_init_orn_noise = [0.0, 0.0, 3.1416]
+        # FORCE-OBS GRAVITY COMPENSATION: the real F/T is gravity-compensated, so subtract the per-env
+        # pre-contact gravity wrench from the force obs -> pure CONTACT (plan requirement; was silently off
+        # in the weekend runs). Safe: the stateful baseline is nan_to_num-guarded in _get_observations
+        # (the NaN-amplifier gotcha [[e2e-nan-gravity-comp]] is fixed).
+        self.use_gravity_comp = True
+        # §10 DYNAMICS DR: randomize arm PD gains / friction / armature / mass per episode (see the env).
+        self.e2e_dynamics_dr = True
+        # Ramp DR strength 0->1 over the first ~150k env-steps (early foothold before full spread). Tune vs
+        # the tilt curriculum (~205k) if the early gains feel too soft/hard.
+        self.e2e_dynamics_dr_curriculum_steps = 150000
+        # PER-STEP angular obs noise on the goal-axis estimate (supervisor: ~0.5deg/step live jitter).
+        self.e2e_goal_ang_obs_noise_deg = 0.5
+        # §10/§4: keep the BAKED grasp misalign SMALL (3deg) so baked + the curriculumed injected angular
+        # (0->27deg) stays <= the 30deg total start-misalignment budget. Secondary out-of-plane -> 0.
+        self.task.grasp_misalign_max_deg = 3.0
+        # Grasp position jitter. NOTE: the weld BAKES grasp DR per-env at init (cold from step 0), so it
+        # CANNOT be curriculum-ramped. v1 used 5/5mm + 7deg secondary and never got an early foothold (13%
+        # @it500 vs w2's 50%); v2 eases it back toward the w2-proven 3/2mm and a small 3deg secondary so the
+        # cold grasp is learnable, while keeping the dominant 25deg pressing-axis misalign. The axial (+z)
+        # direction retracts the shaft INTO the pads -- keep it small.
+        self.task.grasp_pos_jitter_axial_mm = 3.0
+        self.task.grasp_pos_jitter_lateral_mm = 2.0
+        self.task.grasp_misalign_secondary_deg = 0.0  # §4: fold all angular error into the 30deg budget
+        # §6 START HEIGHT: screw tip z = rim + 0.04 +- 0.01 -> TCP = tip + 17.5mm shaft = rim + 0.0575. The
+        # hand_init_pos is the FINGERTIP (TCP) target above the socket opening, so z = 0.0575.
+        self.task.hand_init_pos = [0.0, 0.0, 0.0575]
+        # §6 LATERAL SPAWN = small servo SETTLING only (radial <= ~0.3cm). The lateral/z GOAL-ESTIMATE error
+        # is now injected physically by the goal anchor (above), so the peg starts OFF the true hole and the
+        # obs delta-to-noisy-G ~ 0. This 0.3cm is just the residual servo settling about that estimate. z
+        # noise +-0.01 = the rim+0.04+-0.01 height band (tip 4cm above rim).
+        self.task.hand_init_pos_noise = [0.003, 0.003, 0.010]
+        # §6 WRIST YAW START is now injected as a HALF-NORMAL in the reset re-pose (wrist_yaw_halfnormal
+        # above), so turn OFF Factory's uniform hover yaw here to avoid double-applying it.
+        self.task.hand_init_orn_noise = [0.0, 0.0, 0.0]
+        self.hand_init_yaw_curriculum_steps = 0  # the half-normal injection is the yaw source now
         # Widen the SOCKET placement so the restored socket-relative pose obs sees real spatial variation
         # (not a memorisable constant): X band 0.65-0.75m (nominal 0.70 +- 0.05, recentred 2cm nearer than
         # the 0.72 default per user), Y +-15cm, Z +-5cm. Y is the roomy axis -- at x~0.70 it's a base-yaw
@@ -503,11 +662,32 @@ class ForgeTaskCoolingInsertIiwaE2EVisionCfg(ForgeTaskCoolingInsertIiwaCameraCfg
         # -- closer folds the arm into torque/wrist-limit stalls, farther exceeds reach. Keeping the whole
         # workspace comfortably inside reach should also cut the near-singular-IK NaN crashes (the resume
         # cause). VALIDATE the corners with scripts/diag_reset_ik.py (reset-only) if reset failures spike.
-        self.task.fixed_asset.init_state.pos = (0.70, 0.0, 0.05)
-        # Socket PLACEMENT spread; X/Z raised 0.05->0.06 (2026-08-13). Y stays 0.15 (the roomy base-yaw
-        # axis). NOTE this is the PHYSICAL socket spread; the actor's noisy socket ESTIMATE that the policy
-        # must correct is fixed_asset_pos_obs_noise_bound (the +-2.5cm anchor) -- tune that separately.
-        self.task.fixed_asset_init_pos_noise = [0.08, 0.08, 0.08]
+        # Socket PLACEMENT region = how the base actually gets put on the table IRL: a hand-placed spot in
+        # a workspace REGION (x 0.50-0.75m, y +-40cm) at ~table height (z 0-0.05m), FLAT (only yaw varies,
+        # 360deg; roll/pitch=0 since it sits flat -- matches reality). Encoded as center +- uniform noise.
+        #   x 0.50-0.75 -> center 0.625 +-0.125 ; y +-0.40 -> 0.0 +-0.40 ; z 0-0.05 -> 0.025 +-0.025
+        # This is the PHYSICAL pose; the actor's noisy ESTIMATE of it is fixed_asset_pos_obs_noise_bound
+        # (the +-3cm anchor / the ~5mm deploy CV) -- a SEPARATE knob.
+        # !!! REACH WARNING: the iiwa reach is ~0.8m radial from its base at the origin. The far corners of
+        # this box EXCEED it: (x=0.75, y=+-0.40) -> radial sqrt(0.75^2+0.40^2)=0.85m > 0.8m. Those resets
+        # will fail hover-IK (fall back to the vertical grasp) and risk the near-singular-IK NaN crashes that
+        # caused past resume loops. VALIDATE with scripts/diag_reset_ik.py BEFORE the full run; if the
+        # corners fail, cap y to ~+-0.30 or x to ~0.70 (radial back under 0.8m).
+        # §5 CUSTOM PLATE PLACEMENT (2026-08-19): x~U[0.40,0.65], y~U[-0.55,-0.20], z~U[-0.02,+0.01], flat
+        # (roll=pitch=0). Yaw = 80% nominal +-3deg, 20% wide +-[3,45]deg. Reject radial > 0.72m so the far
+        # corners of the box (which exceed the ~0.8m iiwa reach) never spawn. Replaces the bimodal-Y clusters.
+        # See InsertionEnv._sample_custom_fixed_xy / _apply_fixed_yaw_bimodal. VALIDATE corners with
+        # scripts/diag_reset_ik.py (near (0.40,-0.20) + the trimmed far corner) before a full run.
+        self.task.fixed_asset_custom_placement = True
+        self.task.base_y_clusters = None
+        self.task.fixed_asset_xy_ranges = [0.40, 0.65, -0.55, -0.20]
+        self.task.fixed_asset_z_center = -0.005   # U[-0.02, +0.01] centre (nominal ~ -0.01)
+        self.task.fixed_asset_z_noise = 0.015
+        self.task.fixed_asset_reach_radius = 0.72
+        self.task.fixed_asset_yaw_nominal_deg = 90.0  # holes along world-Y [VERIFY vs USD default + mesh frame]
+        self.task.fixed_asset_yaw_nominal_halfwidth_deg = 3.0
+        self.task.fixed_asset_yaw_wide_frac = 0.20
+        self.task.fixed_asset_yaw_wide_deg = [3.0, 45.0]
         # Crank the contact solver 192 -> real_solver_iters (128) for the real run (supervisor-approved).
         n = int(getattr(self, "real_solver_iters", 0) or 0)
         if n > 0:
@@ -519,39 +699,48 @@ class ForgeTaskCoolingInsertIiwaE2EVisionCfg(ForgeTaskCoolingInsertIiwaCameraCfg
                         props.solver_position_iteration_count = n
 
         # --- 2026-08-13 real-robot DEPLOY HARDENING (starting defaults; tune each via runs) --------------
-        # REALISTIC DEPTH: the confirmed dominant sim2real gap (real D405 ~45% invalid, structured on fin-
-        # slots/edges + a missing socket interior; sim trained only 2% uniform). Swap to structured
-        # corruption + per-episode modality dropout + 5mm range noise + occasional hole-fill.
-        self.depth_corruption_mode = "structured"
-        self.depth_modality_dropout = True
-        self.depth_noise_std = 0.005          # 5mm range noise on valid returns (was 2mm)
-        self.depth_fill_prob = 0.30           # ~30% of episodes get interpolation-filled holes
-        # DEPTH-REALISM CURRICULUM: ramp structural corruption + modality-dropout prevalence 0->full over
-        # ~160k control steps (~1250 it @ horizon 128, ~50% of a 2500-it run) so the estimator bootstraps
-        # hole-prediction on good depth first (the biggest cold-start de-risk of the new regime).
-        self.depth_corruption_curriculum_steps = 160000
-        # WRIST-YAW CURRICULUM: ramp +-45deg -> the full +-180deg over the same window.
-        self.hand_init_yaw_curriculum_steps = 160000
-        self.hand_init_yaw_start_deg = 45.0
+        # RGB-ONLY (2026-08-19 rebuild): the depth channel + ALL depth DR are REMOVED (real D405 depth was
+        # ~45% invalid and structured -- an unmodellable gap; the rebuild drops depth entirely and leans on
+        # RGB appearance DR instead). depth_corruption_mode stays "uniform" (unused: no depth is rendered)
+        # and every depth-DR knob is left at its no-op default. Do NOT re-enable depth DR on the RGB-only path.
+        # §13 CURRICULA (2026-08-19 rebuild): all ramp from ~0 to full over the schedules below. No depth
+        # curriculum (RGB-only).
+        #   GOAL ANCHOR lateral 0->1.75cm / z 0->0.8cm / angular 0->27deg (+3deg baked = 30 total) ~128k (~1000 it)
+        #   appearance         ~180k (~1400 it)  -- vision + image DR foothold
+        #   control latency    0->2 steps        ~230k (~1800 it)  -- actuation lag last
+        #   image + anchor dropout 0->10% / 0->30%  from ~ep800 (102400 steps), mutually exclusive
+        self.appearance_curriculum_steps = 180000        # ~1400 it
+        self.control_latency_curriculum_steps = 230000   # ~1800 it (0->2 steps)
+        # §8/§13 IMAGE DROPOUT: ramp 0 -> 10% starting at ~epoch 800 (128*800 = 102400 control steps), over
+        # ~700 epochs (~90k steps) to full. Forces a force-guided fallback when vision is occluded/dropped.
+        self.image_dropout_prob = 0.10
+        self.image_dropout_start_steps = 102400
+        self.image_dropout_curriculum_steps = 90000
+        # §8/§4 ANCHOR DROPOUT: corrupt the goal G in the obs only (30% of episodes at full), same ~ep800
+        # ramp, MUTUALLY EXCLUSIVE with image-dropout -> the policy always keeps >=1 localisation channel.
+        self.anchor_dropout_prob = 0.30
+        self.anchor_dropout_noise = 0.05   # m; std of the big obs-only goal-G corruption on dropout episodes
+        self.anchor_dropout_start_steps = 102400
+        self.anchor_dropout_curriculum_steps = 90000
+        # REWARD FIX (2026-08-19): small saturating centering cap (~1.5-2cm) so beyond it the tip is just
+        # "not centered" and the penalty stays FLAT (no unbounded drift blow-up). 12s episodes give search
+        # room over w2's 10s without v1's 18s over-amplification.
+        self.e2e_reward_center_cap = 0.02
         # HEAVY APPEARANCE DR (base is vivid BLUE; explicit-estimator over-trusted a clean look):
         self.rgb_noise_std = 0.03
         self.photo_gain_rgb = 0.30            # per-channel gain in [0.7,1.3]
         self.photo_brightness = 0.10          # additive exposure in [-0.1,0.1]
-        self.photo_gamma = 0.20               # tone curve in [0.8,1.2]
-        self.photo_contrast = 0.20            # contrast in [0.8,1.2]
-        self.material_hue_randomize = True    # full-hue materials (spans vivid blue)
-        self.light_color_temp_range_k = (3000.0, 8000.0)  # warm->cool white balance
-        self.light_intensity_range = (1000.0, 3000.0)     # dome ~ +-50%
-        self.key_light_intensity_range = (1000.0, 3000.0)  # key ~ +-50%
-        self.cam_rot_jitter_deg = 3.0         # wrist mount roll jitter +-3deg (was 2)
-        # LONGER EPISODES: allow force-guided search (was 10s).
-        self.episode_length_s = 18.0
-        self.task.duration_s = 18.0
-        # CONTACT REALISM: effective radial-clearance stopgap (0 => authored mesh clearance; see the field
-        # doc -- the clean fix is regenerating the 13mm-shaft/14mm-socket mesh in convert_assets.py).
-        _ro = float(getattr(self, "contact_rest_offset", 0.0) or 0.0)
-        if _ro > 0.0:
-            for art in (self.task.held_asset, self.task.fixed_asset):
-                cp = getattr(getattr(art, "spawn", None), "collision_props", None)
-                if cp is not None and hasattr(cp, "rest_offset"):
-                    cp.rest_offset = _ro
+        # LIGHT COLOUR-TEMPERATURE DR (plan/deploy-hardening: warm 3000K -> cool 8000K). Was None (off) =
+        # legacy grey-only jitter, a silent plan miss like the colours/gravity-comp. Tints dome+key per reset.
+        self.light_color_temp_range_k = (3000.0, 8000.0)
+        # Camera ROLL jitter: plan is +-2-3 deg; base default 2.0 sat at the low edge -> mid-range.
+        self.cam_rot_jitter_deg = 2.5
+        # SUCCESS = FULL-SEAT (decision 2026-08-24, agent-authority): keep the plan's head-flush bar so the
+        # metric is honest/deployable + comparable to w2's 83%, AND the success bonus doesn't let the policy
+        # satisfice at a partial insertion. success_threshold 0.25 => is_seated when tip within height*0.25
+        # =4.375mm of the socket-bottom ref (~13mm inserted, ~2mm shy of the 15mm physical stop). Half-seat
+        # progress is still visible via the engaged/insertion_depth diagnostics (no need to loosen the metric).
+        self.task.success_threshold = 0.25
+        # Seat dead-zone: stop rewarding the last ~3mm the tip cannot close (kills the "crash down" press).
+        self.e2e_seat_deadzone = 0.003
+        

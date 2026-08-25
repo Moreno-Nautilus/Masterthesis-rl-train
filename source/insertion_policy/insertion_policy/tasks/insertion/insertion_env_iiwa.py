@@ -55,9 +55,9 @@ class InsertionEnvIiwa(InsertionEnv):
         self.init_fixed_pos_obs_noise = torch.zeros((self.num_envs, 3), device=self.device)
 
         # iiwa+gripper body names (vs the Franka's panda_leftfinger/rightfinger/fingertip_centered).
-        self.left_finger_body_idx = self._robot.body_names.index("left_finger_link")
-        self.right_finger_body_idx = self._robot.body_names.index("right_finger_link")
-        self.fingertip_body_idx = self._robot.body_names.index("gripper_tcp")
+        self.left_finger_body_idx = self._robot.body_names.index("pdz_gripper_left_finger_link")
+        self.right_finger_body_idx = self._robot.body_names.index("pdz_gripper_right_finger_link")
+        self.fingertip_body_idx = self._robot.body_names.index("pdz_gripper_tcp")
 
         self.last_update_timestamp = 0.0
         self.prev_fingertip_pos = torch.zeros((self.num_envs, 3), device=self.device)

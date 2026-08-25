@@ -22,6 +22,11 @@ TAGS = {
     "reward": "rewards/iter",
     "tip_dist": "logs_rew_neg_tip_l2/iter",       # logged as -tip_dist -> negate to a positive distance
     "axis_err": "logs_rew_shaft_axis_error/iter",
+    # Diagnostic sub-metrics (added 2026-08-24; ONLY present in runs from that point on -- older runs skip).
+    "tip_xy": "logs_rew_tip_xy_dist/iter",        # lateral miss to the socket axis (m)
+    "ins_depth": "logs_rew_insertion_depth/iter",  # tip depth below the rim (m); ~15mm at full seat
+    "centered": "logs_rew_centered/iter",          # fraction with tip over the hole
+    "engaged": "logs_rew_engaged/iter",            # fraction with shaft inserted past the engage threshold
     "kl": "info/kl",
     "lr": "info/last_lr",
     "a_loss": "losses/a_loss",
@@ -39,8 +44,11 @@ CORE = [("success", "training SUCCESS", "fraction", False, ID),
         ("kl", "policy KL (info/kl)", "KL", True, ID),
         ("lr", "LEARNING RATE (info/last_lr)", "lr", True, ID)]
 FULL = [("reward", "episode REWARD", "reward", False, ID),
-        ("success", "training SUCCESS", "fraction", False, ID),
-        ("tip_dist", "TIP DISTANCE to socket", "metres", False, NEG),
+        ("success", "training SUCCESS (seated)", "fraction", False, ID),
+        ("centered", "CENTERED (tip over hole)", "fraction", False, ID),
+        ("engaged", "ENGAGED (shaft in >thr)", "fraction", False, ID),
+        ("tip_xy", "LATERAL miss to hole axis", "metres", False, ID),
+        ("ins_depth", "INSERTION DEPTH below rim", "metres", False, ID),
         ("axis_err", "shaft AXIS ERROR", "rad", False, ID),
         ("kl", "policy KL (info/kl)", "KL", True, ID),
         ("lr", "LEARNING RATE (info/last_lr)", "lr", True, ID),
@@ -77,7 +85,13 @@ def main():
     data = {r: load_stitched(r) for r in args.runs if os.path.isdir(os.path.join(ROOT, r))}
     runs = list(data)
     hi = {"vision_res224_1": ("black", 3.0), "e2e_vis_proprio": ("tab:green", 3.0),
-          "e2e_deploy_g25t12": ("tab:green", 3.0), "e2e_deploy_g25t12_s192": ("tab:blue", 3.0)}
+          "e2e_deploy_g25t12": ("tab:green", 3.0), "e2e_deploy_g25t12_s192": ("tab:purple", 2.5),
+          "e2e_estimator_hardened_v2_val500": ("tab:green", 3.0),  # v2 validation (the run we're judging)
+          "e2e_estimator_hardened_2500": ("tab:red", 2.5),         # v1 (failed) baseline for contrast
+          "e2e_deploy_hard_a175_bimodal_2500": ("tab:green", 3.0),  # deploy HARD anchor 1.75cm (64.5% -- the candidate)
+          "e2e_deploy_easy_a08_bimodal_2500": ("tab:orange", 3.0),  # deploy EASY anchor 0.8cm (peaked then declined)
+          "e2e_weld_curric": ("black", 2.5),                        # 85% no-DR reference
+          "w2_estimator_192": ("tab:blue", 2.5)}                   # deployed 83% target
     faded = plt.cm.autumn(np.linspace(0.15, 0.75, max(1, len(runs))))
     colors, fi = {}, 0
     for r in runs:
@@ -95,8 +109,8 @@ def main():
               f"ent~{last('entropy'):.2f}")
 
     panels = FULL if args.full else CORE
-    nrow, ncol = (3, 3) if args.full else (2, 2)
-    fig, axes = plt.subplots(nrow, ncol, figsize=(18, 14) if args.full else (17, 11))
+    nrow, ncol = (4, 3) if args.full else (2, 2)
+    fig, axes = plt.subplots(nrow, ncol, figsize=(18, 19) if args.full else (17, 11))
     for ax, (key, title, ylab, logy, tf) in zip(axes.flat, panels):
         for r in runs:
             if key not in data[r]:

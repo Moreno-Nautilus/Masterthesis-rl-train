@@ -67,6 +67,25 @@ class CoolingInsert(FactoryTask):
     # inside one run segment (re-ramp on a mid-anneal crash is a minor transient).
     pre_insert_tilt_start_deg: float = 0.0
     pre_insert_tilt_curriculum_steps: int = 0
+    # GOAL-ANCHOR injection (§4, 2026-08-19): when True, _apply_pre_insert_tilt injects the FULL goal-estimate
+    # error at reset -- the angular tilt (above) PLUS a lateral/z translation -- so the peg physically starts
+    # off the TRUE seated pose by the (curriculumed) estimate error. Subsumes the standalone pre-insert tilt.
+    # Angular budget is the pre_insert_tilt_* curriculum (keep the baked grasp misalign small so baked +
+    # injected <= 30deg total). Lateral is a radial disk <= goal_anchor_lat_max; z <= goal_anchor_z_max; both
+    # ramp 0 -> max over goal_anchor_curriculum_steps control steps. Off => legacy pure-tilt behaviour.
+    goal_anchor_injection: bool = False
+    goal_anchor_lat_max: float = 0.0175   # radial xy estimate error (m)
+    goal_anchor_z_max: float = 0.008      # z estimate error (m)
+    goal_anchor_curriculum_steps: int = 0
+    # WRIST YAW (half-normal): inject the reset wrist yaw as a half-normal about vertical (biased to 0) in
+    # _apply_pre_insert_tilt instead of Factory's uniform hover yaw (yaw-symmetric for the round peg -> only
+    # rotates the wrist image). Set Factory's hand_init_orn_noise[2]=0 when using this. 0 => off (legacy).
+    wrist_yaw_halfnormal: bool = False
+    wrist_yaw_max_deg: float = 45.0
+    # Bias the tilt MAGNITUDE toward 0 with a half-normal (|N| scaled so ~2 sigma = the effective max),
+    # instead of the uniform [0, max]. Keeps most resets near-aligned with a tail out to max -- the
+    # realistic residual after the arm drives to the pre-insert pose. False => uniform (legacy behaviour).
+    pre_insert_tilt_halfnormal: bool = False
 
     # Robot start, relative to the fixed-asset tip (socket opening). This is the FINGERTIP target:
     # nominally 6.3cm above the socket, with +/-2cm z noise -> fingertip starts about 4.3-8.3cm
@@ -78,8 +97,32 @@ class CoolingInsert(FactoryTask):
 
     # Fixed asset placement noise (the upstream-uncertainty source the policy corrects).
     fixed_asset_init_pos_noise: list = [0.05, 0.05, 0.05]
+    # BIMODAL base-Y placement: if set (e.g. [-0.40, 0.40]), the base is placed at ONE of these Y clusters
+    # (sampled per env) + the fixed_asset_init_pos_noise[1] spread -- models a base placed off to the LEFT
+    # or RIGHT of the robot IRL (not straight in front). None => the single centred box. Injected in
+    # InsertionEnv.randomize_initial_state by setting default_root_state[:,1] before the Factory placement.
+    base_y_clusters: list | None = None
     fixed_asset_init_orn_deg: float = 0.0
     fixed_asset_init_orn_range_deg: float = 360.0
+
+    # CUSTOM PLATE PLACEMENT (§5, 2026-08-19 rebuild): sample the base (plate) pose per reset from explicit
+    # robot-base-frame ranges with a reach-radius rejection + a BIMODAL yaw, replacing the bimodal-Y-cluster
+    # box. Handled in InsertionEnv.randomize_initial_state (pre-super xy write + Factory nominal-yaw place,
+    # post-super bimodal yaw delta). None/False keeps the residual/state placement. Reject radial > reach so
+    # the far corners of the xy box (which exceed the iiwa reach) never spawn. Yaw: (1-wide_frac) at nominal
+    # +- nominal_halfwidth; wide_frac uniform in +-[wide_deg]. Roll/pitch stay 0 (plate sits flat).
+    fixed_asset_custom_placement: bool = False
+    fixed_asset_xy_ranges: list = [0.40, 0.65, -0.55, -0.20]  # [x_lo, x_hi, y_lo, y_hi] (m)
+    fixed_asset_z_center: float = -0.005   # z centre of U[-0.02, +0.01] (nominal ~ -0.01)
+    fixed_asset_z_noise: float = 0.015     # +- z noise (m)
+    fixed_asset_reach_radius: float = 0.72  # reject plate radial > this (3cm hole ring stays <= 0.75m reach)
+    # NOMINAL yaw = holes aligned along world-Y. In the asset frame the two sockets sit along local-x, so a
+    # 90deg yaw points them along world-Y. [VERIFY] against the USD default orientation + the FoundationPose
+    # vision mesh frame before a full run (viz the plate; the socket ring should run along world-Y at nominal).
+    fixed_asset_yaw_nominal_deg: float = 90.0
+    fixed_asset_yaw_nominal_halfwidth_deg: float = 3.0
+    fixed_asset_yaw_wide_frac: float = 0.20        # fraction of resets with a wide (mis-fixtured) yaw
+    fixed_asset_yaw_wide_deg: list = [3.0, 45.0]   # wide yaw magnitude ~ U[3,45] deg, random sign
 
     # Held asset noise in the gripper.
     held_asset_pos_noise: list = [0.003, 0.0, 0.003]
@@ -211,7 +254,12 @@ class ForgeTaskCoolingInsertCameraCfg(ForgeTaskCoolingInsertCfg):
     # RGB (3) + depth (1), stacked in InsertionEnv._get_camera_image. Render is ~2x slower than 64px.
     image_height: int = 160
     image_width: int = 160
-    image_channels: int = 4  # per-FRAME channels: RGB (3) + depth (1)
+    image_channels: int = 4  # per-FRAME channels: RGB (3) + depth (1); set 3 + rgb_only=True for RGB-only
+    # RGB-ONLY path (sim2real E2E rebuild 2026-08-19): drop the depth channel + ALL depth DR entirely, so
+    # the encoder is a plain 3-channel ImageNet ResNet-18 (no conv inflation). Default False keeps the
+    # residual/state vision tasks on the RGB-D path unchanged. When True, set image_channels=3 and remove
+    # "depth" from tiled_camera.data_types (see _get_camera_image, which returns RGB only under this flag).
+    rgb_only: bool = False
     # Temporal frame-stack: stack the last N wrist frames along the channel axis (env-side ring buffer)
     # so the CNN sees intra-observation MOTION (approach speed, contact-onset dynamics) the single frame
     # lacks -- complements the LSTM's cross-step memory. 1 = OFF (current single-frame behaviour); N>1
@@ -293,7 +341,14 @@ class ForgeTaskCoolingInsertCameraCfg(ForgeTaskCoolingInsertCfg):
     # Geometry-correct specular/shading under the moving wrist light -- which the image aug can't fake.
     # Fail-safe: self-disables on any USD error (can't kill a run). See _setup_part_materials.
     randomize_part_materials: bool = True
-    material_base_color: tuple = (0.33, 0.33, 0.40)  # darker centre -> richer/less-washed colours (was 0.45/0.5 = pale)
+    material_base_color: tuple = (0.10, 0.15, 0.55)  # BLUE base (matches the real printed base); per-env jitter added on top
+    # PER-PART COLOURS (2026-08-19 RGB-only rebuild): give the screw and base DISTINCT base colours (the
+    # real parts differ: red screw, blue base), each with its OWN per-env jitter, instead of one shared
+    # scene colour +/- a small part divergence. When True, _randomize_part_materials draws screw ~
+    # material_screw_color and base ~ material_base_color independently (per-env jitter = material_color_
+    # jitter, curriculum-scaled). Default False keeps the legacy correlated-colour behaviour for other tasks.
+    material_per_part_colors: bool = True   # 2026-08-24: plan = red screw / blue base + per-env jitter (was False -> parts came out same colour)
+    material_screw_color: tuple = (0.70, 0.05, 0.05)  # bright red screw
     material_color_jitter: float = 0.25             # per-env scene-colour half-range (the between-env DR)
     material_part_color_jitter: float = 0.05        # screw-vs-base divergence within an env (small => usually same)
     material_roughness_range: tuple = (0.55, 0.95)  # matte 3D-printed plastic (high roughness -> diffuse colour dominates, less white specular)
@@ -365,6 +420,21 @@ class ForgeTaskCoolingInsertCameraCfg(ForgeTaskCoolingInsertCfg):
     # job harder; this eases them in. See InsertionEnv.randomize_initial_state.
     hand_init_yaw_curriculum_steps: int = 0
     hand_init_yaw_start_deg: float = 45.0
+
+    # IMAGE DROPOUT (§8, 2026-08-19 RGB-only rebuild): zero the RGB image on a fraction of EPISODES (a
+    # whole-image sensor/occlusion dropout, distinct from the per-pixel depth dropout) so the policy learns
+    # a force-guided fallback and can't over-trust vision. Per-episode mask sampled at reset. The rate ramps
+    # 0 -> image_dropout_prob starting at image_dropout_start_steps over image_dropout_curriculum_steps
+    # control steps (common_step_counter ~= iters*horizon; 128*800 ~= 102400 = ~epoch 800). 0 => off.
+    image_dropout_prob: float = 0.0
+    image_dropout_start_steps: int = 0
+    image_dropout_curriculum_steps: int = 0
+
+    # APPEARANCE-DR CURRICULUM: ramp the photometric aug ranges + RGB sensor noise + material saturation
+    # from ~0 (near-clean, consistent images) to full over this many control steps (0 => full from step 0).
+    # Gives the CNN an easy early visual foothold, then adapts to the full hardened appearance DR -- the v2
+    # fix for the weak early learning. See InsertionEnv._appearance_curric_frac.
+    appearance_curriculum_steps: int = 0
 
     # (7) FULL-HUE MATERIAL DR: the real base is vivid BLUE, which the narrow RGB-jitter-about-grey band
     # (material_base_color/material_color_jitter) does NOT span. Enabling this draws a full-range HUE per

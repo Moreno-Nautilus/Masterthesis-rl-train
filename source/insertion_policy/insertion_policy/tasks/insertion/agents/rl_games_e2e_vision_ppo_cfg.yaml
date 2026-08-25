@@ -1,12 +1,13 @@
-# END-TO-END VISUOMOTOR cfg (supervisor-locked 2026-07-30).
-# The real end-to-end policy: obs = wrist RGB-D (frozen ImageNet ResNet-18, input conv inflated to 4ch +
-# trainable) + wrist force (3) + prev_action (5), NO proprio. Asymmetric privileged critic (flat state,
-# no CNN). LSTM + MLP; fixed_sigma; entropy 0. Consumes Dict obs (concate_obs_groups: False) via the
-# insertion_hybrid network with cnn.backbone=resnet18. Run with --enable_cameras.
-# Task: Isaac-Insertion-CoolingPeg-Iiwa-E2E-Vision-Direct-v0.
+# END-TO-END VISUOMOTOR cfg (supervisor-locked 2026-07-30; RGB-only sim2real rebuild 2026-08-19).
+# The real end-to-end policy: obs = wrist RGB (fully frozen ImageNet ResNet-18, 3-channel)
+# + EE-frame wrist force (3) + prev_action (6) [+ pending socket-relative goal term], NO proprio.
+# Asymmetric privileged critic (flat state, no CNN). LSTM + MLP; fixed_sigma; entropy 0. Consumes Dict obs
+# (concate_obs_groups: False) via the insertion_hybrid network with cnn.backbone=resnet18. RGB-only: the
+# depth branch is gone (3ch ResNet uses the pretrained RGB conv weights directly, no inflation). Run with
+# --enable_cameras. Task: Isaac-Insertion-CoolingPeg-Iiwa-E2E-Vision-Direct-v0.
 
 params:
-  seed: 0
+  seed: 42
   algo:
     name: a2c_continuous
 
@@ -37,12 +38,16 @@ params:
         fixed_sigma: True
 
     cnn:
-      # Frozen ImageNet ResNet-18; input conv inflated to the image's 4 channels (RGB copied, depth =
-      # mean of the RGB weights) and kept trainable so depth adapts. Its 512-d pooled feature is projected
+      # Frozen ImageNet ResNet-18; RGB-only (3 channels), so conv1 keeps the pretrained RGB weights
+      # verbatim (no depth-channel inflation). Its 512-d pooled feature is projected
       # to fc_size before fusing with force+prev_action (so the small proprio isn't swamped).
       backbone: resnet18
       pretrained: True
       # weights_path:  # optional local resnet18 state_dict if the box is offline (else random-init warn)
+      # Fine-tune the top residual block (layer4) at a reduced effective LR (grad *= finetune_grad_scale).
+      # Frozen stem stays under no_grad + BN in eval; keep torch_compile OFF (mixed_precision autocast only).
+      finetune_tail: True
+      finetune_grad_scale: 0.1
       fc_size: 128
       type: conv2d          # ignored by the resnet path; kept so rl_games' cnn parser is happy
       activation: relu
@@ -62,7 +67,7 @@ params:
     rnn:
       name: lstm
       units: 1024
-      layers: 2
+      layers: 1
       before_mlp: True
       concat_input: True
       layer_norm: True
@@ -77,11 +82,18 @@ params:
     env_name: rlgpu
     multi_gpu: False
     ppo: True
-    mixed_precision: True
+    # Keep eager execution while debugging numerical integrity; it is easier to localize failures and avoids
+    # compile-time memory overhead. torch.compile was ruled out as the source of the 2026-08-20 NaNs.
+    torch_compile: False
+    # rl_games' BF16 recurrent training path produced isolated catastrophic LSTM/Adam entries (1e32)
+    # despite finite encoder features and gradient clipping. Keep PPO/LSTM updates in FP32; the frozen
+    # ResNet encoder still runs under its own BF16 autocast in insertion_hybrid_network.py.
+    mixed_precision: True   # plan requires AMP on (was False -> only got it via CLI override; now self-contained)
     normalize_input: True   # normalizes the policy vector + critic state; the image is pre-normalized in-env
     normalize_value: True
     value_bootstrap: True
-    num_actors: 128         # 224px + ResNet-18 is memory-heavy -> lower this (e.g. 48/64) on the real run
+    # Overwritten from the actual environment count by scripts/train.py.
+    num_actors: 32
     reward_shaper:
       scale_value: 1.0
     normalize_advantage: True
@@ -90,14 +102,16 @@ params:
     learning_rate: 1.0e-4
     lr_schedule: adaptive
     schedule_type: standard
-    kl_threshold: 0.016     # see the state cfg (LR-cascade guard); fall back to constant LR if it cascades
+    kl_threshold: 0.02     # see the state cfg (LR-cascade guard); fall back to constant LR if it cascades
     score_to_win: 20000
     max_epochs: 1500
     save_best_after: 10
     save_frequency: 100
     print_stats: True
     grad_norm: 1.0
-    entropy_coef: 0.0
+    entropy_coef: 0       # THE FIX (2026-08-19): the last run stalled from pegged-HIGH entropy (the 0.003
+                          # bonus over-inflated sigma so the policy kept exploring instead of committing to a
+                          # seat). Back to 0 (fixed_sigma still gives baseline exploration via the log-std).
     truncate_grads: True
     e_clip: 0.2
     horizon_length: 128
@@ -113,7 +127,7 @@ params:
       mini_epochs: 4
       learning_rate: 1e-4
       lr_schedule: adaptive
-      kl_threshold: 0.016
+      kl_threshold: 0.02
       clip_value: True
       normalize_input: True
       truncate_grads: True
@@ -134,7 +148,7 @@ params:
         rnn:
           name: lstm
           units: 1024
-          layers: 2
+          layers: 1
           before_mlp: True
           concat_input: True
           layer_norm: True

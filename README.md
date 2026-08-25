@@ -72,10 +72,10 @@ scripts/                    # asset conversion, smoke, train, eval, plotting (se
 ## Install
 
 Requires [Isaac Lab](https://isaac-sim.github.io/IsaacLab/main/source/setup/installation/index.html)
-(2.3.2 / Isaac Sim 4.5) in a conda env (here: `isaaclab`).
+2.3.2 with Isaac Sim 5.1 in a conda env (here: `isaaclab51`).
 
 ```bash
-conda activate isaaclab
+conda activate isaaclab51
 python -m pip install -e source/insertion_policy
 ```
 
@@ -85,7 +85,7 @@ All scripts launch Isaac Sim headless. First launch needs the EULA accepted, and
 captures stdout — so the scripts write their results to `/tmp/*_report.txt`.
 
 ```bash
-conda activate isaaclab
+conda activate isaaclab51
 OMNI_KIT_ACCEPT_EULA=YES python scripts/<script>.py
 ```
 
@@ -99,7 +99,7 @@ OMNI_KIT_ACCEPT_EULA=YES python scripts/<script>.py
 | `test_part_physics.py`    | Drop-test: confirm the screw seats in a socket (SDF collision sane) |
 | `smoke_env.py`            | Instantiate the env, reset, step; prints obs/reward + reset geometry (dumps wrist frames for the vision task) |
 | `train.py`                | Train with RL-Games (registers our tasks + the `insertion_hybrid` net) |
-| `auto_resume_train.sh`    | Watchdog wrapper for `train.py`: passes the `--experience` kit, auto-resumes from the latest checkpoint through PhysX crashes/stalls until `--max_iterations`. Use this for any unattended run. |
+| `auto_resume_train.sh`    | Watchdog wrapper for `train.py`: uses the stock Sim 5.1 experience and auto-resumes from the latest checkpoint after crashes/stalls until `--max_iterations`. Use this for any unattended run. |
 | `overnight_chain.sh`      | Runs two `auto_resume_train.sh` jobs back-to-back on one GPU (e.g. state baseline → vision), freeing the GPU between them. `setsid bash scripts/overnight_chain.sh >log 2>&1 &` |
 | `eval_policy.py`          | Load a checkpoint, run N episodes, bin success by reset tilt / lateral offset |
 | `render_wrist_rollout.py` | Render a checkpoint rollout as video — `--view wrist` (the RGB-D POV) or `--view scene` (close third-person), following one env |
@@ -110,18 +110,18 @@ OMNI_KIT_ACCEPT_EULA=YES python scripts/<script>.py
 ## Training & evaluation
 
 ```bash
-conda activate isaaclab
-KIT=$PWD/apps/isaaclab.python.headless.rendering.physx1065.kit   # physx-pinned experience (see GPU note)
+conda activate isaaclab51
 
 # State-obs policy (128 envs)
 OMNI_KIT_ACCEPT_EULA=YES python scripts/train.py \
-  --task Isaac-Insertion-CoolingPeg-Direct-v0 --num_envs 128 --headless --experience "$KIT" \
+  --task Isaac-Insertion-CoolingPeg-Direct-v0 --num_envs 128 --headless \
   --max_iterations 500 agent.params.config.full_experiment_name=my_state_run
 
-# Vision policy (wrist RGB-D + CNN). NOTE: requires --enable_cameras; run at 64 envs (128 = PhysX crash).
-# For any unattended run prefer the watchdog (auto --experience + auto-resume through crashes):
+# E2E vision policy: wrist RGB, frozen ImageNet ResNet-18, full 320x180 16:9 frames (no crop).
+# NOTE: requires --enable_cameras; 32 environments is the tested 24 GB configuration.
+# For any unattended run prefer the watchdog (stock Sim 5.1 experience + automatic resume):
 SEED_RNG=42 setsid bash scripts/auto_resume_train.sh my_vision_run \
-  Isaac-Insertion-CoolingPeg-Vision-Direct-v0 64 1800 >my_vision_run.log 2>&1 &
+  Isaac-Insertion-CoolingPeg-Iiwa-E2E-Vision-Direct-v0 32 1800 >my_vision_run.log 2>&1 &
 # Realistic ranges (grasp 10°, ±8 mm, 25° tilt) + camera/proprio DR + APPEARANCE DR (per-env materials,
 # directional light, D405 sensor noise; see DECISIONS.md §12+§14) are now the cfg DEFAULTS. Override per-run
 # via EXTRA_OVERRIDES, e.g. EXTRA_OVERRIDES="env.cam_pos_jitter=0.0 env.randomize_part_materials=false".
@@ -141,7 +141,7 @@ SEED_RNG=42 setsid bash scripts/auto_resume_train.sh my_vision_run \
 # Evaluate (add --enable_cameras for the vision task)
 OMNI_KIT_ACCEPT_EULA=YES python scripts/eval_policy.py \
   --task Isaac-Insertion-CoolingPeg-Direct-v0 --num_envs 128 --num_episodes 512 --headless \
-  --experience "$KIT" --checkpoint logs/rl_games/Forge/<run>/nn/Forge.pth
+  --checkpoint logs/rl_games/Forge/<run>/nn/Forge.pth
 ```
 
 Logs/checkpoints land in `logs/rl_games/Forge/<run>/` (`nn/Forge.pth` = best by mean reward). On the
@@ -151,9 +151,9 @@ plateau ~ep1500 was misleading), so deliverable runs warrant ~3000; use **~1500 
 screening**, then retrain the winner long. Eval writes a timestamped report next to the checkpoint, and
 `Forge.pth` is best-by-*reward* (not always best-by-success — eval the last few checkpoints).
 
-> **Vision/GPU note:** the vision task keeps PhysX on Fabric (GPU-stable) but routes only the
-> camera's pose view to the USD path, working around a missing `usdrt.hierarchy` in this Isaac Sim
-> build. Disabling Fabric globally instead causes PhysX CUDA crashes/hangs — don't.
+> **Vision/GPU note:** use the stock Isaac Sim 5.1 rendering experience. The custom
+> `apps/isaaclab.python.headless.rendering.physx1065.kit` file is retained only for the old Isaac Sim
+> 4.5 environment and is not compatible with the upgraded stack.
 
 ## Code formatting
 
@@ -164,4 +164,4 @@ pre-commit run --all-files
 
 ---
 
-_README last updated: 2026-06-29._
+_README last updated: 2026-08-21._
