@@ -29,7 +29,7 @@
 docker/artifacts/
 *.tmp
 
-/Masterthesis-train-serl
+
 
 
 # Isaac-Sim packman

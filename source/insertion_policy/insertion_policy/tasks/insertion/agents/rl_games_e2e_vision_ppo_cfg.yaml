@@ -120,7 +120,9 @@ params:
     critic_coef: 2
     clip_value: True
     seq_length: 128
-    bounds_loss_coef: 0.0001
+    bounds_loss_coef: 0.01  # 2026-08-26: 0.0001->0.01. At 1e-4 the bounds penalty was ~off, so bounds_loss
+    # climbed to ~33 last night = the policy pinned actions at +-1 (the RAM, in sim and real). 1e-2 keeps it
+    # off the saturation rails without flattening the policy; paired with the halved e2e_pos_action_scale.
 
     central_value_config:
       minibatch_size: 512

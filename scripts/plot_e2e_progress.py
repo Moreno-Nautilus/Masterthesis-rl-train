@@ -91,7 +91,10 @@ def main():
           "e2e_deploy_hard_a175_bimodal_2500": ("tab:green", 3.0),  # deploy HARD anchor 1.75cm (64.5% -- the candidate)
           "e2e_deploy_easy_a08_bimodal_2500": ("tab:orange", 3.0),  # deploy EASY anchor 0.8cm (peaked then declined)
           "e2e_weld_curric": ("black", 2.5),                        # 85% no-DR reference
-          "w2_estimator_192": ("tab:blue", 2.5)}                   # deployed 83% target
+          "w2_estimator_192": ("tab:blue", 2.5),                   # deployed 83% target
+          "pdz_gc_center_overnight_20260825_gpu": ("tab:orange", 2.5),  # last night: gc+center
+          "pdz_v3_ramfix_geom_20260826": ("tab:red", 3.0),  # the 200-ep validation
+          "pdz_v3_fulltilt_20260826": ("tab:green", 3.0)}  # NEW full-tilt policy (in progress)
     faded = plt.cm.autumn(np.linspace(0.15, 0.75, max(1, len(runs))))
     colors, fi = {}, 0
     for r in runs:

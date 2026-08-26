@@ -312,12 +312,18 @@ class InsertionEnvE2EIiwa(InsertionEnvIiwa):
     def _get_observations(self):
         prev_actions = self.actions.clone()
         force_policy = self.noisy_force  # noisy 3-axis wrist contact force (NOT proprio)
-        # GRAVITY COMP: subtract the per-env pre-contact gravity baseline (captured on the first obs after
-        # reset, when the screw is above the socket = no contact) so force_policy is pure CONTACT, like the
-        # real gravity-compensated F/T. Gravity is a constant world-frame wrench, so one baseline holds.
+        # GRAVITY COMP: subtract the pre-contact gravity baseline so force_policy is pure CONTACT, like the
+        # real gravity-compensated F/T. get_link_incoming_joint_force() reports the wrench IN THE SENSOR'S
+        # CHILD (BODY) FRAME (Isaac docstring), NOT world -- so the gravity load rotates with the wrist. A
+        # single BODY-frame baseline captured at the reset pose therefore only cancels gravity at that
+        # orientation and leaks a phantom force ~|g|*(1-cos theta) once the wrist tilts (curriculum -> 25deg).
+        # FIX: store the baseline in the WORLD frame (constant there), and at every step rotate that constant
+        # world-frame gravity back into the CURRENT sensor-body frame before subtracting -> zero force at any
+        # orientation, with no contact. self._grav_base now holds the WORLD-frame gravity wrench.
         if getattr(self.cfg, "use_gravity_comp", False) and hasattr(self, "_grav_pending"):
             _p = self._grav_pending
             _had_pending = bool(_p.any())
+            _sensor_quat = self._robot.data.body_quat_w[:, self.force_sensor_body_idx]  # sensor body -> world
             if _had_pending:
                 # Snapshot the reset-env mask BEFORE clearing _grav_pending (both point to the same
                 # tensor, so the in-place False-set below would otherwise lose the mask).
@@ -326,25 +332,29 @@ class InsertionEnvE2EIiwa(InsertionEnvIiwa):
                 # is only 25% of the true gravity load on the first obs (EMA alpha=0.25), which would
                 # bake a 0.75*gravity_weight error into the baseline. The raw reading is the correct
                 # gravity load immediately after the first physics step.
-                raw_world = self._robot.root_physx_view.get_link_incoming_joint_force()[
+                raw_body = self._robot.root_physx_view.get_link_incoming_joint_force()[
                     :, self.force_sensor_body_idx
                 ]
                 # Warm-start the EMA buffer so the smoothed force has no transient for the rest of
                 # the episode (without this, the smoothed force takes ~10 steps to reach gravity).
-                self.force_sensor_world_smooth[_reset] = raw_world[_reset]
+                self.force_sensor_world_smooth[_reset] = raw_body[_reset]
+                # Rotate the RAW body-frame gravity reading into WORLD (constant there) and store it.
                 # SANITIZE: guard against a rare PhysX transient spike at reset.
-                self._grav_base[_reset] = torch.nan_to_num(raw_world[_reset, 0:3], nan=0.0, posinf=0.0, neginf=0.0)
+                _grav_world_reset = torch_utils.quat_apply(_sensor_quat[_reset], raw_body[_reset, 0:3])
+                self._grav_base[_reset] = torch.nan_to_num(_grav_world_reset, nan=0.0, posinf=0.0, neginf=0.0)
                 self._grav_pending[_reset] = False
 
-            # Apply gravity comp to all envs. For reset envs we must use the raw force rather than
-            # noisy_force: noisy_force was computed by _compute_intermediate_values BEFORE this obs
-            # call, so it still carries the attenuated EMA value (0.25*gravity). Overriding with raw
-            # gives raw_gravity - grav_base = 0 (correct: no contact at hover on step 1).
-            compensated = torch.nan_to_num(force_policy - self._grav_base, nan=0.0, posinf=0.0, neginf=0.0)
+            # Rotate the stored WORLD-frame gravity baseline into the CURRENT sensor-body frame so it lines
+            # up with force_policy (which is body-frame). At the reset orientation this reproduces the old
+            # behaviour exactly; at any tilt it correctly tracks the rotated gravity -> pure contact force.
+            grav_base_body = torch_utils.quat_rotate_inverse(_sensor_quat, self._grav_base)
+            compensated = torch.nan_to_num(force_policy - grav_base_body, nan=0.0, posinf=0.0, neginf=0.0)
             if _had_pending:
+                # Reset envs: noisy_force still carries the attenuated EMA value (0.25*gravity) from the
+                # pre-obs _compute_intermediate_values, so use the raw body reading for a clean 0 on step 1.
                 compensated = compensated.clone()
                 compensated[_reset] = torch.nan_to_num(
-                    raw_world[_reset, 0:3] - self._grav_base[_reset], nan=0.0, posinf=0.0, neginf=0.0
+                    raw_body[_reset, 0:3] - grav_base_body[_reset], nan=0.0, posinf=0.0, neginf=0.0
                 )
             force_policy = compensated
 
@@ -495,9 +505,16 @@ class InsertionEnvE2EIiwa(InsertionEnvIiwa):
             tip_dist_rew = torch.nn.functional.relu(tip_dist - _dz) if _dz > 0.0 else tip_dist
             rew_buf = -(w_pos * tip_dist_rew + w_rot * orient_err)
 
+        # PER-TERM REWARD LOGGING (2026-08-26): record each term's per-step contribution so the tensorboard
+        # shows the reward BREAKDOWN, not just the aggregate -> makes the term balance (esp. the anti-jam vs
+        # base tug-of-war) directly visible instead of inferred. Values are batch means; logged via log_dict.
+        _rt = {"rew_term_base": rew_buf.clone()}
+
         bonus = float(getattr(self.cfg, "e2e_success_bonus", 0.0))
         if bonus != 0.0:
-            rew_buf = rew_buf + bonus * curr_successes.float()
+            _b = bonus * curr_successes.float()
+            rew_buf = rew_buf + _b
+            _rt["rew_term_success_bonus"] = _b
 
         # Lateral-centering reward: pull the tip OVER the hole -- attacks the "reaches the area, misses
         # the hole" failure that dominates under the 2.5cm anchor noise. Behind a weight (default 0 => no-op).
@@ -513,7 +530,9 @@ class InsertionEnvE2EIiwa(InsertionEnvIiwa):
             if _cap > 0.0:
                 _xyd = _xyd.clamp(max=_cap)
             # sanitize: a NaN held-base pose would put a NaN in the reward buffer -> NaN advantages/losses.
-            rew_buf = rew_buf - _wc * torch.nan_to_num(_xyd, nan=0.0, posinf=0.0, neginf=0.0)
+            _center = -_wc * torch.nan_to_num(_xyd, nan=0.0, posinf=0.0, neginf=0.0)
+            rew_buf = rew_buf + _center
+            _rt["rew_term_center"] = _center
 
         # ANTI-JAM contact-force penalty: penalize SUSTAINED contact force above a threshold while NOT
         # seated -> discourages "press down on the fins" and nudges toward a force-guided lateral search.
@@ -525,7 +544,9 @@ class InsertionEnvE2EIiwa(InsertionEnvIiwa):
             thr = float(getattr(self.cfg, "e2e_contact_penalty_threshold", 12.0))
             cap = float(getattr(self.cfg, "e2e_contact_penalty_cap", 8.0))  # cap the overshoot (N) so a
             over = torch.nn.functional.relu(contact_force - thr).clamp(max=cap) * (~curr_successes).float()  # force spike can't dominate the reward
-            rew_buf = rew_buf - _wj * torch.nan_to_num(over, nan=0.0, posinf=0.0, neginf=0.0)
+            _antijam = -_wj * torch.nan_to_num(over, nan=0.0, posinf=0.0, neginf=0.0)
+            rew_buf = rew_buf + _antijam
+            _rt["rew_term_antijam"] = _antijam
 
         # SEAT SHAPING -- CENTER-THEN-DESCEND gate: penalize the shaft tip going BELOW the socket rim while
         # laterally OFF-CENTRE, so the policy must CENTRE first and only then commit the descent. Directly
@@ -542,14 +563,36 @@ class InsertionEnvE2EIiwa(InsertionEnvIiwa):
             xy = torch.linalg.vector_norm(_open[:, 0:2] - _tp[:, 0:2], dim=1)
             thr = float(getattr(self.cfg, "e2e_reward_descend_center_thresh", 0.005))
             gate = below * (xy > thr).float()                                   # below-rim depth while off-centre
-            rew_buf = rew_buf - _wg * torch.nan_to_num(gate, nan=0.0, posinf=0.0, neginf=0.0)
+            _descend = -_wg * torch.nan_to_num(gate, nan=0.0, posinf=0.0, neginf=0.0)
+            rew_buf = rew_buf + _descend
+            _rt["rew_term_descend_gate"] = _descend
+
+        # SEARCH / LIFT incentive (2026-08-26): a SMALL positive reward for REDUCING the lateral xy-miss to the
+        # hole axis WHILE IN CONTACT -> teaches "slide toward centre on a rim-strike" instead of pressing down
+        # (the deploy failure: "leans into contact, never lifts/searches"). Reward = w * max(0, prev_xy - xy)
+        # gated on contact_force > thresh and unseated. Kept LOW so it can't out-compete seating. Weight 0 => off.
+        _wr = float(getattr(self.cfg, "e2e_reward_recenter_weight", 0.0))
+        if _wr > 0.0:
+            _tp_r, _ = self._held_base_pose()
+            _xy_now = torch.linalg.vector_norm(self.fixed_pos[:, 0:2] - _tp_r[:, 0:2], dim=1)
+            if not hasattr(self, "_prev_tip_xy"):
+                self._prev_tip_xy = _xy_now.clone()
+            _in_contact = (contact_force > float(getattr(self.cfg, "e2e_reward_recenter_force_thresh", 3.0)))
+            _improve = torch.nn.functional.relu(self._prev_tip_xy - _xy_now)      # metres of xy-miss reduced
+            _recenter = _improve * (_in_contact & (~curr_successes)).float()
+            _search = _wr * torch.nan_to_num(_recenter, nan=0.0, posinf=0.0, neginf=0.0)
+            rew_buf = rew_buf + _search
+            _rt["rew_term_search_lift"] = _search
+            self._prev_tip_xy = _xy_now.detach().clone()
 
         # YAW REGULARIZATION (yaw is now actionable): a small penalty on the commanded yaw action so the
         # wrist doesn't slowly wind toward its joint limit. Squared -> only meaningfully penalizes large
         # sustained yaw, leaving small counter-rotations free. Width-guarded (5-DoF scaffold has no yaw).
         _wy = float(getattr(self.cfg, "e2e_reward_yaw_reg_weight", 0.0))
         if _wy > 0.0 and self.actions.shape[1] >= 6:
-            rew_buf = rew_buf - _wy * torch.nan_to_num(self.actions[:, 5] ** 2, nan=0.0, posinf=0.0, neginf=0.0)
+            _yaw = -_wy * torch.nan_to_num(self.actions[:, 5] ** 2, nan=0.0, posinf=0.0, neginf=0.0)
+            rew_buf = rew_buf + _yaw
+            _rt["rew_term_yaw_reg"] = _yaw
 
         # DIAGNOSTIC SUB-METRICS (2026-08-24): split the opaque 3D tip distance into the two sub-skills so
         # the plots show WHICH part is missing -- lateral centring vs insertion depth -- plus two coverage
@@ -574,6 +617,10 @@ class InsertionEnvE2EIiwa(InsertionEnvIiwa):
             "centered": centered,                # fraction with tip over the hole (xy < socket radius)
             "engaged": engaged,                  # fraction with the shaft inserted > engage threshold
         }
+        # PER-TERM REWARD BREAKDOWN: merge the recorded per-step reward contributions (batch means logged by
+        # _log_factory_metrics as logs_rew_rew_term_*). Lets the tensorboard show WHICH term drives the return
+        # -- watch rew_term_antijam vs rew_term_base to catch the "policy went timid" failure early.
+        log_dict.update(_rt)
         self.prev_actions = self.actions.clone()
         self._log_factory_metrics(log_dict, curr_successes)
         return rew_buf
@@ -684,6 +731,15 @@ class InsertionEnvE2EIiwa(InsertionEnvIiwa):
         self.contact_penalty_thresholds = contact_lower + contact_rand * (contact_upper - contact_lower)
 
         self.force_sensor_world_smooth[:, :] = 0.0
+
+        # SEARCH/LIFT reward: clear the per-env previous-xy baseline for reset envs so the first post-reset
+        # step doesn't score a spurious "improvement" off the previous episode's tip position (which could be
+        # anywhere). Seeding with the fresh post-reset xy makes the first-step delta 0 (no reward).
+        if hasattr(self, "_prev_tip_xy"):
+            _tp_reset, _ = self._held_base_pose()
+            self._prev_tip_xy[env_ids] = torch.linalg.vector_norm(
+                self.fixed_pos[env_ids, 0:2] - _tp_reset[env_ids, 0:2], dim=1
+            )
 
         ema_rand = torch.rand((self.num_envs, 1), device=self.device)
         ema_lower, ema_upper = self.cfg.ctrl.ema_factor_range

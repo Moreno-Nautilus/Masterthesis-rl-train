@@ -449,7 +449,15 @@ class ForgeTaskCoolingInsertIiwaE2EVisionCfg(ForgeTaskCoolingInsertIiwaCameraCfg
     weld_held_parent_body: str = "pdz_gripper_tcp"
     weld_gripper_closed_half_gap: float = 0.006
 
-    e2e_pos_action_scale: float = 0.01  # metres (was 0.02 for the 85% run; halved -> gentler contact/deploy)
+    # Longer episode (2026-08-26: 10->13s). The halved action scale below makes the approach slower, and the
+    # new search/lift reward needs TIME to lift-recentre-retry after a rim-strike instead of timing out mid-
+    # search. +3s buys that without over-diluting the success signal. Overridden HERE (iiwa E2E only) so the
+    # residual Franka ForgeTaskCoolingInsertCfg (10s) stays untouched.
+    episode_length_s: float = 13.0
+    e2e_pos_action_scale: float = 0.005  # metres. 2026-08-26: 0.01->0.005. Halved to kill the RAM: a saturated
+    # down-command (bounds_loss hit 33 last night = actions pinned at +-1) now moves 5mm/step (~7.5cm/s @15Hz),
+    # a gentle press instead of a 1cm slam. Attacks the ram at its MECHANISM (max action is now soft), paired
+    # with a modest bounds_loss_coef bump (0.0001->0.01, in the agent yaml) that keeps the policy off the rails.
     e2e_rot_action_scale: float = 0.1   # radians (~5.7 deg) per unit tilt action
     # Reward = the VALIDATED squashing kernel + seat bonus (the state-first debug reached ~60% success
     # with this; the flat l2_axis reward gave 0% -- policy hovered above the hole). Same reward, vision obs.
@@ -471,15 +479,30 @@ class ForgeTaskCoolingInsertIiwaE2EVisionCfg(ForgeTaskCoolingInsertIiwaCameraCfg
     # e2e_contact_penalty_threshold N while NOT seated, so the policy force-searches instead of pressing
     # ~18N onto the fins. scale sized so the MAX per-step penalty is only a few % of the main reward term
     # (must NOT make contact timid). Tune the scale via runs; 0 disables it.
-    e2e_contact_penalty_scale: float = 0.02  # modest scale (max/step a few % of the main term -- don't make contact timid)
-    e2e_contact_penalty_threshold: float = 6.5   # N; sustained contact above this (unseated) is penalized (2026-08-19: was 12)
+    e2e_contact_penalty_scale: float = 2.0  # 2026-08-26: 0.1->2.0. Last night's 0.1 (max 0.8/step) was still
+    # cosmetic vs the weight-15 descend/center terms, so the policy kept ramming (bounds_loss climbed to 33 =
+    # action saturation, contact_force cruised ~10N, p95 16N, batch-mean peaks 28N). With thr=12/scale=2/cap=8
+    # a 20N strike now costs relu(20-12)=8 -> *2.0 = 16/step, COMPARABLE to the descend/center terms; the ram
+    # finally competes. Cruising <12N still pays ZERO (see threshold), so normal contact is NOT made timid.
+    e2e_contact_penalty_threshold: float = 12.0  # N; 2026-08-26: 6.5->12. 6.5 sat BELOW the ~10N cruise so it
+    # taxed normal contact and became an ignorable background tax. 12 sits above cruise (p95~16), below the ram,
+    # so ONLY rims/jams are penalized. The bite comes from thr-above-cruise + scale, NOT the cap (kept at 8).
     e2e_contact_penalty_cap: float = 8.0         # N; cap on the overshoot so a spike can't dominate reward
     # SEAT SHAPING (fine-seat of the chamfer-free ~1mm hole):
     # (a) CENTER-THEN-DESCEND gate: penalize the tip going below the socket rim while laterally off-centre
     #     (> thresh) -> centre first, then descend. Weight 0 => off. Penalty ~ w * below-rim-depth(m); with
     #     socket depth ~0.0175m, w~15 gives a max ~0.26/step -- comparable to the main reward. Tune via runs.
-    e2e_reward_descend_gate_weight: float = 0.0
+    e2e_reward_descend_gate_weight: float = 15.0  # 2026-08-25: 0->15. THE pdz-deploy fix. Was OFF, so the policy
+    # descended regardless of lateral error and rammed the rim ~8mm off-centre (deploy trials 1-3). w~15 gives
+    # a max ~0.26/step (comparable to the main reward) -> forces CENTRE-THEN-DESCEND. Tune via runs.
     e2e_reward_descend_center_thresh: float = 0.005  # m; xy miss beyond this counts as "off-centre"
+    # (a2) SEARCH / LIFT incentive (2026-08-26): a SMALL positive reward for REDUCING the lateral (xy) miss to
+    # the hole WHILE IN CONTACT -> rewards sliding toward centre on a rim-strike instead of pressing straight
+    # down. Directly teaches the lift/recentre reflex the deploy policy lacked ("leans into contact, never
+    # lifts/searches"). Kept LOW so it can't out-compete seating (else the policy hovers/searches forever).
+    # Reward = w * max(0, prev_xy - xy) while contact_force > thresh and unseated. Weight 0 => off.
+    e2e_reward_recenter_weight: float = 1.5  # per metre of xy-miss reduction (so ~mm/step -> ~1.5e-3/step)
+    e2e_reward_recenter_force_thresh: float = 3.0  # N; only reward recentring once actually in contact
     # (b) CONTACT COMPLIANCE: scale the high-gain arm PD stiffness (<1 = softer -> the peg can slide into the
     #     hole instead of rigidly jamming). Damping scaled by sqrt to stay ~critically damped. 1.0 = current
     #     gains. SMOKE for control stability before using <1 on a full run (soft gains + tight-contact solver
@@ -642,9 +665,16 @@ class ForgeTaskCoolingInsertIiwaE2EVisionCfg(ForgeTaskCoolingInsertIiwaCameraCfg
         self.task.grasp_pos_jitter_axial_mm = 3.0
         self.task.grasp_pos_jitter_lateral_mm = 2.0
         self.task.grasp_misalign_secondary_deg = 0.0  # §4: fold all angular error into the 30deg budget
-        # §6 START HEIGHT: screw tip z = rim + 0.04 +- 0.01 -> TCP = tip + 17.5mm shaft = rim + 0.0575. The
-        # hand_init_pos is the FINGERTIP (TCP) target above the socket opening, so z = 0.0575.
-        self.task.hand_init_pos = [0.0, 0.0, 0.0575]
+        # §6a TCP->TIP TRIM (2026-08-26): retract the screw 2mm UP into the jaws so the sim TCP->screw-tip
+        # matches the real ~30mm exactly. VERIFIED-BY-CODE: grasp origin sits (head_height 17.5 - fingerpad)
+        # below the TCP, + the 17.5mm shaft. fingerpad 0.003 gave origin 14.5mm -> tip 32.0mm; fingerpad 0.005
+        # gives origin 12.5mm -> tip 30.0mm. (LARGER fingerpad retracts UP; sign verified 2026-08-03.)
+        self.task.robot_cfg.franka_fingerpad_length = 0.005  # sim TCP->tip = 12.5 + 17.5 = 30.0mm (== real)
+        # §6 START HEIGHT: hand_init_pos is the FINGERTIP (TCP) IK target above the socket opening (rim). With
+        # the TCP->tip now 30.0mm (above), z=0.0675 puts the TCP at rim+67.5mm -> screw TIP at rim + 67.5 - 30
+        # = ~37.5mm (mid of the requested 35-40mm band). (Old 0.0575 + the stale "17.5mm" comment mislabeled
+        # this as rim+40mm; the true tip was only rim+25.5mm.) +-10mm z-noise below keeps a rim+27.5..47.5 band.
+        self.task.hand_init_pos = [0.0, 0.0, 0.0675]
         # §6 LATERAL SPAWN = small servo SETTLING only (radial <= ~0.3cm). The lateral/z GOAL-ESTIMATE error
         # is now injected physically by the goal anchor (above), so the peg starts OFF the true hole and the
         # obs delta-to-noisy-G ~ 0. This 0.3cm is just the residual servo settling about that estimate. z
