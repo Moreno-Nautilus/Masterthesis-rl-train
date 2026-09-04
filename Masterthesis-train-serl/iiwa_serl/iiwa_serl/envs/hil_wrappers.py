@@ -77,16 +77,30 @@ class PS4Intervention(gym.ActionWrapper):
         self._last_abort = False
 
     def action(self, action: np.ndarray) -> np.ndarray:
-        """Return the teleop delta if the operator is driving, else the policy action.
+        """Return motion only while R1 is held.
 
         This single call is the ONLY place per step that pumps pygame events /
         updates button edges (via `get_action`), so the manual success/abort
         flags consumed here are frame-aligned with this action (same guarantee
         the actor's `poll_manual_buttons` relies on)."""
         expert_a = self.teleop.get_action()          # pumps events, updates edges
+        snapshot = (
+            self.teleop.debug_snapshot()
+            if hasattr(self.teleop, "debug_snapshot")
+            else {"r1": 1}  # compatibility for test/custom providers predating snapshots
+        )
+        self._deadman_held = bool(snapshot.get("r1", 0))
+        if hasattr(self.env.unwrapped, "set_deadman"):
+            self.env.unwrapped.set_deadman(self._deadman_held)
         # Consume the one-shot manual-result edges set during that same pump.
         self._last_success = self.teleop.is_success()
         self._last_abort = self.teleop.is_failure()
+        # Terminal markers are recorded transitions, so accept either result button
+        # only during an R1-enabled interval. This prevents an unrecorded terminal
+        # cycle from leaving the preceding replay transition without an episode end.
+        if not self._deadman_held:
+            self._last_success = False
+            self._last_abort = False
         # Level read of L1 stop-forward (residual mode): freeze the nominal clock while held.
         # Push it into the env so the nominal clock (which lives in env.step) can pause forward
         # regardless of whether the executed action is the policy's or an intervention.
@@ -103,6 +117,12 @@ class PS4Intervention(gym.ActionWrapper):
             self._intervened = False
             return np.zeros_like(action)
 
+        # R1 gates the autonomous policy as well as the human residual. Without
+        # this, get_action() returned zero but the wrapper passed policy motion on.
+        if not self._deadman_held:
+            self._intervened = False
+            return np.zeros_like(action)
+
         self._intervened = bool(np.linalg.norm(expert_a) > self.INTERVENE_EPS)
         if self._intervened:
             return np.asarray(expert_a, dtype=action.dtype)
@@ -116,6 +136,7 @@ class PS4Intervention(gym.ActionWrapper):
         # Always surface the button edges so the reward wrapper can end the episode.
         info["manual_success"] = self._last_success
         info["manual_abort"] = self._last_abort
+        info["deadman_held"] = bool(self._deadman_held)
         return obs, rew, done, truncated, info
 
     def close(self):
@@ -154,6 +175,11 @@ class HumanReward(gym.Wrapper):
         if manual_abort:
             manual_success = False
 
+        if manual_success or manual_abort:
+            import os as _os
+            if _os.environ.get("HIL_DEBUG_BTN", "0") in ("1", "true", "True"):
+                print(f"[HumanReward] manual_success={manual_success} manual_abort={manual_abort} "
+                      f"deadman={info.get('deadman_held')} -> rew set", flush=True)
         if manual_success:
             # Keep env-side success bookkeeping in sync (one-shot flag).
             if hasattr(self.env.unwrapped, "set_manual_success"):

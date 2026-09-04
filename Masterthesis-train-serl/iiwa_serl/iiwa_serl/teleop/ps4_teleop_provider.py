@@ -197,6 +197,18 @@ class PS4TeleopProvider(TeleopProvider):
     def get_action(self) -> np.ndarray:
         """Return 6D delta action in [-1, 1]. Zeros while R1 not held."""
         pygame.event.pump()
+
+        # SAFETY: if the controller went away (a dropout can leave a ghost device stuck reporting a
+        # pressed button -> deadman false-True -> runaway), FAIL SAFE: publish a neutral snapshot
+        # with r1=0 so the deadman reads OFF and the robot freezes. get_init() is False if the
+        # joystick was closed/lost (get_attached() doesn't exist in this pygame).
+        if not self._js.get_init():
+            self._last_snapshot = dict(
+                r1=0, raw_lx=0.0, raw_ly=0.0, raw_rx=0.0, raw_ry=0.0,
+                raw_l2=0.0, raw_r2=0.0, l2_ready=0, r2_ready=0,
+            )
+            return np.zeros(6, dtype=np.float32)
+
         self._update_button_edges()
 
         cfg = self._cfg

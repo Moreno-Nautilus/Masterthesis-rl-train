@@ -75,6 +75,13 @@ class IiwaInsertionConfig:
     random_reset: bool = True
     random_xy_range: float = 0.01
     random_yaw_range: float = 0.05   # small: keep resets gentle/reachable (was 0.20)
+    # Independent base-frame translation jitter applied after the joint reset. Each
+    # component is a half-range in metres; zeros preserve the legacy reset exactly.
+    reset_noise_xyz_m: np.ndarray = field(
+        default_factory=lambda: _arr([0.0, 0.0, 0.0])
+    )
+    # Constant +Z lift (metres) added to the reset pose so the arm starts higher above the seat.
+    reset_z_offset_m: float = 0.0
     sparse_reward: bool = True
     success_bonus: float = 1.0
     dense_pos_weight: float = 1.0
@@ -166,6 +173,13 @@ class IiwaInsertionConfig:
     # Nominal forward speed (mm/s): sets the EFFECTIVE nominal step count = dist/(speed*dt), so the
     # push runs at a safe fixed contact speed (NOT the handoff's fine 0.18mm/step). Default 4 mm/s.
     nominal_speed_mm_s: float = 4.0
+    # Override the computed nominal step count (0 = off). For very short inserts (k=0, 5mm) where
+    # dist/speed gives many sub-mm steps the compliant controller can't resolve: set e.g. 6 so each
+    # step commands a larger (~length/6) delta that punches through the impedance deadband.
+    nominal_steps_override: int = 0
+    # require_deadman (R1): when True, the nominal only advances while the operator holds R1, so the
+    # episode WAITS at reset until R1 is pressed (recording/HIL). Default False (advance freely).
+    require_deadman: bool = False
     # extra steps beyond the nominal length for lateral search / contact (per-insert horizon).
     episode_search_margin: int = 150
     # Per-insert JOINT configs from the handoff (frame-independent). goal_joints is FK'd at reset to

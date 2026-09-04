@@ -49,8 +49,8 @@ class IiwaInsertBase(DefaultTrainingConfig):
     random_steps = 0
     training_starts = 100
     steps_per_update = 50
-    checkpoint_period = 2000
-    buffer_period = 2000
+    checkpoint_period = int(os.environ.get("CHECKPOINT_PERIOD", "300"))
+    buffer_period = int(os.environ.get("BUFFER_PERIOD", "300"))
     eval_n_trajs = 0                              # manual-reward: no un-gated eval resets
     eval_period = 0
 
@@ -73,11 +73,22 @@ class IiwaInsertBase(DefaultTrainingConfig):
             joint_reset_on_reset=True,
             manual_reset=False,                   # AUTOMATED reset to the annotated pre-insert
             random_reset=False,
+            # Independent uniform base-frame reset jitter (half-range, X/Y/Z). Default +/-1 mm;
+            # override with RESET_NOISE_MM (e.g. 5 = +/-5 mm in all three axes).
+            reset_noise_xyz_m=np.full(
+                3, float(os.environ.get("RESET_NOISE_MM", "1.0")) / 1000.0, dtype=np.float64
+            ),
+            # Constant +Z lift of the reset pose (mm) so the arm starts higher above the seat.
+            reset_z_offset_m=float(os.environ.get("RESET_Z_OFFSET_MM", "0.0")) / 1000.0,
             force_retract_enable=True,
             force_retract_thresh_n=25.0,          # TUNE at rig
             force_retract_step_m=0.003,
             residual_enable=residual,
             nominal_speed_mm_s=float(os.environ.get("NOMINAL_SPEED_MM_S", "4.0")),
+            nominal_steps_override=int(os.environ.get("NOMINAL_STEPS", "0")),
+            # Hard safety/recording invariant: policy + residual motion is enabled only
+            # while R1 is physically held. This is intentionally not environment-optional.
+            require_deadman=True,
             nominal_pause_force_n=8.0,            # TUNE at rig
             residual_rotation_enable=(
                 os.environ.get("RESIDUAL_ROTATION", "0") in ("1", "true", "True")
@@ -85,7 +96,10 @@ class IiwaInsertBase(DefaultTrainingConfig):
         )
         # Fixed ZED scene camera — RECORDING-ONLY (record_only), OPT-IN via RECORD_ZED=1 so a
         # missing/dead ZED can never break training/recording (#21). NOT a policy/training input.
-        cams = [CameraConfig(image_key="wrist", ros_topic="/realsense_1/camera/color/image_raw")]
+        wrist_topic = os.environ.get(
+            "SERL_WRIST_TOPIC", "/realsense_1/camera/color/image_raw"
+        )
+        cams = [CameraConfig(image_key="wrist", ros_topic=wrist_topic)]
         if os.environ.get("RECORD_ZED", "0") in ("1", "true", "True"):
             cams.append(CameraConfig(
                 image_key="scene", record_only=True,

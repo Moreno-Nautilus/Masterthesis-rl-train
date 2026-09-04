@@ -53,11 +53,14 @@ def _train_config_for(assembly: str, insert: int):
     residual flags, and cameras are byte-identical to training. Requires the examples/ dir on the
     path (as train_rlpd runs); add it if launching this script standalone."""
     import sys, os as _os
-    examples_dir = _os.path.abspath(
-        _os.path.join(_os.path.dirname(__file__), "..", "..", "hil-serl_src", "examples")
+    hil_root = _os.path.abspath(
+        _os.path.join(_os.path.dirname(__file__), "..", "..", "hil-serl_src")
     )
-    if examples_dir not in sys.path:
-        sys.path.insert(0, examples_dir)
+    # Force the Gymnasium HIL launcher ahead of the repo's legacy classic-Gym
+    # launcher. The two packages share a name, so ordinary import fallback is unsafe.
+    for source_dir in (_os.path.join(hil_root, "examples"), _os.path.join(hil_root, "serl_launcher")):
+        if source_dir not in sys.path:
+            sys.path.insert(0, source_dir)
     from experiments.mappings import CONFIG_MAPPING
     exp_name = f"iiwa_{'plumbers' if assembly=='plumbers_block' else 'cooling'}_insert{insert}"
     if exp_name not in CONFIG_MAPPING:
@@ -95,6 +98,19 @@ def record(insert, assembly, n_demos, server_url, out_dir, fake_env):
     ep_transitions: list[dict] = []
     success_count = 0
     total_episodes = 0
+    recording_active = False
+
+    # --- opt-in per-step diagnostic log (DEBUG_LOG=1): what you press vs what the robot does.
+    _dbg = os.environ.get("DEBUG_LOG", "0") in ("1", "true", "True")
+    _dbg_csv = None
+    _dbg_step = 0
+    if _dbg:
+        _dbg_path = os.path.join(out_dir, f"debug_{tag}_{uid}.csv")
+        _dbg_csv = open(_dbg_path, "w")
+        _dbg_csv.write("step,ep,r1,l1,raw_ly,raw_lx,raw_r2,raw_l2,r2_ready,l2_ready,"
+                       "act0,act1,act2,contact,progress,paused,shielded,"
+                       "cmd_z,meas_x,meas_y,meas_z\n")
+        print(f"[REC][DEBUG] logging per-step to {_dbg_path}")
 
     print(f"[REC] residual demos: {tag}  n={n_demos}  "
           f"axis={base_env.config.insertion_axis.round(2)}  speed={base_env.config.nominal_speed_mm_s}mm/s")
@@ -105,8 +121,21 @@ def record(insert, assembly, n_demos, server_url, out_dir, fake_env):
         while success_count < n_demos:
             action = teleop.get_action()
             # Frame-aligned button reads (single pump inside get_action, like the actor).
-            manual_success = teleop.is_success()
+            snap = (
+                teleop.debug_snapshot()
+                if hasattr(teleop, "debug_snapshot")
+                else {"r1": int(np.linalg.norm(action) > 1e-6)}
+            )
+            deadman_held = bool(snap.get("r1", 0))
+            success_pressed = teleop.is_success()
+            manual_success = bool(success_pressed and deadman_held)
             manual_abort = teleop.is_failure()
+            # R1 is both the motion deadman and the recording level gate. Releasing it
+            # pauses the episode without adding zero/hold transitions to the demo.
+            base_env.set_deadman(deadman_held)
+            if deadman_held != recording_active:
+                print("[REC] recording ON (R1 held)" if deadman_held else "[REC] recording PAUSED (R1 released)")
+                recording_active = deadman_held
             # #11: on a terminal button, zero the action AND freeze forward so the terminal step
             # commands a hold (no last-instant push into the recorded transition).
             if manual_success or manual_abort:
@@ -116,6 +145,39 @@ def record(insert, assembly, n_demos, server_url, out_dir, fake_env):
                 base_env.set_stop_forward(teleop.is_stop_forward())  # L1 -> freeze nominal clock
 
             next_obs, rew, terminated, truncated, info = env.step(action)
+
+            if _dbg:
+                try:
+                    meas = base_env.client.get_state().pose[:3]
+                except Exception:
+                    meas = (float("nan"),) * 3
+                prog = info.get("nominal_progress", float("nan"))
+                paused = int(bool(info.get("nominal_paused", False)))
+                shielded = int(bool(info.get("shielded", False)))
+                contact = int(paused and not bool(teleop.is_stop_forward()))  # paused w/o L1 ~ contact
+                l1 = int(bool(base_env._stop_forward))
+                # commanded Z = interpolate(reset_z, goal_z, progress) — what the nominal is asking for
+                try:
+                    rz = float(base_env.config.nominal_reset_pose6[2])
+                    gz = float(base_env.config.nominal_goal_pose6[2])
+                    cmd_z = (1.0 - prog) * rz + prog * gz
+                except Exception:
+                    cmd_z = float("nan")
+                row = (f"{_dbg_step},{total_episodes},{snap.get('r1',0)},{l1},"
+                       f"{snap.get('raw_ly',0):.3f},{snap.get('raw_lx',0):.3f},"
+                       f"{snap.get('raw_r2',0):.3f},{snap.get('raw_l2',0):.3f},"
+                       f"{snap.get('r2_ready',0)},{snap.get('l2_ready',0)},"
+                       f"{action[0]:.3f},{action[1]:.3f},{action[2]:.3f},"
+                       f"{contact},{prog:.3f},{paused},{shielded},"
+                       f"{cmd_z:.4f},{meas[0]:.4f},{meas[1]:.4f},{meas[2]:.4f}")
+                _dbg_csv.write(row + "\n"); _dbg_csv.flush()
+                if _dbg_step % 5 == 0:
+                    print(f"[DBG] R1={snap.get('r1',0)} L1={l1} "
+                          f"lx={snap.get('raw_lx',0):+.2f} ly={snap.get('raw_ly',0):+.2f} "
+                          f"act={action[:3].round(2)} "
+                          f"prog={prog:.2f} paused={paused} "
+                          f"cmdZ={cmd_z:.4f} measX={meas[0]:.4f} measY={meas[1]:.4f} measZ={meas[2]:.4f}")
+                _dbg_step += 1
 
             if manual_success:
                 rew, terminated = 1.0, True
@@ -131,16 +193,17 @@ def record(insert, assembly, n_demos, server_url, out_dir, fake_env):
                 return {k: v for k, v in o.items() if k != "scene"}
             def _scene(o):
                 return o.get("scene")
-            ep_transitions.append(copy.deepcopy(dict(
-                observations=_policy_obs(obs),
-                actions=action,
-                next_observations=_policy_obs(next_obs),
-                rewards=float(rew),
-                masks=1.0 - float(terminated),
-                dones=bool(terminated or truncated),
-                scene=_scene(obs),                    # backup-only, ignored by the learner
-                shielded=bool(info.get("shielded", False)),  # #8: retract/L1 flag
-            )))
+            if deadman_held:
+                ep_transitions.append(copy.deepcopy(dict(
+                    observations=_policy_obs(obs),
+                    actions=action,
+                    next_observations=_policy_obs(next_obs),
+                    rewards=float(rew),
+                    masks=1.0 - float(terminated),
+                    dones=bool(terminated or truncated),
+                    scene=_scene(obs),                    # backup-only, ignored by the learner
+                    shielded=bool(info.get("shielded", False)),  # #8: retract/L1 flag
+                )))
             obs = next_obs
 
             if terminated or truncated:
@@ -154,8 +217,11 @@ def record(insert, assembly, n_demos, server_url, out_dir, fake_env):
                 else:
                     print(f"[REC] discarded episode (abort/timeout, steps={len(ep_transitions)})")
                 ep_transitions = []
+                recording_active = False
                 obs, _ = env.reset()
     finally:
+        if _dbg_csv is not None:
+            _dbg_csv.close()
         with open(file_path, "wb") as f:
             pkl.dump(all_transitions, f)
         print(f"\n[REC] Saved {len(all_transitions)} transitions "

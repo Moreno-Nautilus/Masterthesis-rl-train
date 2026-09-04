@@ -38,10 +38,9 @@ import time
 import numpy as np
 from tqdm import tqdm
 
-# NOTE: import `gym` (not gymnasium) to match the registry iiwa_serl registers into
-# and the registry the training script (async_drq_iiwa_insert.py) uses. Mixing the two
-# causes NameNotFound at gym.make.
-import gym
+# The iiwa env and HIL ChunkingWrapper are Gymnasium-based. Mixing classic Gym
+# spaces here makes the recorder fail before the first reset.
+import gymnasium as gym
 
 import iiwa_serl  # noqa: F401 — registers environments
 from iiwa_serl.teleop import PS4TeleopProvider
@@ -268,7 +267,9 @@ def record_demos(
         while success_count < n_demos:
             action = teleop.get_action()
             _snap = teleop.debug_snapshot() if hasattr(teleop, "debug_snapshot") else {}
-            manual_success = teleop.is_success()
+            deadman_held = bool(_snap.get("r1", 0))
+            success_pressed = teleop.is_success()
+            manual_success = bool(success_pressed and deadman_held)
             manual_abort = teleop.is_failure()
             if manual_success or manual_abort:
                 # Stop on the button edge before taking the terminal observation.
@@ -283,7 +284,8 @@ def record_demos(
                 info.get("workspace_clipped", False),
             )
             camera_stale = bool(info.get("camera_stale", False))
-            ep_camera_stale_steps += int(camera_stale)
+            if deadman_held:
+                ep_camera_stale_steps += int(camera_stale)
             if camera_stale and not camera_stale_warned:
                 print(
                     "[DEMO] Camera did not deliver a fresh frame. "
@@ -303,18 +305,19 @@ def record_demos(
                 terminated = True
                 rew = 0.0
 
-            ep_transitions.append(
-                copy.deepcopy(
-                    dict(
-                        observations=obs,
-                        actions=action,
-                        next_observations=next_obs,
-                        rewards=float(rew),
-                        masks=1.0 - float(terminated),
-                        dones=terminated,
+            if deadman_held:
+                ep_transitions.append(
+                    copy.deepcopy(
+                        dict(
+                            observations=obs,
+                            actions=action,
+                            next_observations=next_obs,
+                            rewards=float(rew),
+                            masks=1.0 - float(terminated),
+                            dones=terminated,
+                        )
                     )
                 )
-            )
             obs = next_obs
 
             if terminated or truncated:

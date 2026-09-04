@@ -52,6 +52,10 @@ class BaseIiwaSERLEnv(gym.Env):
         self._camera_stale = False
         self._last_camera_warning = 0.0
         self._stop_forward = False  # operator L1 (set by PS4Intervention); freezes nominal clock
+        # deadman (R1): when _require_deadman, the nominal only advances while _deadman is True
+        # (so the episode WAITS at reset until R1 is pressed). Opt-in via config.require_deadman.
+        self._deadman = False
+        self._require_deadman = bool(getattr(self.config, "require_deadman", False))
 
         # Residual-on-nominal controller (None in E2E / free-delta mode). Built here with the
         # config endpoints; rebuilt frame-correctly in _resolve_goal_from_fk() once the robot's
@@ -106,13 +110,33 @@ class BaseIiwaSERLEnv(gym.Env):
             dtype=np.float32,
         )
 
-    def _randomized_reset_pose7(self) -> np.ndarray:
-        pose6 = np.asarray(self.config.reset_pose, dtype=np.float64).copy()
+    def _randomized_reset_pose7(self, base_pose7: np.ndarray | None = None) -> np.ndarray:
+        pose6 = (
+            np.asarray(self.config.reset_pose, dtype=np.float64).copy()
+            if base_pose7 is None
+            else pose7_to_pose6(np.asarray(base_pose7, dtype=np.float64))
+        )
         if self.config.random_reset:
-            pose6[0] += np.random.uniform(-self.config.random_xy_range, self.config.random_xy_range)
-            pose6[1] += np.random.uniform(-self.config.random_xy_range, self.config.random_xy_range)
-            pose6[5] += np.random.uniform(-self.config.random_yaw_range, self.config.random_yaw_range)
-        return pose6_to_pose7(pose6)
+            pose6[0] += self.np_random.uniform(
+                -self.config.random_xy_range, self.config.random_xy_range
+            )
+            pose6[1] += self.np_random.uniform(
+                -self.config.random_xy_range, self.config.random_xy_range
+            )
+            pose6[5] += self.np_random.uniform(
+                -self.config.random_yaw_range, self.config.random_yaw_range
+            )
+        pose7 = pose6_to_pose7(pose6)
+        xyz_half_range = np.asarray(
+            getattr(self.config, "reset_noise_xyz_m", np.zeros(3)), dtype=np.float64
+        )
+        if xyz_half_range.shape != (3,) or np.any(xyz_half_range < 0.0):
+            raise ValueError("reset_noise_xyz_m must contain three non-negative metre values")
+        pose7[:3] += self.np_random.uniform(-xyz_half_range, xyz_half_range)
+        # Constant +Z lift of the reset pose (base frame) so the arm starts higher above the seat,
+        # giving more descent room. Config reset_z_offset_m (metres).
+        pose7[2] += float(getattr(self.config, "reset_z_offset_m", 0.0))
+        return pose7
 
     def _get_images(self) -> dict[str, np.ndarray]:
         if not self.include_image:
@@ -172,12 +196,25 @@ class BaseIiwaSERLEnv(gym.Env):
         step by PS4Intervention (recording + HIL training). Not used at inference."""
         self._stop_forward = bool(value)
 
+    def set_deadman(self, value: bool) -> None:
+        """Operator deadman (R1): when False, freeze the nominal clock (no forward push).
+        Recording/HIL only — lets the episode WAIT at reset until R1 is pressed. When
+        _require_deadman is False (default / inference), this is ignored and the nominal
+        advances freely as before."""
+        self._deadman = bool(value)
+
     def _effective_nominal_n(self, insertion_len_m: float | None) -> int:
         """Number of nominal steps so the forward push runs at ~nominal_speed_mm_s (#7).
 
         We do NOT use the handoff's raw waypoint count (0.18 mm/step -> 280-349 steps, which
         over-discounts the terminal reward and is needlessly fine). Steps = distance / (speed *
         dt); dt = 1/hz. Same physical motion, coarser sampling, still FRI-safe."""
+        # explicit override (config.nominal_steps_override > 0): use exactly this many steps
+        # regardless of length/speed — for very short inserts where distance/speed gives too
+        # many sub-mm steps that the compliant controller can't resolve (k=0, 5mm).
+        override = int(getattr(self.config, "nominal_steps_override", 0) or 0)
+        if override > 0:
+            return max(override, 2)
         length_m = insertion_len_m
         if length_m is None:
             length_m = float(np.linalg.norm(
@@ -309,6 +346,9 @@ class BaseIiwaSERLEnv(gym.Env):
         self.prev_action[:] = 0.0
         self._manual_success = False
         self._stop_forward = False
+        # Require a fresh R1 sample after every reset; never inherit an enabled
+        # deadman state from the terminal step of the preceding episode.
+        self._deadman = False
         if self._nominal is not None:
             self._nominal.reset()
         self.client.clear_errors()
@@ -325,6 +365,17 @@ class BaseIiwaSERLEnv(gym.Env):
                 self.client.joint_reset(
                     target_q=(target_q if target_q is not None else self.config.reset_joints)
                 )
+            reset_pose7 = self.client.get_state().pose.copy()
+            xyz_half_range = np.asarray(
+                getattr(self.config, "reset_noise_xyz_m", np.zeros(3)), dtype=np.float64
+            )
+            if np.any(xyz_half_range > 0.0):
+                # The target is sampled once, then repeated briefly so a compliant position
+                # loop reaches the same absolute pose instead of resampling or accumulating.
+                reset_pose7 = self._randomized_reset_pose7(reset_pose7)
+                for _ in range(3):
+                    self.client.move_pose(reset_pose7)
+                    time.sleep(max(0.0, 1.0 / float(self.config.hz)))
             self._episode_origin = self.client.get_state().pose.copy()
         if self.config.sticky_gripper_closed:
             self.client.close_gripper()
@@ -353,6 +404,11 @@ class BaseIiwaSERLEnv(gym.Env):
     def step(self, action):
         action = np.asarray(action, dtype=np.float32)
         action = np.clip(action, self.action_space.low, self.action_space.high)
+        deadman_blocked = bool(self._require_deadman and not self._deadman)
+        if deadman_blocked:
+            # Do not accumulate a policy/residual command that would jump into
+            # effect when R1 is pressed again.
+            action = np.zeros_like(action)
         current_state = self.client.get_state()
         force_mag = float(np.linalg.norm(np.asarray(current_state.force, dtype=np.float64)))
         baseline = getattr(self, "_force_baseline_n", 0.0)
@@ -360,7 +416,8 @@ class BaseIiwaSERLEnv(gym.Env):
 
         # Contact-retract trigger (per-insert axis via the nominal; NOT hardcoded +Z).
         self._force_retracting = bool(
-            getattr(self.config, "force_retract_enable", False)
+            not deadman_blocked
+            and getattr(self.config, "force_retract_enable", False)
             and (force_mag - baseline) > self.config.force_retract_thresh_n
         )
 
@@ -388,9 +445,13 @@ class BaseIiwaSERLEnv(gym.Env):
                 nominal_target6 = self._nominal.target_pose6()
                 drot = np.zeros(3)
             else:
+                # deadman: when required and R1 not held, freeze the nominal (treat as stop_forward)
+                _freeze = bool(self._stop_forward) or (
+                    self._require_deadman and not self._deadman
+                )
                 rstep = self._nominal.step(
                     dxyz_m=dxyz, drot_rad=drot,
-                    contact=contact, stop_forward=bool(self._stop_forward),
+                    contact=contact, stop_forward=_freeze,
                     action_along_norm=action_along_norm,
                 )
                 nominal_target6 = self._nominal.target_pose6()
@@ -401,7 +462,13 @@ class BaseIiwaSERLEnv(gym.Env):
             drot = np.zeros(3)
 
         command_kind = "move"
-        if nominal_target6 is not None:
+        # SAFETY DEADMAN: when required and R1 not held, HOLD the current measured pose instead of
+        # commanding the nominal/goal target. Freezing only the clock still re-sent the goal pose
+        # every step -> the arm kept driving toward it with R1 released (runaway). Holding the
+        # measured pose makes releasing R1 a true freeze.
+        if self._require_deadman and not self._deadman:
+            target_pose7 = current_state.pose.copy()
+        elif nominal_target6 is not None:
             base_pose7 = pose6_to_pose7(nominal_target6)
             target_pose7 = compose_delta_pose(
                 base_pose7, delta_xyz=np.zeros(3), delta_rot_xyz=drot
@@ -456,6 +523,14 @@ class BaseIiwaSERLEnv(gym.Env):
             # target can wind up outside the box and feel dead after stick reversal.
             self._teleop_target.sync_target(target_pose7)
 
+        if deadman_blocked:
+            # Pin measured joints instead of repeatedly solving toward a Cartesian
+            # target. This cancels interpolation and guarantees no commanded motion
+            # while R1 is released.
+            target_pose7 = current_state.pose.copy()
+            command_kind = "hold"
+            workspace_clipped = False
+
         cycle_start = time.time()
         if getattr(self.config, "debug_step", False):
             # Prove the record-phase integration story: is the measured pose (what we add
@@ -474,7 +549,8 @@ class BaseIiwaSERLEnv(gym.Env):
             self.client.move_pose(target_pose7)
         elif command_kind == "hold":
             self.client.hold_position()
-        self.curr_path_length += 1
+        if not deadman_blocked:
+            self.curr_path_length += 1
         self.prev_action = action.copy()
         dt = time.time() - cycle_start
         time.sleep(max(0.0, (1.0 / float(self.config.hz)) - dt))
@@ -498,15 +574,19 @@ class BaseIiwaSERLEnv(gym.Env):
             "camera_stale": bool(self._camera_stale),
             "workspace_clipped": workspace_clipped,
             "force_retracting": bool(self._force_retracting),
+            "deadman_held": bool(self._deadman),
+            "deadman_blocked": deadman_blocked,
         }
         if self._nominal is not None:
             info["nominal_progress"] = float(self._nominal.progress)
             info["nominal_lateral_offset"] = self._nominal.lateral_offset
-            info["nominal_paused"] = bool(contact or self._stop_forward)
+            info["nominal_paused"] = bool(contact or self._stop_forward or deadman_blocked)
         # #8 (safe, non-behavioural): FLAG steps where the executed motion differs from the raw
         # action — force-retract override or L1 forward-freeze. Stored in the transition so these
         # "shielded" steps CAN be filtered/down-weighted later, without changing current learning.
-        info["shielded"] = bool(self._force_retracting or self._stop_forward)
+        info["shielded"] = bool(
+            self._force_retracting or self._stop_forward or deadman_blocked
+        )
         return obs, reward, terminated, truncated, info
 
     def render(self, mode="rgb_array"):

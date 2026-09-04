@@ -206,11 +206,16 @@ def actor(agent, data_store, intvn_data_store, env, sampling_rng):
                 transition['grasp_penalty']= info['grasp_penalty']
             if 'shielded' in info:                 # #8: flag retract/L1-shielded steps
                 transition['shielded'] = bool(info['shielded'])
-            data_store.insert(transition)
-            transitions.append(copy.deepcopy(transition))
-            if already_intervened:
-                intvn_data_store.insert(transition)
-                demo_transitions.append(copy.deepcopy(transition))
+            # Hardware HIL exposes an R1 level gate. Paused/hold cycles are useful
+            # for UI responsiveness but are not interaction data and must never
+            # enter either replay recording. Environments without the key retain
+            # the upstream behaviour.
+            if bool(info.get("deadman_held", True)):
+                data_store.insert(transition)
+                transitions.append(copy.deepcopy(transition))
+                if already_intervened:
+                    intvn_data_store.insert(transition)
+                    demo_transitions.append(copy.deepcopy(transition))
 
             obs = next_obs
             if done or truncated:
@@ -427,16 +432,21 @@ def main(_):
         jax.tree_map(jnp.array, agent), sharding.replicate()
     )
 
-    if FLAGS.checkpoint_path is not None and os.path.exists(FLAGS.checkpoint_path):
+    _latest_ckpt = (
+        checkpoints.latest_checkpoint(os.path.abspath(FLAGS.checkpoint_path))
+        if (FLAGS.checkpoint_path is not None and os.path.exists(FLAGS.checkpoint_path))
+        else None
+    )
+    if _latest_ckpt is not None:
+        # A real checkpoint file exists -> resume. (An EMPTY dir returns None here and we
+        # just start fresh instead of crashing on os.path.basename(None).)
         input("Checkpoint path already exists. Press Enter to resume training.")
         ckpt = checkpoints.restore_checkpoint(
             os.path.abspath(FLAGS.checkpoint_path),
             agent.state,
         )
         agent = agent.replace(state=ckpt)
-        ckpt_number = os.path.basename(
-            checkpoints.latest_checkpoint(os.path.abspath(FLAGS.checkpoint_path))
-        )[11:]
+        ckpt_number = os.path.basename(_latest_ckpt)[11:]
         print_green(f"Loaded previous checkpoint at step {ckpt_number}.")
 
     def create_replay_buffer_and_wandb_logger():

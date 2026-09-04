@@ -33,16 +33,23 @@ else
   echo "[serl_env] WARNING: ${_deploy_dir}/install/setup.bash not found — build the deploy ws first." >&2
 fi
 
-# 2) SERL/JAX stack: the serl conda env's site-packages, PLUS the editable source dirs (iiwa_serl and
-#    serl_launcher are `pip install -e`, so their code lives in the repo, not in site-packages).
+# 2) SERL/JAX stack: prefer the vendored HIL-SERL Gymnasium launcher. Keep the legacy launcher
+#    later on PYTHONPATH for old scripts, but never let its classic-Gym ChunkingWrapper wrap the
+#    Gymnasium iiwa environment.
 if [ -d "${_serl_site}" ]; then
-  export PYTHONPATH="${_repo_dir}/iiwa_serl:${_repo_dir}/serl_launcher:${_serl_site}:${PYTHONPATH}"
+  # python_compat/sitecustomize.py moves the Conda site directory behind the system
+  # stdlib at interpreter startup, preventing its obsolete typing.py from shadowing
+  # Python 3.10 while leaving Conda's JAX/Gymnasium packages available.
+  export PYTHONPATH="${_repo_dir}/python_compat:${_repo_dir}/iiwa_serl:${_repo_dir}/hil-serl_src/serl_launcher:${_repo_dir}/serl_launcher:${_serl_site}:${PYTHONPATH}"
 else
   echo "[serl_env] WARNING: serl site-packages not found: ${_serl_site} (set SERL_PY_SITE)." >&2
 fi
 
 # 3) Keep SERL on CPU while a PPO train/deploy is using the GPU. Comment out for a GPU SERL run.
 export JAX_PLATFORMS="${JAX_PLATFORMS:-cpu}"
+# Older JAX probes the CUDA toolkit path even when the selected platform is CPU;
+# an explicit valid root avoids its broken namespace-package auto-detection.
+export CUDA_ROOT="${CUDA_ROOT:-/usr}"
 
 echo "[serl_env] ROS=${_ros_distro} | serl_site=${_serl_site} | JAX_PLATFORMS=${JAX_PLATFORMS}"
 echo "[serl_env] verify: python3 -c 'import rclpy, lbr_fri_idl, jax, iiwa_serl; print(\"OK\")'"

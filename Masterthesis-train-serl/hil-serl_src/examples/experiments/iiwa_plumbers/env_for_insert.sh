@@ -16,6 +16,8 @@ _k="${1:?usage: source env_for_insert.sh <k in 0..3>}"
 
 export SERL_ARM_PREFIX="lbr_two"
 export RESIDUAL_ENABLE="${RESIDUAL_ENABLE:-1}"
+# RIGHT-arm wrist D405 = realsense_2 (color-only launch). SERL policy/recorder read this topic.
+export SERL_WRIST_TOPIC="${SERL_WRIST_TOPIC:-/realsense_2/camera/color/image_raw}"
 
 case "$_k" in
   0) export SERL_RESET_JOINTS="-0.719947,0.959996,-0.616195,-1.513854,0.662503,1.263704,0.006226" ;;  # part3 -Z 5mm
