@@ -207,11 +207,15 @@ class ForgeTaskCoolingInsertIiwaCameraCfg(ForgeTaskCoolingInsertCameraCfg):
 
     def __post_init__(self):
         super().__post_init__()
-        # FOV set from the REAL D405 color intrinsics (rs-enumerate-devices, serial 260522275434): the
-        # 16:9 stream is 88.7deg(H) x 57.7deg(V); the policy image is a SQUARE CENTER-CROP -> its FOV =
-        # the vertical FOV ~57.7deg -> focal = 20.955/(2*tan(57.7/2)) = 19.0mm. (Raw 88deg-wide = focal 11
-        # only if the full frame were squished, not cropped.) Own-instance mutation; Franka cam untouched.
-        self.tiled_camera.spawn.focal_length = 19.0
+        # FOV MATCH (2026-09-01, CORRECTED): the deploy does NOT square-crop -- it does a plain 16:9 resize
+        # of the FULL D405 frame to 320x180 with fov_match=False (see deploy obs_preprocessing_we_a.py:
+        # sim_focal_length_mm=11.0). The real D405 color intrinsics (fx=436.3, w=848) => H-FOV
+        # 2*atan(848/(2*436.3))=88.2deg; sim focal 11.0 @ aperture 20.955 => 2*atan(20.955/(2*11.0))=87.2deg,
+        # a byte-for-geometry match. The pdz_v3 CHECKPOINT trained at 11.0 (its params/env.yaml:835), so the
+        # 19.0 square-crop assumption here was WRONG (a stale edit): 19.0 = ~58deg, far too narrow -> sim saw
+        # a zoomed top-down base and CROPPED OUT the welded screw, which the real 88deg view shows prominently.
+        # That narrow-FOV crop is a prime sim2real gap. Restore 11.0 to match deploy + the trained checkpoint.
+        self.tiled_camera.spawn.focal_length = 11.0
 
 
 # --- END-TO-END VISUOMOTOR variant (supervisor-locked 2026-07-30) -------------------------------
@@ -454,7 +458,12 @@ class ForgeTaskCoolingInsertIiwaE2EVisionCfg(ForgeTaskCoolingInsertIiwaCameraCfg
     # search. +3s buys that without over-diluting the success signal. Overridden HERE (iiwa E2E only) so the
     # residual Franka ForgeTaskCoolingInsertCfg (10s) stays untouched.
     episode_length_s: float = 13.0
-    e2e_pos_action_scale: float = 0.005  # metres. 2026-08-26: 0.01->0.005. Halved to kill the RAM: a saturated
+    e2e_pos_action_scale: float = 0.01   # metres. 2026-09-01: 0.005->0.01. The 0.005 halving killed deploy
+    # SPEED (sub-mm/tick -> painfully slow, never reached the hole in the time budget); restore 0.01 for a
+    # ~2x faster approach. The RAM the halving fought is now held by the anti-jam force penalty (thr12/scale2)
+    # + bounds_loss_coef bump instead of a soft action cap. DEPLOY PARITY: the deploy MUST read this same
+    # scale (retrain-matched); confirm the deploy client isn't hardcoding 0.005.  [prev note kept:]
+    # 2026-08-26 the 0.005 was: a saturated
     # down-command (bounds_loss hit 33 last night = actions pinned at +-1) now moves 5mm/step (~7.5cm/s @15Hz),
     # a gentle press instead of a 1cm slam. Attacks the ram at its MECHANISM (max action is now soft), paired
     # with a modest bounds_loss_coef bump (0.0001->0.01, in the agent yaml) that keeps the policy off the rails.
@@ -710,7 +719,16 @@ class ForgeTaskCoolingInsertIiwaE2EVisionCfg(ForgeTaskCoolingInsertIiwaCameraCfg
         # scripts/diag_reset_ik.py (near (0.40,-0.20) + the trimmed far corner) before a full run.
         self.task.fixed_asset_custom_placement = True
         self.task.base_y_clusters = None
-        self.task.fixed_asset_xy_ranges = [0.40, 0.65, -0.55, -0.20]
+        # SIM2REAL BASE PLACEMENT (2026-09-01): the pdz_v3 deploy failed partly because training only ever
+        # placed the base at -Y (behind/left), but the real rig has it IN FRONT (y~0). Actions are TCP-
+        # relative so insertion geometry is unaffected, BUT the wrist camera is an ABSOLUTE world view ->
+        # base-in-front changes scene layout / approach / what's behind the part. Widen Y to span BOTH the
+        # old -Y region AND +Y/in-front (y in [-0.40, +0.40]) so the wrist cam sees the base from every real
+        # layout. The reach-radius rejection (fixed_asset_reach_radius below) resamples/clamps the far
+        # corners (sqrt(0.65^2+0.40^2)=0.76m > 0.72m), so no unreachable plate spawns -- validated via
+        # _sample_custom_fixed_xy's rejection+clamp fallback. Re-run scripts/diag_reset_ik.py at the new
+        # corners (0.65,+-0.40) before the full run to confirm hover-IK.
+        self.task.fixed_asset_xy_ranges = [0.40, 0.65, -0.40, 0.40]
         self.task.fixed_asset_z_center = -0.005   # U[-0.02, +0.01] centre (nominal ~ -0.01)
         self.task.fixed_asset_z_noise = 0.015
         self.task.fixed_asset_reach_radius = 0.72
@@ -743,9 +761,14 @@ class ForgeTaskCoolingInsertIiwaE2EVisionCfg(ForgeTaskCoolingInsertIiwaCameraCfg
         self.control_latency_curriculum_steps = 230000   # ~1800 it (0->2 steps)
         # §8/§13 IMAGE DROPOUT: ramp 0 -> 10% starting at ~epoch 800 (128*800 = 102400 control steps), over
         # ~700 epochs (~90k steps) to full. Forces a force-guided fallback when vision is occluded/dropped.
-        self.image_dropout_prob = 0.10
-        self.image_dropout_start_steps = 102400
-        self.image_dropout_curriculum_steps = 90000
+        # 2026-09-01 sim2real: the wrist view is the LEADING deploy-failure suspect (pose-mismatched +
+        # cluttered real image -> false hole features). Strengthen the force+anchor fallback so the policy
+        # does NOT collapse when the image is unreliable: raise dropout 0.10->0.20 and start the ramp earlier
+        # (ep500 vs ep800) so a meaningful fraction of episodes train blind for longer. Anchor-dropout stays
+        # mutually exclusive, so the policy always keeps >=1 localisation channel (force+anchor, or vision).
+        self.image_dropout_prob = 0.20
+        self.image_dropout_start_steps = 64000       # ~ep500 (128*500)
+        self.image_dropout_curriculum_steps = 120000  # ramp to full over ~940 epochs
         # §8/§4 ANCHOR DROPOUT: corrupt the goal G in the obs only (30% of episodes at full), same ~ep800
         # ramp, MUTUALLY EXCLUSIVE with image-dropout -> the policy always keeps >=1 localisation channel.
         self.anchor_dropout_prob = 0.30
@@ -756,6 +779,19 @@ class ForgeTaskCoolingInsertIiwaE2EVisionCfg(ForgeTaskCoolingInsertIiwaCameraCfg
         # "not centered" and the penalty stays FLAT (no unbounded drift blow-up). 12s episodes give search
         # room over w2's 10s without v1's 18s over-amplification.
         self.e2e_reward_center_cap = 0.02
+        # PROCEDURAL BACKGROUND CLUTTER (2026-09-01 sim2real): the sim wrist view was a clean grey ground
+        # plane, but the real wrist view is heavy clutter (rails, cables, hand, table edges). The frozen
+        # ResNet latched onto real background edges as false hole features. Spawn a per-env vertical panel
+        # behind the workspace with a full-random albedo per reset so the policy never sees a clean grey
+        # background and must localise the hole from the part. (A captured-image texture set can layer on
+        # later; a solid random panel is the immediate procedural version.) See InsertionEnv._setup_backdrop.
+        # BACKDROP DR DISABLED (2026-09-01): a flat opaque panel at table height (base sits ~z=0 too) occluded
+        # the base -> the wrist saw a solid colour sheet, no base. The camera itself is CORRECT (screw+gripper+
+        # base frame like the real image without it). Deferred fix: tint the EXISTING table per-env instead
+        # (already the wrist background, never occludes the base). Code/fields kept for that follow-up.
+        self.randomize_backdrop = False
+        self.backdrop_size = (1.6, 1.6, 0.01)
+        self.backdrop_pos = (0.525, 0.0, 0.001)
         # HEAVY APPEARANCE DR (base is vivid BLUE; explicit-estimator over-trusted a clean look):
         self.rgb_noise_std = 0.03
         self.photo_gain_rgb = 0.30            # per-channel gain in [0.7,1.3]

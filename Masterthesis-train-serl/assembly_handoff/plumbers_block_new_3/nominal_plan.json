@@ -1,0 +1,514 @@
+{
+  "meta": {
+    "assembly": "plumbers_block",
+    "assembly_dir": "assets/fabrica/plumbers_block",
+    "log_dir": "logs/kuka_pdz8_cm_aruco/plumbers_block_new_3",
+    "arm_type": "kuka",
+    "gripper_type": "pdz",
+    "n_active_joints": 7,
+    "part_ids": [
+      "0",
+      "1",
+      "2",
+      "3",
+      "4"
+    ],
+    "inserted_parts_in_order": [
+      "3",
+      "1",
+      "0",
+      "4"
+    ],
+    "holder_part_ids": [
+      "2"
+    ],
+    "n_insertions": 4,
+    "n_motion_segments": 43,
+    "n_commands": 39,
+    "actor_role": {
+      "move": "inserting arm (real_robot robot_right / robot_num 2)",
+      "hold": "holder arm (real_robot robot_left / robot_num 1)"
+    },
+    "assembly_max_speed_cm_s": 0.3,
+    "transport_max_speed_cm_s": 4.0,
+    "stream_dt_s_non_insertion": 0.1
+  },
+  "segments": [
+    {
+      "segment_index": 0,
+      "actor": "move",
+      "kind": "arm",
+      "task": "init",
+      "active_part": null,
+      "n_waypoints": 1,
+      "dof": 7,
+      "traj_key": "seg000_move_init",
+      "traj_shape": [
+        1,
+        7
+      ]
+    },
+    {
+      "segment_index": 1,
+      "actor": "hold",
+      "kind": "arm",
+      "task": "init",
+      "active_part": null,
+      "n_waypoints": 1,
+      "dof": 7,
+      "traj_key": "seg001_hold_init",
+      "traj_shape": [
+        1,
+        7
+      ]
+    },
+    {
+      "segment_index": 2,
+      "actor": "move",
+      "kind": "gripper",
+      "task": "init",
+      "active_part": null,
+      "gripper_command": 0.5
+    },
+    {
+      "segment_index": 3,
+      "actor": "hold",
+      "kind": "gripper",
+      "task": "init",
+      "active_part": null,
+      "gripper_command": 0.5
+    },
+    {
+      "segment_index": 4,
+      "actor": "hold",
+      "kind": "gripper",
+      "task": "open",
+      "active_part": null,
+      "gripper_command": 0.5375
+    },
+    {
+      "segment_index": 5,
+      "actor": "hold",
+      "kind": "arm",
+      "task": "transport",
+      "active_part": null,
+      "n_waypoints": 310,
+      "dof": 7,
+      "traj_key": "seg005_hold_transport",
+      "traj_shape": [
+        310,
+        7
+      ]
+    },
+    {
+      "segment_index": 6,
+      "actor": "hold",
+      "kind": "gripper",
+      "task": "close",
+      "active_part": null,
+      "gripper_command": 0.4375
+    },
+    {
+      "segment_index": 7,
+      "actor": "hold",
+      "kind": "arm",
+      "task": "transport",
+      "active_part": "2",
+      "n_waypoints": 537,
+      "dof": 7,
+      "traj_key": "seg007_hold_transport",
+      "traj_shape": [
+        537,
+        7
+      ]
+    },
+    {
+      "segment_index": 8,
+      "actor": "move",
+      "kind": "gripper",
+      "task": "open",
+      "active_part": null,
+      "gripper_command": 0.5375
+    },
+    {
+      "segment_index": 9,
+      "actor": "move",
+      "kind": "arm",
+      "task": "switch",
+      "active_part": null,
+      "n_waypoints": 334,
+      "dof": 7,
+      "traj_key": "seg009_move_switch",
+      "traj_shape": [
+        334,
+        7
+      ]
+    },
+    {
+      "segment_index": 10,
+      "actor": "move",
+      "kind": "gripper",
+      "task": "close",
+      "active_part": null,
+      "gripper_command": 0.4375
+    },
+    {
+      "segment_index": 11,
+      "actor": "move",
+      "kind": "arm",
+      "task": "transport",
+      "active_part": "3",
+      "n_waypoints": 383,
+      "dof": 7,
+      "traj_key": "seg011_move_transport",
+      "traj_shape": [
+        383,
+        7
+      ]
+    },
+    {
+      "segment_index": 12,
+      "actor": "move",
+      "kind": "arm",
+      "task": "assembly",
+      "active_part": "3",
+      "n_waypoints": 30,
+      "dof": 7,
+      "traj_key": "seg012_move_assembly",
+      "traj_shape": [
+        30,
+        7
+      ]
+    },
+    {
+      "segment_index": 13,
+      "actor": "move",
+      "kind": "gripper",
+      "task": "open",
+      "active_part": null,
+      "gripper_command": 0.5375
+    },
+    {
+      "segment_index": 14,
+      "actor": "move",
+      "kind": "arm",
+      "task": "transport",
+      "active_part": null,
+      "n_waypoints": 166,
+      "dof": 7,
+      "traj_key": "seg014_move_transport",
+      "traj_shape": [
+        166,
+        7
+      ]
+    },
+    {
+      "segment_index": 15,
+      "actor": "move",
+      "kind": "arm",
+      "task": "switch",
+      "active_part": null,
+      "n_waypoints": 166,
+      "dof": 7,
+      "traj_key": "seg015_move_switch",
+      "traj_shape": [
+        166,
+        7
+      ]
+    },
+    {
+      "segment_index": 16,
+      "actor": "move",
+      "kind": "gripper",
+      "task": "open",
+      "active_part": null,
+      "gripper_command": 0.302656291603405
+    },
+    {
+      "segment_index": 17,
+      "actor": "move",
+      "kind": "gripper",
+      "task": "close",
+      "active_part": null,
+      "gripper_command": 0.20265629160340498
+    },
+    {
+      "segment_index": 18,
+      "actor": "move",
+      "kind": "arm",
+      "task": "transport",
+      "active_part": "1",
+      "n_waypoints": 350,
+      "dof": 7,
+      "traj_key": "seg018_move_transport",
+      "traj_shape": [
+        350,
+        7
+      ]
+    },
+    {
+      "segment_index": 19,
+      "actor": "move",
+      "kind": "arm",
+      "task": "assembly",
+      "active_part": "1",
+      "n_waypoints": 280,
+      "dof": 7,
+      "traj_key": "seg019_move_assembly",
+      "traj_shape": [
+        280,
+        7
+      ]
+    },
+    {
+      "segment_index": 20,
+      "actor": "move",
+      "kind": "gripper",
+      "task": "open",
+      "active_part": null,
+      "gripper_command": 0.302656291603405
+    },
+    {
+      "segment_index": 21,
+      "actor": "move",
+      "kind": "arm",
+      "task": "transport",
+      "active_part": null,
+      "n_waypoints": 191,
+      "dof": 7,
+      "traj_key": "seg021_move_transport",
+      "traj_shape": [
+        191,
+        7
+      ]
+    },
+    {
+      "segment_index": 22,
+      "actor": "move",
+      "kind": "gripper",
+      "task": "open",
+      "active_part": null,
+      "gripper_command": 0.580045625
+    },
+    {
+      "segment_index": 23,
+      "actor": "move",
+      "kind": "arm",
+      "task": "switch",
+      "active_part": null,
+      "n_waypoints": 260,
+      "dof": 7,
+      "traj_key": "seg023_move_switch",
+      "traj_shape": [
+        260,
+        7
+      ]
+    },
+    {
+      "segment_index": 24,
+      "actor": "move",
+      "kind": "gripper",
+      "task": "close",
+      "active_part": null,
+      "gripper_command": 0.48004562500000003
+    },
+    {
+      "segment_index": 25,
+      "actor": "move",
+      "kind": "arm",
+      "task": "transport",
+      "active_part": "0",
+      "n_waypoints": 303,
+      "dof": 7,
+      "traj_key": "seg025_move_transport",
+      "traj_shape": [
+        303,
+        7
+      ]
+    },
+    {
+      "segment_index": 26,
+      "actor": "move",
+      "kind": "arm",
+      "task": "assembly",
+      "active_part": "0",
+      "n_waypoints": 349,
+      "dof": 7,
+      "traj_key": "seg026_move_assembly",
+      "traj_shape": [
+        349,
+        7
+      ]
+    },
+    {
+      "segment_index": 27,
+      "actor": "move",
+      "kind": "gripper",
+      "task": "open",
+      "active_part": null,
+      "gripper_command": 0.580045625
+    },
+    {
+      "segment_index": 28,
+      "actor": "move",
+      "kind": "arm",
+      "task": "transport",
+      "active_part": null,
+      "n_waypoints": 179,
+      "dof": 7,
+      "traj_key": "seg028_move_transport",
+      "traj_shape": [
+        179,
+        7
+      ]
+    },
+    {
+      "segment_index": 29,
+      "actor": "hold",
+      "kind": "gripper",
+      "task": "open",
+      "active_part": null,
+      "gripper_command": 0.5375
+    },
+    {
+      "segment_index": 30,
+      "actor": "hold",
+      "kind": "arm",
+      "task": "switch",
+      "active_part": null,
+      "n_waypoints": 435,
+      "dof": 7,
+      "traj_key": "seg030_hold_switch",
+      "traj_shape": [
+        435,
+        7
+      ]
+    },
+    {
+      "segment_index": 31,
+      "actor": "hold",
+      "kind": "gripper",
+      "task": "close",
+      "active_part": null,
+      "gripper_command": 0.4375
+    },
+    {
+      "segment_index": 32,
+      "actor": "move",
+      "kind": "arm",
+      "task": "switch",
+      "active_part": null,
+      "n_waypoints": 377,
+      "dof": 7,
+      "traj_key": "seg032_move_switch",
+      "traj_shape": [
+        377,
+        7
+      ]
+    },
+    {
+      "segment_index": 33,
+      "actor": "move",
+      "kind": "gripper",
+      "task": "open",
+      "active_part": null,
+      "gripper_command": 0.3026555110673165
+    },
+    {
+      "segment_index": 34,
+      "actor": "move",
+      "kind": "gripper",
+      "task": "close",
+      "active_part": null,
+      "gripper_command": 0.20265551106731644
+    },
+    {
+      "segment_index": 35,
+      "actor": "move",
+      "kind": "arm",
+      "task": "transport",
+      "active_part": "4",
+      "n_waypoints": 860,
+      "dof": 7,
+      "traj_key": "seg035_move_transport",
+      "traj_shape": [
+        860,
+        7
+      ]
+    },
+    {
+      "segment_index": 36,
+      "actor": "move",
+      "kind": "arm",
+      "task": "assembly",
+      "active_part": "4",
+      "n_waypoints": 293,
+      "dof": 7,
+      "traj_key": "seg036_move_assembly",
+      "traj_shape": [
+        293,
+        7
+      ]
+    },
+    {
+      "segment_index": 37,
+      "actor": "move",
+      "kind": "gripper",
+      "task": "open",
+      "active_part": null,
+      "gripper_command": 0.3026555110673165
+    },
+    {
+      "segment_index": 38,
+      "actor": "move",
+      "kind": "arm",
+      "task": "transport",
+      "active_part": null,
+      "n_waypoints": 251,
+      "dof": 7,
+      "traj_key": "seg038_move_transport",
+      "traj_shape": [
+        251,
+        7
+      ]
+    },
+    {
+      "segment_index": 39,
+      "actor": "hold",
+      "kind": "gripper",
+      "task": "open",
+      "active_part": null,
+      "gripper_command": 0.5375
+    },
+    {
+      "segment_index": 40,
+      "actor": "hold",
+      "kind": "arm",
+      "task": "transport",
+      "active_part": null,
+      "n_waypoints": 377,
+      "dof": 7,
+      "traj_key": "seg040_hold_transport",
+      "traj_shape": [
+        377,
+        7
+      ]
+    },
+    {
+      "segment_index": 41,
+      "actor": "hold",
+      "kind": "gripper",
+      "task": "close",
+      "active_part": null,
+      "gripper_command": 0.5
+    },
+    {
+      "segment_index": 42,
+      "actor": "move",
+      "kind": "gripper",
+      "task": "close",
+      "active_part": null,
+      "gripper_command": 0.5
+    }
+  ]
+}

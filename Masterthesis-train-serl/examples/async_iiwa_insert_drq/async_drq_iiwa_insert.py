@@ -68,6 +68,13 @@ flags.DEFINE_integer("checkpoint_period", 0, "Checkpoint frequency.")
 flags.DEFINE_string("checkpoint_path", None, "Checkpoint path.")
 flags.DEFINE_boolean("debug", False, "Disable external logging.")
 flags.DEFINE_string("log_rlds_path", None, "Optional RLDS log directory.")
+flags.DEFINE_boolean(
+    "manual_reset",
+    False,
+    "Real-robot MANUAL reset: before every episode the operator jogs the peg to a pre-insert "
+    "pose (hold R1 + sticks) and presses X, exactly like record_demo. Env does NOT auto-move on "
+    "reset (no FRI-drop lurch). Use for base-anywhere training. Disables periodic eval.",
+)
 
 devices = jax.local_devices()
 num_devices = len(devices)
@@ -83,6 +90,31 @@ def make_env(fake_env: bool = False):
     if "Real" in FLAGS.env:
         kwargs["fake_env"] = fake_env
     env = gym.make(FLAGS.env, **kwargs)
+    if FLAGS.manual_reset and "Real" in FLAGS.env:
+        # Same manual pre-insert workflow as record_demo: reset() captures the CURRENT pose as
+        # the episode origin (NO auto-move → no FRI-drop lurch), workspace box is relative to it,
+        # and env.step drives base-frame to match the jog feel. The operator jogs to pre-insert
+        # BEFORE each reset (see jog_to_preinsert in the actor).
+        cfg = env.unwrapped.config
+        cfg.manual_reset = True
+        cfg.relative_pose_limit = True
+        cfg.base_frame_actions = True
+        cfg.reward_mode = "manual"   # success = operator presses X (visual ground truth). The
+                                     # force_depth auto-check was unusable (uncompensated force);
+                                     # even with the external_torque fix, use manual X first.
+        # D405 intermittently freezes (multi-second USB stalls). Reuse the last good frame
+        # through a gap instead of crashing the actor mid-run (same as record_demo). Only helps
+        # AFTER the first frame has arrived — the camera must be live at startup.
+        cfg.reuse_last_camera_frame = True
+        # Gentler motion so early random/unconverged actions don't ram the socket and drop FRI.
+        # Halve XY, quarter Z (Z into a hard surface builds force fastest).
+        cfg.action_scale_xyz_m = 0.005                       # 10mm -> 5mm base step
+        cfg.action_scale_xyz_mult = np.array([1.0, 1.0, 0.5])  # Z half again -> 2.5mm/step
+        cfg.action_scale_rot_rad = 0.05                      # gentler rotation too
+        # Force-triggered retract: back off if contact force exceeds threshold, before FRI drops.
+        cfg.force_retract_enable = True
+        cfg.force_retract_thresh_n = 25.0                    # TUNE at rig, below the FRI drop point
+        cfg.force_retract_step_m = 0.003
     # The iiwa env already emits a flat {"state", <image_keys>} obs dict (no nested
     # "images" group), so SERLObsWrapper is not needed here. But the memory-efficient
     # replay buffer requires image observations to carry a temporal axis
@@ -108,8 +140,102 @@ def actor(agent: DrQAgent, data_store, env, sampling_rng):
 
     client.recv_network_callback(update_params)
 
-    eval_env = gym.wrappers.RecordEpisodeStatistics(make_env(fake_env=False))
-    obs, _ = env.reset()
+    # --- Manual pre-insert reset (base-anywhere) -------------------------------------------
+    # Copies the WORKING record_demo jog: hold R1 + sticks to drive the peg to a pre-insert
+    # pose, press X to arm. Then env.reset() (manual_reset) captures that pose as the episode
+    # origin without auto-moving. This is what avoids the FRI-drop lurch of auto-reset.
+    teleop = None
+    jog_target = None
+    pygame = None
+    if FLAGS.manual_reset:
+        import pygame
+
+        from iiwa_serl.teleop import PS4TeleopProvider
+        from iiwa_serl.teleop.pose_target import TeleopPoseTarget
+        teleop = PS4TeleopProvider(joystick_index=0, server_url=None)
+        _rc = env.unwrapped.config
+        jog_target = TeleopPoseTarget(
+            np.array([0.004, 0.004, _rc.action_scale_xyz_m * _rc.action_scale_xyz_mult[2]]),
+            _rc.action_scale_rot_rad,
+            base_frame_actions=True,
+        )
+
+    def poll_manual_buttons():
+        """Poll motion state and consume manual-result buttons exactly once.
+
+        The policy loop can block in inference/env.step long enough for a quick press and
+        release to occur between get_button() snapshots. JOYBUTTONDOWN remains queued, so
+        use it as the reliable edge source while retaining the provider's polled flags as
+        a fallback. Always consume both flags so jog events cannot leak into an episode.
+        """
+        teleop_action = teleop.get_action()
+        queued = pygame.event.get([pygame.JOYBUTTONDOWN, pygame.JOYBUTTONUP])
+
+        js = teleop._js
+        js_instance = js.get_instance_id() if hasattr(js, "get_instance_id") else None
+
+        def is_this_joystick(event):
+            event_instance = getattr(event, "instance_id", None)
+            if js_instance is not None and event_instance is not None:
+                return event_instance == js_instance
+            return getattr(event, "joy", 0) == 0
+
+        button_down = {
+            int(event.button)
+            for event in queued
+            if event.type == pygame.JOYBUTTONDOWN and is_this_joystick(event)
+        }
+        cross = int(teleop._cfg["btn_cross"])
+        triangle = int(teleop._cfg["btn_triangle"])
+        success = teleop.is_success()
+        failure = teleop.is_failure()
+        success = success or cross in button_down
+        failure = failure or triangle in button_down
+
+        # TEMP live diagnostic: confirms the controller's actual SDL button indices.
+        if button_down:
+            raw_pressed = [
+                i for i in range(js.get_numbuttons()) if js.get_button(i)
+            ]
+            print(
+                f"\n[PS4 BUTTONS] down={sorted(button_down)} raw_pressed={raw_pressed} "
+                f"configured(X={cross}, Triangle={triangle})",
+                flush=True,
+            )
+        return teleop_action, success, failure
+
+    def jog_to_preinsert():
+        """Operator jogs peg to pre-insert (hold R1 + sticks), presses X to arm. Then returns
+        env.reset() which captures the current pose as the episode origin (no auto-move)."""
+        rob = env.unwrapped.client
+        print("\n[TRAIN] JOG peg to PRE-INSERT pose (hold R1 + sticks). Press X when ready...")
+        rob.hold_position()
+        time.sleep(1.0 / float(env.unwrapped.config.hz))
+        jog_target.reset(rob.get_state().pose.copy())
+        while True:
+            loop_start = time.monotonic()
+            action, arm_pressed, _ = poll_manual_buttons()
+            if arm_pressed:                         # X = armed
+                rob.hold_position()
+                break
+            measured = rob.get_state().pose.copy()
+            command = jog_target.update(action, measured)
+            if command.kind == "move":
+                rob.move_pose(command.target_pose)
+            elif command.kind == "hold":
+                rob.hold_position()
+            time.sleep(max(0.0, 1.0 / float(env.unwrapped.config.hz) - (time.monotonic() - loop_start)))
+        print("[TRAIN] Armed — episode running.")
+        return env.reset()
+
+    eval_env = None
+    if not FLAGS.manual_reset:
+        eval_env = gym.wrappers.RecordEpisodeStatistics(make_env(fake_env=False))
+
+    if FLAGS.manual_reset:
+        obs, _ = jog_to_preinsert()
+    else:
+        obs, _ = env.reset()
     timer = Timer()
 
     for step in tqdm.tqdm(range(FLAGS.max_steps), dynamic_ncols=True):
@@ -126,8 +252,29 @@ def actor(agent: DrQAgent, data_store, env, sampling_rng):
                 )
                 action = np.asarray(jax.device_get(action))
 
+        # Manual reward: operator presses X (success) / triangle (abort) DURING the episode.
+        # X -> reward=1, end episode as success. Triangle -> end with no reward.
+        manual_success = False
+        manual_abort = False
+        if FLAGS.manual_reset and teleop is not None:
+            _, manual_success, manual_abort = poll_manual_buttons()
+            # Abort wins if both buttons are pressed together. Do not execute another
+            # policy move after an operator termination request.
+            if manual_abort:
+                manual_success = False
+            if manual_success or manual_abort:
+                action = np.zeros_like(action)
+            if manual_success:
+                env.unwrapped.set_manual_success(True)  # env._success() returns True this step
+
         with timer.context("step_env"):
             next_obs, reward, done, truncated, info = env.step(action)
+            if manual_success:
+                reward = 1.0
+                done = True
+            elif manual_abort:
+                reward = 0.0
+                done = True
             transition = dict(
                 observations=obs,
                 actions=action,
@@ -139,12 +286,21 @@ def actor(agent: DrQAgent, data_store, env, sampling_rng):
             data_store.insert(transition)
             obs = next_obs
             if done or truncated:
-                obs, _ = env.reset()
+                if manual_success:
+                    print_green(f"  [SUCCESS] operator marked seat at step {step}")
+                elif manual_abort:
+                    print(f"\n[ABORT] operator ended episode at step {step}", flush=True)
+                if FLAGS.manual_reset:
+                    obs, _ = jog_to_preinsert()
+                else:
+                    obs, _ = env.reset()
 
         if step % FLAGS.steps_per_update == 0:
             client.update()
 
-        if step % FLAGS.eval_period == 0:
+        # Periodic eval runs un-gated env.reset()s (no jog) — incompatible with manual reset,
+        # so skip it there. You are watching the arm live anyway.
+        if not FLAGS.manual_reset and step % FLAGS.eval_period == 0:
             with timer.context("eval"):
                 stats = evaluate(
                     policy_fn=lambda observations, **_: agent.sample_actions(

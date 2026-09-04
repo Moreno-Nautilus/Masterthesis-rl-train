@@ -108,3 +108,28 @@ gym.register(
         "rl_games_cfg_entry_point": f"{__name__}.agents:rl_games_camera_ppo_cfg.yaml",
     },
 )
+
+# 2nd generalization target ("across parts + direction"): pb-assembly HORIZONTAL PIPE insertion (pb_pipe
+# driven horizontally into pb_base's Y through-bore). Modelled EXACTLY like the cooling E2E-iiwa visuomotor
+# task (same iiwa7+pdz robot, IK+PD controller, RGB wrist cam, appearance/dynamics DR, goal-anchor noise,
+# squashing reward + all curricula); only the parts + incoming direction change (pb_pipe_horiz_tasks_cfg /
+# assets_cfg). InsertionEnvE2EIiwa is reused unchanged. NEEDS a render/smoke pass before training (geometry
+# marked TODO-tune). See memory pb-pipe-horizontal-geometry.
+gym.register(
+    id="Isaac-Insertion-PbPipe-Iiwa-E2E-Direct-v0",  # STATE-first debug scaffold (no camera)
+    entry_point=f"{__name__}.insertion_env_e2e_iiwa:InsertionEnvE2EIiwa",
+    disable_env_checker=True,
+    kwargs={
+        "env_cfg_entry_point": f"{__name__}.pb_pipe_horiz_tasks_cfg:ForgeTaskPbPipeHorizInsertIiwaE2ECfg",
+        "rl_games_cfg_entry_point": f"{__name__}.agents:rl_games_e2e_state_ppo_cfg.yaml",
+    },
+)
+gym.register(
+    id="Isaac-Insertion-PbPipe-Iiwa-E2E-Vision-Direct-v0",  # the weekend training target
+    entry_point=f"{__name__}.insertion_env_e2e_iiwa:InsertionEnvE2EIiwa",
+    disable_env_checker=True,
+    kwargs={
+        "env_cfg_entry_point": f"{__name__}.pb_pipe_horiz_tasks_cfg:ForgeTaskPbPipeHorizInsertIiwaE2EVisionCfg",
+        "rl_games_cfg_entry_point": f"{__name__}.agents:rl_games_e2e_vision_ppo_cfg.yaml",
+    },
+)

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import asdict, dataclass
+import os
 import time
 from typing import Any
 
@@ -61,6 +62,13 @@ class RobotServerClient:
     def move_pose(self, pose7: np.ndarray) -> None:
         self._post("pose", {"pose": np.asarray(pose7, dtype=np.float64).tolist()})
 
+    def move_joint_delta(self, dq7: np.ndarray) -> None:
+        self._post("joint_delta", {"dq": np.asarray(dq7, dtype=np.float64).tolist()})
+
+    def hold_position(self) -> None:
+        """Pin the measured joints without passing a zero delta through Cartesian IK."""
+        self._post("hold")
+
     def get_state(self) -> RobotState:
         try:
             payload = self._post("getstate")
@@ -78,8 +86,22 @@ class RobotServerClient:
             }
         return RobotState.from_json(payload)
 
-    def joint_reset(self) -> None:
-        self._post("jointreset")
+    def joint_reset(self, target_q=None) -> None:
+        # #3: a bounded joint reset move (0.01 rad/step over up to ~1 rad) plus convergence wait can
+        # take several seconds — far longer than the default 2 s. Use a reset-specific timeout so the
+        # HTTP call doesn't abort mid-move (which would leave the arm partway and skip fail-closed).
+        payload = {"q": list(map(float, target_q))} if target_q is not None else None
+        prev = self.timeout_s
+        try:
+            self.timeout_s = float(os.environ.get("SERL_RESET_TIMEOUT_S", "20.0"))
+            self._post("jointreset", payload)
+        finally:
+            self.timeout_s = prev
+
+    def fk(self, q) -> np.ndarray:
+        """FK an arbitrary joint vector -> base-frame TCP pose7 (xyzw), via the server."""
+        resp = self._post("fk", {"q": list(map(float, q))})
+        return np.asarray(resp["pose"], dtype=np.float64)
 
     def clear_errors(self) -> None:
         self._post("clearerr")
@@ -110,11 +132,44 @@ class LocalBackendClient:
     def move_pose(self, pose7: np.ndarray) -> None:
         self.backend.move_pose(np.asarray(pose7, dtype=np.float64))
 
+    def move_joint_delta(self, dq7: np.ndarray) -> None:
+        dq7 = np.asarray(dq7, dtype=np.float64)
+        fn = getattr(self.backend, "move_joint_delta", None)
+        if fn is not None:
+            fn(dq7)
+        elif np.any(dq7 != 0.0):
+            raise NotImplementedError("Local backend has no move_joint_delta implementation")
+
+    def hold_position(self) -> None:
+        """Local equivalent of RobotServerClient.hold_position()."""
+        hold = getattr(self.backend, "hold_position", None)
+        if hold is not None:
+            hold()
+            return
+        fn = getattr(self.backend, "move_joint_delta", None)
+        if fn is not None:
+            fn(np.zeros(7, dtype=np.float64))
+            return
+        # Mock/legacy local backends have no joint command surface.  Re-sending
+        # their exact pose is safe and keeps fake-env tests API-compatible.
+        self.backend.move_pose(self.backend.get_state().pose.copy())
+
     def get_state(self) -> RobotState:
         return self.backend.get_state()
 
-    def joint_reset(self) -> None:
-        self.backend.reset_joints()
+    def joint_reset(self, target_q=None) -> None:
+        fn = self.backend.reset_joints
+        try:
+            fn(target_q=target_q)
+        except TypeError:
+            fn()  # legacy backend without target_q support
+
+    def fk(self, q) -> np.ndarray:
+        fn = getattr(self.backend, "fk", None)
+        if fn is not None:
+            return np.asarray(fn(q), dtype=np.float64)
+        # Mock/legacy fallback: no kinematics — return current pose (goal ~= reset for fake_env).
+        return np.asarray(self.backend.get_state().pose, dtype=np.float64)
 
     def clear_errors(self) -> None:
         self.backend.clear_errors()

@@ -80,7 +80,12 @@ class PbTop(FixedAssetCfg):
 class PbBase(FixedAssetCfg):
     """Fixed receptacle (FIRST-CUT screw target): 160x40x65mm bracket with Ø10mm screw holes at x=+/-40mm
     in its upper region (these align with PbTop's holes; the x=+/-65mm holes are mounting, not the screw
-    path). Used alone for the first smoke; the assembled pb_top on top is the documented next step."""
+    path). Used alone for the first smoke; the assembled pb_top on top is the documented next step.
+
+    ALSO the fixed receptacle for the HORIZONTAL PIPE task (pb_pipe_horiz_tasks_cfg). For that task the SAME
+    bracket exposes a large THROUGH-BORE running along its local Y (the 4cm-thin axis): measured Ø ~5.6cm at
+    stations near x=+/-5cm (mesh scan 2026-08-28). The `diameter`/`height` below are the SCREW-task values;
+    the pipe task OVERRIDES them via PbBasePipeSocket (a different bore) so this class stays screw-valid."""
 
     usd_path = f"{ASSET_DIR}/pb_base.usd"
     diameter = 0.010  # Ø10 screw socket (Ø9.5 shank + ~0.5mm clearance)
@@ -88,3 +93,44 @@ class PbBase(FixedAssetCfg):
     base_height = 0.0
     mass = 10.0  # glued/immovable (real ~236g); kept dynamic + high-friction like CoolingBase
     friction = 1.0
+
+
+# ---------------------------------------------------------------------------------------------------
+# HORIZONTAL PIPE insertion (2nd generalization target, 2026-08-28): pb_pipe driven HORIZONTALLY into
+# pb_base's through-bore. Measured from the raw meshes (scripts scan; units cm -> x0.01 = m):
+#   pb_pipe: hollow flattened TUBE, LONG AXIS = local Y (80mm). Cross-section flattened -> +/-X faces are
+#            the FLATS (42.7mm apart, the grasp faces), +/-Z is taller (49.5mm); OD ~49.5mm, ID ~22.4mm.
+#   pb_base: THROUGH-BORE along local Y (the 40mm-thin axis), Ø ~56mm at stations near x=+/-50mm, z~center.
+# The gripper grasps the pipe across its FLAT +/-X faces near ONE Y-end, from above (gripper Z down); the
+# pipe's long axis is then ~90deg to gripper Z (sticks out sideways = horizontal). The base is placed with
+# its long axis (local Y=bore axis... see note) oriented so the bore mouth faces the incoming pipe.
+# Geometry marked TODO-tune are first-bring-up approximations, refined once the env smoke-steps + renders.
+# ---------------------------------------------------------------------------------------------------
+@configclass
+class PbPipe(HeldAssetCfg):
+    """Held part: pb assembly PIPE. Hollow flattened tube, long axis = mesh-local Y (80mm), OD ~49.5mm /
+    ID ~22.4mm, +/-X faces flat (42.7mm across = the grasp width)."""
+
+    usd_path = f"{ASSET_DIR}/pb_pipe.usd"
+    # `diameter` = gripper width -> the jaws close across the FLAT +/-X faces (42.7mm). VERIFY in viz.
+    diameter = 0.0427
+    # `height` in the Factory grasp formula = the part length ALONG the grasped/insertion axis. For the pipe
+    # the insertable length is the tube length (80mm) but we grasp near one END, so the protruding insertable
+    # stub is ~half. Set to the full 80mm here; the grasp offset (franka_fingerpad_length) + hand_init trim
+    # the effective TCP->tip at smoke. TODO-tune against render_grasp_grid.
+    height = 0.080
+    # Mesh volume ~113 cm^3 -> ~113g if solid @1g/cm^3; the real print is hollow-walled (lighter). The rigid
+    # WELD carries it regardless, so this is not load-bearing for control. TODO-set from the real part mass.
+    mass = 0.113
+
+
+@configclass
+class PbBasePipeSocket(PbBase):
+    """pb_base as the HORIZONTAL-PIPE receptacle: same USD/mass/friction as PbBase, but the socket geometry
+    describes the large Y through-bore (not the Ø10 screw hole). Ø ~56mm bore vs the pipe OD ~49.5mm ->
+    radial clearance ~3mm (looser than cooling's ~1mm). height = the seat DEPTH along the bore. Both
+    diameter + height are mesh-scan first cuts -> TODO-tune at the render/smoke pass."""
+
+    diameter = 0.056   # bore Ø (pipe OD 49.5 + ~2x3mm clearance) -- TODO-tune at smoke
+    height = 0.030     # seat depth along the bore (how far the pipe drives in) -- TODO-tune at smoke
+    base_height = 0.0

@@ -75,9 +75,15 @@ def _aim_scene_camera(u):
 
 
 def _to_frame(u, env_idx, far):
-    """Build one (H, 2W, 3) uint8 frame: raw RGB | depth (grayscale), side by side."""
+    """Build one uint8 frame: raw RGB, plus depth side-by-side IF the camera outputs depth.
+
+    RGB-only tasks (e.g. pdz_v3) have no 'depth' key -> return just the RGB frame.
+    """
     out = u._tiled_camera.data.output
     rgb = out["rgb"][env_idx, :, :, :3].clamp(0, 255).to(torch.uint8).cpu().numpy()
+
+    if "depth" not in out:
+        return rgb  # RGB-only policy view
 
     depth = out["depth"][env_idx].clone().float()
     depth[~torch.isfinite(depth)] = 0.0

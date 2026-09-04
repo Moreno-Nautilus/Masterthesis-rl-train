@@ -342,6 +342,16 @@ class ForgeTaskCoolingInsertCameraCfg(ForgeTaskCoolingInsertCfg):
     # Fail-safe: self-disables on any USD error (can't kill a run). See _setup_part_materials.
     randomize_part_materials: bool = True
     material_base_color: tuple = (0.10, 0.15, 0.55)  # BLUE base (matches the real printed base); per-env jitter added on top
+    # PROCEDURAL BACKGROUND CLUTTER (2026-09-01 sim2real): spawn a per-env vertical panel behind the
+    # workspace with a full-random albedo per reset, so the wrist view is never a clean grey ground plane
+    # (the frozen ResNet latched onto real background edges as false hole features). See
+    # InsertionEnv._setup_backdrop / _randomize_backdrop. Default OFF -> other tasks unchanged.
+    randomize_backdrop: bool = False
+    # HORIZONTAL ground-cover panel: the wrist cam looks DOWN, so the background it sees is the ground
+    # AROUND/UNDER the base -- a flat tinted cover there fills the wrist frame (a vertical panel sat outside
+    # the downward frustum). Big enough to span the base placement box; z just below the base rim.
+    backdrop_size: tuple = (1.6, 1.6, 0.01)   # (x,y,z) m: wide flat cover
+    backdrop_pos: tuple = (0.525, 0.0, 0.001)  # env-local: centred on the plate placement box, under the rim
     # PER-PART COLOURS (2026-08-19 RGB-only rebuild): give the screw and base DISTINCT base colours (the
     # real parts differ: red screw, blue base), each with its OWN per-env jitter, instead of one shared
     # scene colour +/- a small part divergence. When True, _randomize_part_materials draws screw ~

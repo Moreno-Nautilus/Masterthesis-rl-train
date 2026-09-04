@@ -1,7 +1,5 @@
-try:
-    from gym.envs.registration import register
-except ImportError:
-    from gymnasium.envs.registration import register
+# #5: register with gymnasium (the vendored HIL serl_launcher stack is gymnasium-based).
+from gymnasium.envs.registration import register
 
 
 register(

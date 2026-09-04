@@ -264,8 +264,11 @@ class InsertionEnvE2EIiwa(InsertionEnvIiwa):
         the reward (its norm) and as the rotation half of the true-delta obs (the full vector).
         """
         _, held_base_quat = self._held_base_pose()
-        held_axis = torch_utils.quat_apply(held_base_quat, self._local_z_axis)
-        socket_axis = torch_utils.quat_apply(self.fixed_quat, self._local_z_axis)
+        held_axis = torch_utils.quat_apply(held_base_quat, self._held_axis_local)
+        socket_axis = torch_utils.quat_apply(self.fixed_quat, self._socket_axis_local)
+        if bool(getattr(self.cfg_task, "axis_alignment_abs", False)):
+            same_dir = torch.sum(held_axis * socket_axis, dim=1, keepdim=True) >= 0.0
+            socket_axis = torch.where(same_dir, socket_axis, -socket_axis)
         v = torch.cross(held_axis, socket_axis, dim=1)
         s = torch.clamp(torch.sum(held_axis * socket_axis, dim=1), -1.0, 1.0)
         angle = torch.atan2(torch.linalg.norm(v, dim=1), s)  # [0, pi], = shaft_axis_error
@@ -297,9 +300,12 @@ class InsertionEnvE2EIiwa(InsertionEnvIiwa):
         pos_world = (self.fixed_pos + self._goal_err_pos) - tip_pos
         # orientation: align the current shaft axis to the NOISY goal axis (= true socket axis tilted by the
         # injected angular error). Same cross/dot axis-angle as _axis_error_vec, but to the noisy target.
-        socket_axis = torch_utils.quat_apply(self.fixed_quat, self._local_z_axis)
+        socket_axis = torch_utils.quat_apply(self.fixed_quat, self._socket_axis_local)
         goal_axis = torch_utils.quat_apply(self._goal_err_rot_quat, socket_axis)
-        held_axis = torch_utils.quat_apply(held_base_quat, self._local_z_axis)
+        held_axis = torch_utils.quat_apply(held_base_quat, self._held_axis_local)
+        if bool(getattr(self.cfg_task, "axis_alignment_abs", False)):
+            same_dir = torch.sum(held_axis * goal_axis, dim=1, keepdim=True) >= 0.0
+            goal_axis = torch.where(same_dir, goal_axis, -goal_axis)
         v = torch.cross(held_axis, goal_axis, dim=1)
         s = torch.clamp(torch.sum(held_axis * goal_axis, dim=1), -1.0, 1.0)
         angle = torch.atan2(torch.linalg.norm(v, dim=1), s)
@@ -520,8 +526,7 @@ class InsertionEnvE2EIiwa(InsertionEnvIiwa):
         # the hole" failure that dominates under the 2.5cm anchor noise. Behind a weight (default 0 => no-op).
         _wc = float(getattr(self.cfg, "e2e_reward_center_weight", 0.0))
         if _wc > 0.0:
-            _tp, _ = self._held_base_pose()
-            _xyd = torch.linalg.vector_norm(self.fixed_pos[:, 0:2] - _tp[:, 0:2], dim=1)
+            _, _, _xyd = self._goal_error_components()
             # CAP the centering distance (m): beyond the cap the tip is already "not centered", so keep the
             # penalty FLAT instead of growing without bound. Without this, drift to the +-8cm socket-anchor
             # box edge over a long episode makes wc*xy accumulate to ~ -1000/episode -> high-variance
@@ -554,13 +559,11 @@ class InsertionEnvE2EIiwa(InsertionEnvIiwa):
         # xy-miss > thresh (proportional to how far below the rim it is; zero once centred). Weight 0 => off.
         _wg = float(getattr(self.cfg, "e2e_reward_descend_gate_weight", 0.0))
         if _wg > 0.0:
-            _tp, _ = self._held_base_pose()
-            _open = self._socket_opening_pos()
             # CAP below-rim depth at the socket depth (deeper is unphysical / a stray pose) so this term
             # stays bounded -- an uncapped "below" spiked the episodic reward to ~ -1825 (40x) in the hard run.
             _cap_d = float(getattr(self.cfg, "e2e_reward_descend_cap", 0.0)) or float(self.cfg_task.fixed_asset_cfg.height)
-            below = torch.nn.functional.relu(_open[:, 2] - _tp[:, 2]).clamp(max=_cap_d)  # how far below the rim (m)
-            xy = torch.linalg.vector_norm(_open[:, 0:2] - _tp[:, 0:2], dim=1)
+            below = torch.nn.functional.relu(self._insertion_depth_from_opening()).clamp(max=_cap_d)
+            _, _, xy = self._goal_error_components()
             thr = float(getattr(self.cfg, "e2e_reward_descend_center_thresh", 0.005))
             gate = below * (xy > thr).float()                                   # below-rim depth while off-centre
             _descend = -_wg * torch.nan_to_num(gate, nan=0.0, posinf=0.0, neginf=0.0)
@@ -573,8 +576,7 @@ class InsertionEnvE2EIiwa(InsertionEnvIiwa):
         # gated on contact_force > thresh and unseated. Kept LOW so it can't out-compete seating. Weight 0 => off.
         _wr = float(getattr(self.cfg, "e2e_reward_recenter_weight", 0.0))
         if _wr > 0.0:
-            _tp_r, _ = self._held_base_pose()
-            _xy_now = torch.linalg.vector_norm(self.fixed_pos[:, 0:2] - _tp_r[:, 0:2], dim=1)
+            _, _, _xy_now = self._goal_error_components()
             if not hasattr(self, "_prev_tip_xy"):
                 self._prev_tip_xy = _xy_now.clone()
             _in_contact = (contact_force > float(getattr(self.cfg, "e2e_reward_recenter_force_thresh", 3.0)))
@@ -597,10 +599,8 @@ class InsertionEnvE2EIiwa(InsertionEnvIiwa):
         # DIAGNOSTIC SUB-METRICS (2026-08-24): split the opaque 3D tip distance into the two sub-skills so
         # the plots show WHICH part is missing -- lateral centring vs insertion depth -- plus two coverage
         # fractions. `success` stays EXACTLY as before (unchanged headline).
-        _tp, _ = self._held_base_pose()
-        _open = self._socket_opening_pos()
-        tip_xy_dist = torch.linalg.vector_norm(self.fixed_pos[:, 0:2] - _tp[:, 0:2], dim=1)  # lateral miss (m)
-        insertion_depth = _open[:, 2] - _tp[:, 2]  # +ve = tip below the rim = inserted (m)
+        _, _, tip_xy_dist = self._goal_error_components()
+        insertion_depth = self._insertion_depth_from_opening()
         _socket_r = 0.5 * float(self.cfg_task.fixed_asset_cfg.diameter)                 # ~7mm
         _engage_thr = float(getattr(self.cfg, "e2e_engage_depth_thresh", 0.005))        # 5mm shaft in
         centered = (tip_xy_dist < _socket_r).float()                                    # tip over the hole
@@ -736,10 +736,8 @@ class InsertionEnvE2EIiwa(InsertionEnvIiwa):
         # step doesn't score a spurious "improvement" off the previous episode's tip position (which could be
         # anywhere). Seeding with the fresh post-reset xy makes the first-step delta 0 (no reward).
         if hasattr(self, "_prev_tip_xy"):
-            _tp_reset, _ = self._held_base_pose()
-            self._prev_tip_xy[env_ids] = torch.linalg.vector_norm(
-                self.fixed_pos[env_ids, 0:2] - _tp_reset[env_ids, 0:2], dim=1
-            )
+            _, _, radial = self._goal_error_components()
+            self._prev_tip_xy[env_ids] = radial[env_ids]
 
         ema_rand = torch.rand((self.num_envs, 1), device=self.device)
         ema_lower, ema_upper = self.cfg.ctrl.ema_factor_range

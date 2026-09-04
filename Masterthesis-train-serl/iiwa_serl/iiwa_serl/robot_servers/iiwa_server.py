@@ -39,6 +39,27 @@ def create_app(backend):
         backend.move_pose(np.asarray(payload["pose"], dtype=np.float64))
         return "Moved"
 
+    @webapp.route("/joint_delta", methods=["POST"])
+    def joint_delta():
+        payload = request.json or {}
+        fn = getattr(backend, "move_joint_delta", None)
+        if fn is None:
+            return ("backend has no move_joint_delta", 501)
+        fn(np.asarray(payload["dq"], dtype=np.float64))
+        return "Moved"
+
+    @webapp.route("/hold", methods=["POST"])
+    def hold():
+        fn = getattr(backend, "hold_position", None)
+        if fn is not None:
+            fn()
+            return "Holding"
+        fallback = getattr(backend, "move_joint_delta", None)
+        if fallback is None:
+            return ("backend has no hold_position or move_joint_delta", 501)
+        fallback(np.zeros(7, dtype=np.float64))
+        return "Holding"
+
     @webapp.route("/getpos", methods=["POST"])
     def get_pos():
         return jsonify({"pose": np.asarray(backend.get_state().pose).tolist()})
@@ -76,9 +97,25 @@ def create_app(backend):
         state = backend.get_state()
         return jsonify(_to_json_state(state))
 
+    @webapp.route("/fk", methods=["POST"])
+    def fk():
+        """FK of an arbitrary joint vector -> base-frame TCP pose7 (xyzw). Used to convert
+        handoff goal joints into the robot's own frame (frame-consistent insertion axis)."""
+        from flask import request
+        q = request.get_json(force=True)["q"]
+        pose7 = backend.fk(q)
+        return jsonify({"pose": list(map(float, pose7))})
+
     @webapp.route("/jointreset", methods=["POST"])
     def joint_reset():
-        backend.reset_joints()
+        payload = None
+        try:
+            from flask import request
+            payload = request.get_json(force=True, silent=True)
+        except Exception:
+            payload = None
+        target_q = payload.get("q") if isinstance(payload, dict) else None
+        backend.reset_joints(target_q=target_q)
         return "Reset Joint"
 
     @webapp.route("/activate_gripper", methods=["POST"])

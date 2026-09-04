@@ -221,20 +221,48 @@ class InsertionEnv(ForgeEnv):
         )  # (n_sockets, 3)
         self.socket_offset_local = self._socket_table[0].repeat(self.num_envs, 1).clone()
 
-        # Held reference = screw shaft tip (shaft_length below the part origin).
-        self.held_base_offset = torch.tensor(
-            [0.0, 0.0, -self.cfg_task.screw_shaft_length], device=self.device
-        ).repeat(self.num_envs, 1)
+        # Held reference = the point that should coincide with fixed_pos at the seated goal. For screws this
+        # remains the shaft tip; horizontal/generalized tasks can opt into a midpoint or any other local point.
+        held_ref = getattr(self.cfg_task, "held_ref_offset_local", None)
+        if held_ref is None:
+            held_ref = [0.0, 0.0, -self.cfg_task.screw_shaft_length]
+        self.held_base_offset = torch.tensor(held_ref, device=self.device, dtype=torch.float32).repeat(
+            self.num_envs, 1
+        )
 
         self._identity_quat = torch.tensor([1.0, 0.0, 0.0, 0.0], device=self.device).repeat(self.num_envs, 1)
         self._local_z_axis = torch.tensor([0.0, 0.0, 1.0], device=self.device).repeat(self.num_envs, 1)
 
-        self._reward_keypoint_offsets = torch.zeros(
-            (self.cfg_task.num_keypoints, 3), device=self.device, dtype=torch.float32
-        )
-        self._reward_keypoint_offsets[:, 2] = torch.linspace(
-            0.0, self.cfg_task.held_asset_cfg.height, self.cfg_task.num_keypoints, device=self.device
-        )
+        def _axis_tensor(attr_name, default):
+            axis = torch.tensor(getattr(self.cfg_task, attr_name, default), device=self.device, dtype=torch.float32)
+            axis = axis / torch.linalg.norm(axis).clamp(min=1e-6)
+            return axis.repeat(self.num_envs, 1)
+
+        # Default screw semantics: held local +Z aligns to fixed local +Z. The pipe task switches both to +Y.
+        self._held_axis_local = _axis_tensor("held_axis_local", [0.0, 0.0, 1.0])
+        self._socket_axis_local = _axis_tensor("socket_axis_local", [0.0, 0.0, 1.0])
+
+        socket_opening_offset = getattr(self.cfg_task, "socket_opening_offset_local", None)
+        if socket_opening_offset is None:
+            socket_opening_offset = [
+                0.0,
+                0.0,
+                self.cfg_task.fixed_asset_cfg.height + self.cfg_task.fixed_asset_cfg.base_height,
+            ]
+        self._socket_opening_offset_local = torch.tensor(
+            socket_opening_offset, device=self.device, dtype=torch.float32
+        ).repeat(self.num_envs, 1)
+
+        reward_offsets = getattr(self.cfg_task, "reward_keypoint_offsets_local", None)
+        if reward_offsets is None:
+            self._reward_keypoint_offsets = torch.zeros(
+                (self.cfg_task.num_keypoints, 3), device=self.device, dtype=torch.float32
+            )
+            self._reward_keypoint_offsets[:, 2] = torch.linspace(
+                0.0, self.cfg_task.held_asset_cfg.height, self.cfg_task.num_keypoints, device=self.device
+            )
+        else:
+            self._reward_keypoint_offsets = torch.tensor(reward_offsets, device=self.device, dtype=torch.float32)
 
     def _weld_gripper_dof_pos(self) -> float:
         """Finger joint target for welded grasps.
@@ -461,7 +489,11 @@ class InsertionEnv(ForgeEnv):
         )
 
         self._robot = Articulation(self.cfg.robot)
-        self._fixed_asset = Articulation(self.cfg_task.fixed_asset)
+        self._fixed_is_rigid = isinstance(self.cfg_task.fixed_asset, RigidObjectCfg)
+        if self._fixed_is_rigid:
+            self._fixed_asset = RigidObject(self.cfg_task.fixed_asset)
+        else:
+            self._fixed_asset = Articulation(self.cfg_task.fixed_asset)
         # Held screw: a RigidObject when we weld it to the gripper (no articulation root -> a FixedJoint to
         # the robot articulation is legal; welding two ARTICULATIONS crashes PhysX). Else Factory's 1-body
         # Articulation (physical clamp grasp). The weld itself is created AFTER clone (per-env, below).
@@ -493,7 +525,10 @@ class InsertionEnv(ForgeEnv):
             self.scene.filter_collisions()
 
         self.scene.articulations["robot"] = self._robot
-        self.scene.articulations["fixed_asset"] = self._fixed_asset
+        if self._fixed_is_rigid:
+            self.scene.rigid_objects["fixed_asset"] = self._fixed_asset
+        else:
+            self.scene.articulations["fixed_asset"] = self._fixed_asset
         if self._held_is_rigid:
             self.scene.rigid_objects["held_asset"] = self._held_asset
         else:
@@ -516,6 +551,8 @@ class InsertionEnv(ForgeEnv):
         if getattr(self.cfg, "tiled_camera", None) is not None:
             if getattr(self.cfg, "randomize_part_materials", False):
                 self._setup_part_materials()
+            if getattr(self.cfg, "randomize_backdrop", False):
+                self._setup_backdrop()
             self._setup_key_light()
 
     def _setup_part_materials(self):
@@ -566,6 +603,81 @@ class InsertionEnv(ForgeEnv):
             carb.log_warn(f"[InsertionEnv] part-material DR setup failed, disabling it: {exc}")
             self._material_dr_failed = True
             self._appearance_shader_paths = {}
+
+    def _setup_backdrop(self):
+        """Spawn a PER-ENV backdrop panel behind the workspace with a random-colour material (best-effort).
+
+        SIM2REAL (2026-09-01): the sim wrist view is a plain grey ground plane; the REAL wrist view is
+        heavy clutter (aluminium rails, cables, a hand, table edges, bright lab light). The frozen-except-
+        layer4 ResNet can latch onto real background edges as FALSE hole features. A big vertical panel
+        behind the base fills the wrist frame with a randomized-colour backdrop each reset, so the policy
+        cannot rely on a clean grey background and must localise the hole from the part itself. This is the
+        "procedural clutter" (a solid random-colour panel; a texture set can be layered later if captured).
+        Mirrors _setup_part_materials: one un-instanced cuboid per env with its OWN PreviewSurface, so the
+        colour varies WITHIN a batch. Wrapped so any failure cleanly disables the layer.
+        """
+        try:
+            import re
+
+            import isaacsim.core.utils.prims as prim_utils  # noqa: F401  (parity w/ _setup_part_materials)
+
+            def _env_idx(path):
+                m = re.search(r"/env_(\d+)/", path)
+                return int(m.group(1)) if m else 0
+
+            # A large thin HORIZONTAL panel laid just above the ground under the plate-placement centroid.
+            # The wrist camera looks DOWN at the base, so the region that fills the background is the GROUND
+            # around/under the base -- a far vertical panel (the old placement) sat outside the downward
+            # frustum and never showed. This flat cover tints exactly the area the wrist sees behind the part.
+            # size = (x, y, thin-z); pos low in z so it sits under the base rim without colliding with it.
+            size = tuple(getattr(self.cfg, "backdrop_size", (1.4, 1.4, 0.01)))
+            pos = tuple(getattr(self.cfg, "backdrop_pos", (0.55, -0.30, -0.02)))
+            box_cfg = sim_utils.CuboidCfg(
+                size=size,
+                visual_material=sim_utils.PreviewSurfaceCfg(diffuse_color=(0.5, 0.5, 0.5), roughness=0.9),
+                collision_props=None,  # visual only -- never interacts with the arm/parts
+            )
+            box_cfg.func("/World/envs/env_.*/Backdrop", box_cfg, translation=pos)
+
+            shaders = []
+            paths = sorted(sim_utils.find_matching_prim_paths("/World/envs/env_.*/Backdrop"), key=_env_idx)
+            for p in paths:
+                mat_path = f"/World/Looks/backdrop_mat_env{_env_idx(p)}"
+                mat_cfg = sim_utils.PreviewSurfaceCfg(diffuse_color=(0.5, 0.5, 0.5), roughness=0.9)
+                mat_cfg.func(mat_path, mat_cfg)
+                prim = prim_utils.get_prim_at_path(p)
+                if prim and prim.IsValid() and prim.IsInstanceable():
+                    prim.SetInstanceable(False)
+                sim_utils.bind_visual_material(p, mat_path)
+                shaders.append(f"{mat_path}/Shader")
+            self._backdrop_shader_paths = shaders
+        except Exception as exc:  # noqa: BLE001
+            carb.log_warn(f"[InsertionEnv] backdrop DR setup failed, disabling it: {exc}")
+            self._backdrop_dr_failed = True
+            self._backdrop_shader_paths = []
+
+    def _randomize_backdrop(self):
+        """Per-env random backdrop albedo each reset (best-effort). Full-hue so the background spans the
+        real cell's colours (metal, cables, painted rails), not a narrow grey band."""
+        if getattr(self, "_backdrop_dr_failed", False) or not getattr(self, "_backdrop_shader_paths", []):
+            return
+        try:
+            import isaacsim.core.utils.prims as prim_utils
+            from pxr import Gf
+
+            n = len(self._backdrop_shader_paths)
+            # Full random RGB per env (no correlation to the parts) -> arbitrary background colours.
+            colors = torch.rand(n, 3).tolist()
+            for path, c in zip(self._backdrop_shader_paths, colors):
+                shader = prim_utils.get_prim_at_path(path)
+                if not (shader and shader.IsValid()):
+                    continue
+                a = shader.GetAttribute("inputs:diffuseColor")
+                if a and a.IsValid():
+                    a.Set(Gf.Vec3f(*c))
+        except Exception as exc:  # noqa: BLE001
+            carb.log_warn(f"[InsertionEnv] backdrop DR randomize failed, disabling it: {exc}")
+            self._backdrop_dr_failed = True
 
     def _setup_key_light(self):
         """Spawn a directional key light (DistantLight) whose direction is randomized per reset.
@@ -665,6 +777,46 @@ class InsertionEnv(ForgeEnv):
             self._set_welded_gripper_state(env_ids)
             self._sync_welded_held_pose_from_parent(env_ids)
             self.step_sim_no_action()
+        fixed_post_shift = getattr(self.cfg_task, "fixed_asset_post_reset_world_shift", None)
+        if fixed_post_shift is not None:
+            # The task-specific alignment below consumes these cached, env-relative tensors. Refresh them
+            # from the live staging fixture pose so a preceding episode's final shifted pose cannot leak
+            # into the next episode's IK target.
+            staged_root_pos = self._fixed_asset.data.root_pos_w[env_ids] - self.scene.env_origins[env_ids]
+            staged_root_quat = self._fixed_asset.data.root_quat_w[env_ids]
+            _, staged_socket_pos = torch_utils.tf_combine(
+                staged_root_quat,
+                staged_root_pos,
+                self._identity_quat[env_ids],
+                self.socket_offset_local[env_ids],
+            )
+            self.fixed_pos[env_ids] = staged_socket_pos
+            self.fixed_quat[env_ids] = staged_root_quat
+        if bool(getattr(self.cfg_task, "reset_held_ref_to_socket_opening", False)):
+            self._move_reset_ref_to_socket_opening(env_ids)
+        # Some low tool-down poses sit on a narrow IK branch. Let a task solve the arm against a nearby
+        # staging fixture pose, then translate only the kinematic fixture to its final deployment pose.
+        # The default is a no-op; PB pipe uses this to add X clearance without changing its level grasp.
+        if fixed_post_shift is not None:
+            shift = torch.tensor(fixed_post_shift, device=self.device, dtype=torch.float32)
+            if torch.any(torch.abs(shift) > 0.0):
+                fixed_pos = self._fixed_asset.data.root_pos_w[env_ids] + shift.unsqueeze(0)
+                fixed_quat = self._fixed_asset.data.root_quat_w[env_ids]
+                fixed_pose = torch.cat((fixed_pos, fixed_quat), dim=-1)
+                self._fixed_asset.write_root_pose_to_sim(fixed_pose, env_ids=env_ids)
+                self._fixed_asset.write_root_velocity_to_sim(
+                    torch.zeros((len(env_ids), 6), device=self.device), env_ids=env_ids
+                )
+                self._fixed_asset.reset(env_ids)
+                self.step_sim_no_action()
+                _, final_socket_pos = torch_utils.tf_combine(
+                    fixed_quat,
+                    fixed_pos - self.scene.env_origins[env_ids],
+                    self._identity_quat[env_ids],
+                    self.socket_offset_local[env_ids],
+                )
+                self.fixed_pos[env_ids] = final_socket_pos
+                self.fixed_quat[env_ids] = fixed_quat
         # Replace Factory's inherited Gaussian fixed-asset observation noise with bounded upstream
         # socket/goal pose error. This is actor-side only: the critic still receives clean fixed_pos.
         # The physical reset offset is separate (cfg_task.hand_init_pos_noise).
@@ -806,6 +958,137 @@ class InsertionEnv(ForgeEnv):
         self._fixed_asset.reset(env_ids)
         self.step_sim_no_action()
 
+    def _move_reset_ref_to_socket_opening(self, env_ids):
+        """Align the reset grasp to the socket axis and place its held reference at the opening/entry point."""
+        held_ref_pos, held_ref_quat = self._held_base_pose()
+        target_ref_pos = self._socket_opening_pos()
+        current_ft_pos = self.fingertip_midpoint_pos[env_ids]
+        current_ft_quat = self.fingertip_midpoint_quat[env_ids]
+
+        # Rotate the current grasp by the minimum world-frame correction that maps the held insertion axis
+        # onto the active socket/channel axis. For through-channels either axial sign is equivalent.
+        held_axis = torch_utils.quat_apply(held_ref_quat[env_ids], self._held_axis_local[env_ids])
+        socket_axis = torch_utils.quat_apply(self.fixed_quat[env_ids], self._socket_axis_local[env_ids])
+        if bool(getattr(self.cfg_task, "axis_alignment_abs", False)):
+            socket_axis = torch.where(
+                (torch.sum(held_axis * socket_axis, dim=1, keepdim=True) >= 0.0), socket_axis, -socket_axis
+            )
+        rot_axis = torch.cross(held_axis, socket_axis, dim=1)
+        rot_axis_norm = torch.linalg.vector_norm(rot_axis, dim=1, keepdim=True)
+        rot_angle = torch.atan2(rot_axis_norm.squeeze(-1), torch.sum(held_axis * socket_axis, dim=1).clamp(-1.0, 1.0))
+        rot_axis = rot_axis / rot_axis_norm.clamp(min=1e-6)
+        rot_quat = torch_utils.quat_from_angle_axis(rot_angle, rot_axis)
+        target_ref_quat = torch_utils.quat_mul(rot_quat, held_ref_quat[env_ids])
+
+        # LEVEL + TOOL-DOWN override: the minimal-axis alignment above inherits any tilt from the (IK-settled)
+        # hover, so the reset pipe ends up crooked. Rebuild target_ref_quat from a CANONICAL frame instead:
+        # pipe long axis (held_axis_local) -> socket/channel axis (horizontal), pipe "up" -> world +Z. This
+        # forces a level pipe with the hand straight down. Columns of R = where the pipe's mesh X,Y,Z map to.
+        if bool(getattr(self.cfg_task, "reset_level_toolstraight", True)):
+            n_e = len(env_ids)
+            y_col = socket_axis / torch.linalg.norm(socket_axis, dim=1, keepdim=True).clamp(min=1e-6)  # pipe long -> channel
+            wup = torch.zeros((n_e, 3), device=self.device); wup[:, 2] = 1.0
+            x_col = torch.cross(y_col, wup, dim=1)
+            x_col = x_col / torch.linalg.norm(x_col, dim=1, keepdim=True).clamp(min=1e-6)
+            z_col = torch.cross(x_col, y_col, dim=1)
+            z_col = z_col / torch.linalg.norm(z_col, dim=1, keepdim=True).clamp(min=1e-6)
+            from isaaclab.utils.math import quat_from_matrix
+            Rm = torch.stack([x_col, y_col, z_col], dim=2)  # (n,3,3), columns = pipe axes in world
+            target_ref_quat = quat_from_matrix(Rm)
+            # Optional task-specific pitch feed-forward for a repeatable low-pose IK tracking bias. This is
+            # applied about world Y after constructing the canonical level frame; absent/zero is an exact no-op.
+            pitch_comp_deg = float(getattr(self.cfg_task, "reset_level_pitch_comp_deg", 0.0))
+            if abs(pitch_comp_deg) > 1e-6:
+                pitch_axis = torch.zeros((n_e, 3), device=self.device)
+                pitch_axis[:, 1] = 1.0
+                pitch_angle = torch.full(
+                    (n_e,), math.radians(pitch_comp_deg), device=self.device, dtype=target_ref_quat.dtype
+                )
+                pitch_quat = torch_utils.quat_from_angle_axis(pitch_angle, pitch_axis)
+                target_ref_quat = torch_utils.quat_mul(pitch_quat, target_ref_quat)
+
+        target_root_pos = target_ref_pos[env_ids] - torch_utils.quat_apply(
+            target_ref_quat, self.held_base_offset[env_ids]
+        )
+        if getattr(self, "_weld_held", False) and hasattr(self, "_weld_frame0_quat"):
+            # The fixed joint's TCP->root transform is authoritative; using it makes the posed arm and the
+            # welded pipe agree exactly, rather than approximating that transform from delayed state tensors.
+            target_ft_quat = torch_utils.quat_mul(
+                target_ref_quat, torch_utils.quat_conjugate(self._weld_frame0_quat[env_ids])
+            )
+            target_ft_pos = target_root_pos - torch_utils.quat_apply(
+                target_ft_quat, self._weld_frame0_pos[env_ids]
+            )
+        else:
+            tip_to_ref_pos = torch_utils.quat_apply(
+                torch_utils.quat_conjugate(current_ft_quat), held_ref_pos[env_ids] - current_ft_pos
+            )
+            tip_to_ref_quat = torch_utils.quat_mul(
+                torch_utils.quat_conjugate(current_ft_quat), held_ref_quat[env_ids]
+            )
+            target_ft_quat = torch_utils.quat_mul(target_ref_quat, torch_utils.quat_conjugate(tip_to_ref_quat))
+            target_ft_pos = target_ref_pos[env_ids] - torch_utils.quat_apply(target_ft_quat, tip_to_ref_pos)
+        saved_joint_pos = self.joint_pos.clone()
+        saved_joint_vel = self.joint_vel.clone()
+
+        # The E2E reset wrapper can deliberately report zero IK error after its global retry budget is spent.
+        # That is appropriate for escaping Factory's unbounded reset loop, but not here: this task-specific
+        # reposition must not silently accept an arm that never reached the requested approach pose.
+        saved_ik_budget = getattr(self, "_reset_ik_budget", None)
+        if hasattr(self, "_reset_ik_budget"):
+            self._reset_ik_budget = None
+        try:
+            _n_ik = int(getattr(self.cfg_task, "reset_ref_ik_iters", 12) or 12)
+            _refine_pos_tol = float(getattr(self.cfg_task, "reset_ref_ik_pos_tol", 0.005))
+            _refine_rot_tol = math.radians(float(getattr(self.cfg_task, "reset_ref_ik_rot_tol_deg", 5.0)))
+            for _ in range(_n_ik):
+                self.set_pos_inverse_kinematics(target_ft_pos, target_ft_quat, env_ids)
+                self.step_sim_no_action()
+                pos_err = target_ft_pos - self.fingertip_midpoint_pos[env_ids]
+                quat_err = torch_utils.quat_mul(
+                    target_ft_quat, torch_utils.quat_conjugate(self.fingertip_midpoint_quat[env_ids])
+                )
+                quat_err = quat_err / torch.linalg.norm(quat_err, dim=1, keepdim=True).clamp(min=1e-6)
+                aa_err = 2.0 * torch.atan2(
+                    torch.linalg.vector_norm(quat_err[:, 1:], dim=1), quat_err[:, 0].abs().clamp(min=1e-6)
+                )
+                needs_refine = (torch.linalg.norm(pos_err, dim=1) > _refine_pos_tol) | (aa_err > _refine_rot_tol)
+                if not bool(needs_refine.any()):
+                    break
+        finally:
+            if hasattr(self, "_reset_ik_budget"):
+                self._reset_ik_budget = saved_ik_budget
+        # A task may request a tighter nominal pose without making reset acceptance equally brittle.
+        _fail_pos_tol = float(getattr(self.cfg_task, "reset_ref_ik_fail_pos_tol", 0.005))
+        _fail_rot_tol = math.radians(float(getattr(self.cfg_task, "reset_ref_ik_fail_rot_tol_deg", 5.0)))
+        ik_failed = (torch.linalg.norm(pos_err, dim=1) > _fail_pos_tol) | (aa_err > _fail_rot_tol)
+        if bool(ik_failed.any()):
+            failed_env_ids = env_ids[ik_failed.nonzero(as_tuple=False).squeeze(-1)]
+            self.joint_pos[failed_env_ids] = saved_joint_pos[failed_env_ids]
+            self.joint_vel[failed_env_ids] = saved_joint_vel[failed_env_ids]
+            self._robot.write_joint_state_to_sim(
+                self.joint_pos[failed_env_ids], self.joint_vel[failed_env_ids], env_ids=failed_env_ids
+            )
+            self.ctrl_target_joint_pos[failed_env_ids] = self.joint_pos[failed_env_ids]
+            self._robot.set_joint_position_target(self.ctrl_target_joint_pos[failed_env_ids], env_ids=failed_env_ids)
+            carb.log_warn(
+                f"[InsertionEnv] reset_ref_to_socket_opening IK failed for {len(failed_env_ids)} env(s); "
+                f"measured residuals: pos={torch.linalg.norm(pos_err[ik_failed], dim=1).max().item() * 1e3:.1f} mm, "
+                f"rot={torch.rad2deg(aa_err[ik_failed]).max().item():.1f} deg; leaving those reset poses at the Factory hover."
+            )
+        if getattr(self, "_weld_held", False):
+            self._set_welded_gripper_state(env_ids)
+            self._sync_welded_held_pose_from_parent(env_ids)
+        else:
+            held_state = self._held_asset.data.root_state_w.clone()[env_ids]
+            ok = ~ik_failed
+            if bool(ok.any()):
+                held_state[ok, 0:3] = target_root_pos[ok] + self.scene.env_origins[env_ids][ok]
+                held_state[ok, 3:7] = target_ref_quat[ok]
+                held_state[ok, 7:13] = 0.0
+                self._held_asset.write_root_state_to_sim(held_state[ok], env_ids=env_ids[ok])
+        self.step_sim_no_action()
+
     def get_handheld_asset_relative_pose(self):
         """Grip the screw HEAD between the fingerpads, then add the rotational grasp misalignment.
 
@@ -828,6 +1111,18 @@ class InsertionEnv(ForgeEnv):
         # Grip the head, not below it (correct for the shoulder-origin, two-diameter screw).
         head_height = self.cfg_task.held_asset_cfg.height - self.cfg_task.screw_shaft_length
         held_asset_relative_pos[:, 2] = head_height - self.cfg_task.robot_cfg.franka_fingerpad_length
+        # FIXED axial grasp offset (cfg-gated, additive; no-op when absent -> cooling/pb_screw untouched):
+        # shift the grip point along the held-asset frame by a constant vector. Needed for the horizontal
+        # pb_pipe, which is gripped NEAR ONE END (not centre) so it can insert until the pipe MIDPOINT
+        # reaches the bore centre -- the base peg formula only offsets along z, giving a centre grip. The
+        # offset is in the SAME (fingertip/relative) frame as held_asset_relative_pos, so for the pipe (long
+        # axis on fingertip-Y after its spawn rot) the along-axis shift goes in the y component. TODO doc: if
+        # a task needs it in the held-asset's own mesh frame instead, rotate by held_asset_relative_quat.
+        _goff = getattr(self.cfg_task, "grasp_offset_local", None)
+        if _goff is not None:
+            held_asset_relative_pos = held_asset_relative_pos + torch.tensor(
+                _goff, device=self.device, dtype=held_asset_relative_pos.dtype
+            )
         # Grasp POSITION DR: add the per-env axial(z)+lateral(x) jitter. Welded path reuses the offset
         # stashed in _weld_held_asset so the weld and the reset pose agree (see there). +z retracts the
         # screw INTO the pads, so keep the axial bound small (never pull the shaft shoulder in).
@@ -872,6 +1167,19 @@ class InsertionEnv(ForgeEnv):
             axis2[:, 0] = 1.0  # fingertip-frame X = out-of-plane (perpendicular to the pressing axis)
             sec_quat = torch_utils.quat_from_angle_axis(sec, axis2)
             held_asset_relative_quat = torch_utils.quat_mul(sec_quat, held_asset_relative_quat)
+        # Optional deterministic grasp angle about fingertip X. Unlike the small random secondary
+        # misalignment above, this rotates the complete relative transform: it intentionally changes the
+        # nominal tool-to-part angle while keeping the grasp attached to the same point on the held part.
+        fixed_tilt_deg = float(getattr(self.cfg_task, "grasp_fixed_tool_tilt_deg", 0.0))
+        if abs(fixed_tilt_deg) > 1e-6:
+            fixed_tilt_axis = torch.zeros((n, 3), device=self.device)
+            fixed_tilt_axis[:, 0] = 1.0
+            fixed_tilt_angle = torch.full(
+                (n,), math.radians(fixed_tilt_deg), device=self.device, dtype=held_asset_relative_quat.dtype
+            )
+            fixed_tilt_quat = torch_utils.quat_from_angle_axis(fixed_tilt_angle, fixed_tilt_axis)
+            held_asset_relative_pos = torch_utils.quat_apply(fixed_tilt_quat, held_asset_relative_pos)
+            held_asset_relative_quat = torch_utils.quat_mul(fixed_tilt_quat, held_asset_relative_quat)
         # Stash the per-episode signed grasp tilt (rad) as the label for the auxiliary grasp head. Set
         # for ALL envs every reset (resets are synchronized), so it matches each env's current episode.
         # This is the COMMANDED tilt; the realized angle drifts a little under gravity sag, which is
@@ -1080,10 +1388,8 @@ class InsertionEnv(ForgeEnv):
 
     def _socket_opening_pos(self):
         """World position of the active socket opening/entry frame."""
-        fixed_tip_pos_local = torch.zeros((self.num_envs, 3), device=self.device)
-        fixed_tip_pos_local[:, 2] = self.cfg_task.fixed_asset_cfg.height + self.cfg_task.fixed_asset_cfg.base_height
         _, socket_opening_pos = torch_utils.tf_combine(
-            self.fixed_quat, self.fixed_pos, self._identity_quat, fixed_tip_pos_local
+            self.fixed_quat, self.fixed_pos, self._identity_quat, self._socket_opening_offset_local
         )
         return socket_opening_pos
 
@@ -1102,6 +1408,8 @@ class InsertionEnv(ForgeEnv):
 
         keypoints_held = torch.zeros((self.num_envs, self.cfg_task.num_keypoints, 3), device=self.device)
         keypoints_target = torch.zeros_like(keypoints_held)
+        keypoints_target_flipped = torch.zeros_like(keypoints_held)
+        line_symmetric = bool(getattr(self.cfg_task, "axis_alignment_abs", False))
         for idx, keypoint_offset in enumerate(self._reward_keypoint_offsets):
             offset = keypoint_offset.repeat(self.num_envs, 1)
             keypoints_held[:, idx] = torch_utils.tf_combine(
@@ -1110,28 +1418,66 @@ class InsertionEnv(ForgeEnv):
             keypoints_target[:, idx] = torch_utils.tf_combine(
                 target_base_quat, target_base_pos, self._identity_quat, offset
             )[1]
+            if line_symmetric:
+                proj = torch.sum(offset * self._socket_axis_local, dim=1, keepdim=True)
+                offset_flipped = offset - 2.0 * proj * self._socket_axis_local
+                keypoints_target_flipped[:, idx] = torch_utils.tf_combine(
+                    target_base_quat, target_base_pos, self._identity_quat, offset_flipped
+                )[1]
 
         keypoint_dist = torch.linalg.vector_norm(keypoints_held - keypoints_target, dim=-1).mean(dim=-1)
+        if line_symmetric:
+            keypoint_dist_flipped = torch.linalg.vector_norm(
+                keypoints_held - keypoints_target_flipped, dim=-1
+            ).mean(dim=-1)
+            keypoint_dist = torch.minimum(keypoint_dist, keypoint_dist_flipped)
         tip_dist = torch.linalg.vector_norm(held_base_pos - target_base_pos, dim=1)
         return keypoint_dist, tip_dist
 
     def _shaft_axis_error(self):
         """Angle between the screw shaft axis and the active socket axis."""
         _, held_base_quat = self._held_base_pose()
-        held_axis = torch_utils.quat_apply(held_base_quat, self._local_z_axis)
-        socket_axis = torch_utils.quat_apply(self.fixed_quat, self._local_z_axis)
+        held_axis = torch_utils.quat_apply(held_base_quat, self._held_axis_local)
+        socket_axis = torch_utils.quat_apply(self.fixed_quat, self._socket_axis_local)
+        if bool(getattr(self.cfg_task, "axis_alignment_abs", False)):
+            same_dir = torch.sum(held_axis * socket_axis, dim=1, keepdim=True) >= 0.0
+            socket_axis = torch.where(same_dir, socket_axis, -socket_axis)
         axis_cos = torch.clamp(torch.sum(held_axis * socket_axis, dim=1), -1.0, 1.0)
         return torch.acos(axis_cos)
 
+    def _goal_error_components(self):
+        """Position error decomposed into axial and radial parts around the socket axis."""
+        held_base_pos, _ = self._held_base_pose()
+        error = held_base_pos - self.fixed_pos
+        socket_axis = torch_utils.quat_apply(self.fixed_quat, self._socket_axis_local)
+        socket_axis = socket_axis / torch.linalg.norm(socket_axis, dim=1, keepdim=True).clamp(min=1e-6)
+        axial = torch.sum(error * socket_axis, dim=1)
+        radial_vec = error - axial.unsqueeze(-1) * socket_axis
+        radial = torch.linalg.vector_norm(radial_vec, dim=1)
+        return error, axial, radial
+
+    def _insertion_depth_from_opening(self):
+        """Signed progress from the configured socket opening toward the seated target."""
+        held_base_pos, _ = self._held_base_pose()
+        opening_pos = self._socket_opening_pos()
+        direction_local = -self._socket_opening_offset_local
+        direction_norm = torch.linalg.norm(direction_local, dim=1, keepdim=True)
+        fallback = -self._socket_axis_local
+        direction_local = torch.where(
+            direction_norm > 1e-6, direction_local / direction_norm.clamp(min=1e-6), fallback
+        )
+        direction_w = torch_utils.quat_apply(self.fixed_quat, direction_local)
+        return torch.sum((held_base_pos - opening_pos) * direction_w, dim=1)
+
     # --- success + reward (pure residual, squashing kernel) ---------------------------------
     def _get_curr_successes(self, success_threshold, check_rot=False):
-        held_base_pos, _ = self._held_base_pose()
-        target = self.fixed_pos  # socket bottom
-        xy_dist = torch.linalg.vector_norm(target[:, 0:2] - held_base_pos[:, 0:2], dim=1)
-        z_disp = held_base_pos[:, 2] - target[:, 2]
-        is_centered = xy_dist < 0.0025
+        _, axial, radial = self._goal_error_components()
+        is_centered = radial < 0.0025
         height_threshold = self.cfg_task.fixed_asset_cfg.height * success_threshold
-        is_seated = z_disp < height_threshold
+        if bool(getattr(self.cfg_task, "success_axial_abs", False)):
+            is_seated = torch.abs(axial) < height_threshold
+        else:
+            is_seated = axial < height_threshold
         is_aligned = self._shaft_axis_error() < self.cfg_task.success_orientation_threshold
         return torch.logical_and(torch.logical_and(is_centered, is_seated), is_aligned)
 
@@ -1216,6 +1562,7 @@ class InsertionEnv(ForgeEnv):
             self._photo_gamma[env_ids] = 1.0 + _half(cfg.photo_gamma * af, (m, 1, 1, 1))
 
         self._randomize_part_materials()
+        self._randomize_backdrop()
         self._randomize_scene_light()
 
     def _randomize_part_materials(self):

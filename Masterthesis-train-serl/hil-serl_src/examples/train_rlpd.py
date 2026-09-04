@@ -11,7 +11,9 @@ from flax.training import checkpoints
 import os
 import copy
 import pickle as pkl
-from gymnasium.wrappers.record_episode_statistics import RecordEpisodeStatistics
+# #5: env + stack are gymnasium. The submodule path `record_episode_statistics` is absent in
+# gymnasium 1.3 — import from the top-level wrappers package.
+from gymnasium.wrappers import RecordEpisodeStatistics
 from natsort import natsorted
 
 from serl_launcher.agents.continuous.sac import SACAgent
@@ -185,16 +187,25 @@ def actor(agent, data_store, intvn_data_store, env, sampling_rng):
                 already_intervened = False
 
             running_return += reward
+            # #7: strip the record-only ZED 'scene' key (if present) so buffer obs = {state,wrist}.
+            _obs = {k: v for k, v in obs.items() if k != "scene"} if isinstance(obs, dict) else obs
+            _next = ({k: v for k, v in next_obs.items() if k != "scene"}
+                     if isinstance(next_obs, dict) else next_obs)
             transition = dict(
-                observations=obs,
+                observations=_obs,
                 actions=actions,
-                next_observations=next_obs,
+                next_observations=_next,
                 rewards=reward,
+                # #5: dones = episode boundary (terminated OR truncated) so the image buffer marks
+                # truncation and does not stack the last pre-reset frame into the next episode;
+                # masks = 1 - terminated (bootstrap only on a true time-limit).
                 masks=1.0 - done,
-                dones=done,
+                dones=bool(done or truncated),
             )
             if 'grasp_penalty' in info:
                 transition['grasp_penalty']= info['grasp_penalty']
+            if 'shielded' in info:                 # #8: flag retract/L1-shielded steps
+                transition['shielded'] = bool(info['shielded'])
             data_store.insert(transition)
             transitions.append(copy.deepcopy(transition))
             if already_intervened:
