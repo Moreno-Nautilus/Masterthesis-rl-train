@@ -18,6 +18,31 @@ try:
 except Exception as _exc:  # noqa: BLE001 - upstream franka deps absent in our env
     print(f"[mappings] upstream Franka configs unavailable ({_exc!r}); KUKA configs still load.")
 
+# --- Franka FR3 plumbers HIL-SERL configs (pivot 2026-09-08; one model per insert). ---
+# Imported defensively too: they pull franka_env / pygame, absent in a KUKA-only env.
+try:
+    from experiments.franka_plumbers.config import (
+        TrainConfigInsert0 as _FrankaPlumbers0,
+        TrainConfigInsert1 as _FrankaPlumbers1,
+        TrainConfigInsert2 as _FrankaPlumbers2,
+        TrainConfigInsert3 as _FrankaPlumbers3,
+    )
+
+    CONFIG_MAPPING.update({
+        "franka_plumbers_insert0": _FrankaPlumbers0,
+        "franka_plumbers_insert1": _FrankaPlumbers1,
+        "franka_plumbers_insert2": _FrankaPlumbers2,
+        "franka_plumbers_insert3": _FrankaPlumbers3,
+    })
+except ImportError as _exc:  # expected in a KUKA-only env (franka_env/pygame absent) — benign
+    print(f"[mappings] franka_plumbers configs unavailable (missing dep: {_exc!r}); "
+          f"other configs still load.")
+except Exception:  # a REAL bug in our config (syntax/API/init) — do NOT mask as 'missing'
+    import traceback
+    print("[mappings] ERROR importing franka_plumbers configs (this is a bug, not a missing "
+          "dep) — full traceback below; the 4 franka_plumbers entries will be ABSENT:")
+    traceback.print_exc()
+
 # --- KUKA per-insert HIL-SERL configs (one model per insert, both assemblies) ---
 from experiments.iiwa_plumbers.config import (
     TrainConfigInsert0 as _Plumbers0,

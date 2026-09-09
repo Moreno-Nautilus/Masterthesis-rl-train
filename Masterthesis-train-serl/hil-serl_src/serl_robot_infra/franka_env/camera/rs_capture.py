@@ -1,5 +1,13 @@
 import numpy as np
-import pyrealsense2 as rs  # Intel RealSense cross-platform open-source API
+
+try:  # import-guard: pyrealsense2 may be absent (e.g. home box / ZED-only rig)
+    import pyrealsense2 as rs  # Intel RealSense cross-platform open-source API
+    _PYREALSENSE_AVAILABLE = True
+    _PYREALSENSE_IMPORT_ERROR = None
+except Exception as e:  # keep module importable so franka_env can import it offline
+    rs = None
+    _PYREALSENSE_AVAILABLE = False
+    _PYREALSENSE_IMPORT_ERROR = e
 
 
 class RSCapture:
@@ -8,6 +16,11 @@ class RSCapture:
         return [d.get_info(rs.camera_info.serial_number) for d in devices]
 
     def __init__(self, name, serial_number, dim=(640, 480), fps=15, depth=False, exposure=40000):
+        if not _PYREALSENSE_AVAILABLE:
+            raise ImportError(
+                "pyrealsense2 is not installed — RSCapture requires it. "
+                f"Original import error: {_PYREALSENSE_IMPORT_ERROR!r}"
+            )
         self.name = name
         assert serial_number in self.get_device_serial_numbers()
         self.serial_number = serial_number

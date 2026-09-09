@@ -63,3 +63,7 @@ CLAUDE.md
 **/configuration/
 *.txt
 *.md
+# Franka pivot docs must be committable despite the blanket *.md ignore above.
+!Masterthesis-train-serl/FRANKA_PIVOT_PLAN.md
+!Masterthesis-train-serl/FRANKA_RIG_CHECKLIST.md
+!Masterthesis-train-serl/TOMORROW_COMMANDS.md

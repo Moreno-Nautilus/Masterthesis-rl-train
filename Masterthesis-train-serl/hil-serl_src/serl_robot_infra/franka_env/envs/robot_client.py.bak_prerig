@@ -1,0 +1,356 @@
+"""Robot-communication seam for FrankaEnv.
+
+HIL-SERL centralizes all robot I/O in ~8 HTTP calls to the Flask `franka_server.py`
+(`getstate`, `pose`, `clearerr`, `update_param`, `jointreset`, gripper open/close,
+`set_load`). This module hides those behind a thin `RobotClient` interface so the
+same env / wrappers / agent / configs can talk to EITHER:
+
+- ``HttpFrankaClient`` — the STOCK path. Every method makes exactly the same
+  ``requests.post(url + endpoint, ...)`` call the original code made, with the same
+  payloads and the same return shapes. This must stay BYTE-IDENTICAL in behavior to
+  upstream so the reference HTTP setup is unchanged.
+
+- ``Ros2FrankaClient`` — the Franka-pivot path (2026-09-08). An rclpy node that talks
+  to the student's ``cartesian_impedance_control`` ROS2 controller over franka_ros2 +
+  FCI. Topic/action names below come from the docs and the student's PS4 teleop; any
+  that differ get finalized at the rig once `ros2 topic list` / `ros2 action list` are
+  available (see the ``TODO(rig)`` markers).
+
+``FrankaEnv.__init__`` picks the backend via ``config.ROBOT_CLIENT`` ("http" | "ros2").
+The env/wrappers/agent/PS4Expert/ZEDCapture/plumbers-configs are IDENTICAL either way —
+only ``Ros2FrankaClient``'s topic/action names are stack-specific.
+"""
+
+import numpy as np
+import requests
+
+
+class RobotClient:
+    """Abstract robot-communication interface used by FrankaEnv and its wrappers.
+
+    Method contract mirrors the stock HTTP endpoints one-for-one:
+
+    - ``get_state() -> dict`` with keys
+      ``pose, vel, force, torque, jacobian, q, dq, gripper_pos`` (raw, as the Flask
+      server returns them; the env reshapes jacobian to (6,7)).
+    - ``send_pos(arr)``      — command an absolute Cartesian target pose (7-vec: xyz+quat).
+    - ``recover()``          — clear/recover from robot error state (stock ``clearerr``).
+    - ``update_param(params)``— set impedance/compliance params (COMPLIANCE/PRECISION/RESET).
+    - ``joint_reset()``      — move to the nominal joint configuration.
+    - ``open_gripper()`` / ``close_gripper()`` / ``close_gripper_slow()``.
+    - ``set_load(params)``   — set the end-effector load (mass/CoM/inertia).
+    """
+
+    def get_state(self) -> dict:
+        raise NotImplementedError
+
+    def send_pos(self, arr) -> None:
+        raise NotImplementedError
+
+    def recover(self) -> None:
+        raise NotImplementedError
+
+    def update_param(self, params: dict) -> None:
+        raise NotImplementedError
+
+    def joint_reset(self) -> None:
+        raise NotImplementedError
+
+    def open_gripper(self) -> None:
+        raise NotImplementedError
+
+    def close_gripper(self) -> None:
+        raise NotImplementedError
+
+    def close_gripper_slow(self) -> None:
+        raise NotImplementedError
+
+    def set_load(self, params: dict) -> None:
+        raise NotImplementedError
+
+    def close(self) -> None:
+        pass
+
+
+class HttpFrankaClient(RobotClient):
+    """Stock HIL-SERL backend: HTTP POSTs to the Flask franka_server.
+
+    Each method reproduces the exact ``requests.post`` call the original franka_env.py /
+    ram_insertion wrapper.py made. Do NOT change endpoint names, payload keys, or return
+    handling here — this path must stay behavior-identical to upstream.
+    """
+
+    def __init__(self, url: str):
+        self.url = url
+
+    def get_state(self) -> dict:
+        # stock: requests.post(self.url + "getstate").json()
+        return requests.post(self.url + "getstate").json()
+
+    def send_pos(self, arr) -> None:
+        # stock: requests.post(self.url + "pose", json={"arr": arr.tolist()})
+        arr = np.array(arr).astype(np.float32)
+        data = {"arr": arr.tolist()}
+        requests.post(self.url + "pose", json=data)
+
+    def recover(self) -> None:
+        # stock: requests.post(self.url + "clearerr")
+        requests.post(self.url + "clearerr")
+
+    def update_param(self, params: dict) -> None:
+        # stock: requests.post(self.url + "update_param", json=<PARAM>)
+        requests.post(self.url + "update_param", json=params)
+
+    def joint_reset(self) -> None:
+        # stock: requests.post(self.url + "jointreset")
+        requests.post(self.url + "jointreset")
+
+    def open_gripper(self) -> None:
+        # stock: requests.post(self.url + "open_gripper")
+        requests.post(self.url + "open_gripper")
+
+    def close_gripper(self) -> None:
+        # stock: requests.post(self.url + "close_gripper")
+        requests.post(self.url + "close_gripper")
+
+    def close_gripper_slow(self) -> None:
+        # stock: requests.post(self.url + "close_gripper_slow")
+        requests.post(self.url + "close_gripper_slow")
+
+    def set_load(self, params: dict) -> None:
+        # stock: requests.post(self.url + "set_load", json=self.config.LOAD_PARAM)
+        requests.post(self.url + "set_load", json=params)
+
+
+class Ros2FrankaClient(RobotClient):
+    """Franka-pivot backend: rclpy node driving `cartesian_impedance_control`.
+
+    Talks to the student's ROS2 Cartesian-impedance controller over franka_ros2 + FCI.
+    No separate F/T sensor: the external wrench comes from the franka_ros2 robot-state
+    (``O_F_ext_hat_K`` / ``tau_ext_hat_filtered``).
+
+    Topic/action names below are the DOCUMENTED ones (student's PS4 teleop drives
+    ``/cartesian_position_controller/commands``). Anything marked ``TODO(rig)`` must be
+    confirmed with ``ros2 topic list`` / ``ros2 action list`` on the robot PC before
+    autonomous motion (see FRANKA_RIG_CHECKLIST.md).
+
+    NOTE: import of rclpy is deferred to __init__ so this module imports fine at home
+    (no ROS2 in the offline dry-run; learner uses fake_env and never constructs this).
+    """
+
+    # --- ROS2 interface names (finalize at rig) -----------------------------------
+    # Command out: absolute Cartesian target, Float64MultiArray [x,y,z,qx,qy,qz,qw]
+    CMD_POSE_TOPIC = "/cartesian_position_controller/commands"
+    # Robot state in: franka_ros2 FrankaRobotState (pose, vel, ext wrench, jacobian, q, dq)
+    # TODO(rig): confirm exact topic + msg type — likely
+    #   /franka_robot_state_broadcaster/robot_state  (franka_msgs/msg/FrankaRobotState)
+    ROBOT_STATE_TOPIC = "/franka_robot_state_broadcaster/robot_state"
+    # Impedance stiffness params. The student's controller exposes these; the exact
+    # service/param path is stack-specific.
+    # TODO(rig): confirm how stiffness is set (rcl param set vs a dedicated service on
+    #   cartesian_impedance_control / messages_fr3). FR3 range: transl 10-3000 N/m,
+    #   rot 1-300 Nm/rad.
+    UPDATE_PARAM_SERVICE = None  # TODO(rig)
+    # Gripper: Franka Hand action servers used by the student's gripper_client.
+    # TODO(rig): confirm namespace — docs say /fr3_gripper/{move,grasp}
+    GRIPPER_MOVE_ACTION = "/fr3_gripper/move"     # franka_msgs/action/Move
+    GRIPPER_GRASP_ACTION = "/fr3_gripper/grasp"   # franka_msgs/action/Grasp
+    # Error recovery (franka_ros2). Official Humble docs use /action_server/error_recovery
+    # (NOT /service_server/...). CONFIRM the exact name at the rig.
+    # TODO(rig): confirm error-recovery action/service name (`ros2 action list`).
+    ERROR_RECOVERY_ACTION = "/action_server/error_recovery"
+
+    def __init__(self, url: str = None, config=None, node_name: str = "hil_serl_franka_client"):
+        # Deferred import: keep this module importable without ROS2 (home / learner).
+        import rclpy
+        from rclpy.node import Node
+        from std_msgs.msg import Float64MultiArray
+
+        self.config = config
+        self._Float64MultiArray = Float64MultiArray
+
+        # Track whether WE initialized the rclpy context, so close() only shuts down what
+        # this client started (never yank a context the host process owns).
+        self._owns_context = False
+        if not rclpy.ok():
+            rclpy.init()
+            self._owns_context = True
+        self._rclpy = rclpy
+        self.node = Node(node_name)
+
+        # Command publisher (absolute Cartesian target the impedance controller tracks).
+        self._cmd_pub = self.node.create_publisher(
+            Float64MultiArray, self.CMD_POSE_TOPIC, 10
+        )
+
+        # Robot-state subscription. Latest message cached; get_state() reads the cache.
+        self._latest_state = None
+        # TODO(rig): wire the real subscription once the FrankaRobotState msg type is
+        # confirmed available on this PC. Pseudocode:
+        #   from franka_msgs.msg import FrankaRobotState
+        #   self.node.create_subscription(FrankaRobotState, self.ROBOT_STATE_TOPIC,
+        #                                  self._on_state, 10)
+        #   in _on_state: cache pose (o_t_ee), vel, wrench (o_f_ext_hat_k),
+        #                 jacobian, q, dq, gripper width.
+
+        # TODO(rig): create gripper + error-recovery ActionClients here once the action
+        # types/names are confirmed:
+        #   from rclpy.action import ActionClient
+        #   from franka_msgs.action import Move, Grasp, ErrorRecovery
+        #   self._move = ActionClient(self.node, Move, self.GRIPPER_MOVE_ACTION)
+        #   self._grasp = ActionClient(self.node, Grasp, self.GRIPPER_GRASP_ACTION)
+        #   self._recover_ac = ActionClient(self.node, ErrorRecovery,
+        #                                   self.ERROR_RECOVERY_ACTION)
+
+    # -- helpers -------------------------------------------------------------------
+    def _spin_once(self, timeout_sec: float = 0.0):
+        self._rclpy.spin_once(self.node, timeout_sec=timeout_sec)
+
+    def _on_state(self, msg):
+        # TODO(rig): populate self._latest_state from the FrankaRobotState msg in the
+        # SAME dict shape HttpFrankaClient.get_state() returns (see get_state below).
+        self._latest_state = msg
+
+    # -- RobotClient interface -----------------------------------------------------
+    def get_state(self) -> dict:
+        """Return the same dict shape as the HTTP server's /getstate.
+
+        Keys: pose(7 xyz+quat), vel(6), force(3), torque(3), jacobian(42 flat, ->(6,7)),
+        q(7), dq(7), gripper_pos(1). The env reshapes jacobian and wraps the rest.
+        """
+        # TODO(rig): convert the cached FrankaRobotState into this dict. IMPORTANT — the
+        # official FrankaRobotState (docs.ros.org/en/humble/p/franka_msgs) does NOT map 1:1
+        # to the HTTP /getstate contract. Concretely:
+        #   - pose      = o_t_ee (4x4 or pose) -> xyz + quat (7).
+        #   - force/torque = o_f_ext_hat_k, a NESTED geometry_msgs WrenchStamped
+        #                    (.wrench.force.{x,y,z} / .wrench.torque.{x,y,z}) — NOT a flat
+        #                    6-vec you can slice [:3]/[3:]. Read the nested fields.
+        #   - vel (tcp_vel, 6) = MEASURED Cartesian velocity. FrankaRobotState exposes
+        #                    DESIRED twists, not measured — derive measured vel from J·dq
+        #                    (jacobian × joint velocities) or another source.
+        #   - jacobian (6x7) = NOT in FrankaRobotState. Needs a separate model source
+        #                    (franka model node / KDL / pinocchio) or compute from q.
+        #   - q, dq (7 each) = from the message's joint state.
+        #   - gripper_pos (1) = NOT in FrankaRobotState. Subscribe to the Franka Hand
+        #                    joint/width topic separately, and NORMALIZE to [0,1] because
+        #                    _send_gripper_command compares curr_gripper_pos against 0.85
+        #                    (raw width in metres would break that guard).
+        #
+        # FORCE SOURCE: the wrench is the FCI ESTIMATE (o_f_ext_hat_k, from joint torques) —
+        # no separate F/T sensor required. If one is added later it's a DROP-IN into the
+        # same force/torque slots.
+        #
+        # FRESHNESS: do NOT rely on a single spin_once(timeout=0) right after DDS discovery.
+        # Block until the FIRST FrankaRobotState + gripper state have arrived (bounded wait),
+        # and raise if the cached state is older than a freshness timeout — never feed stale
+        # or zero state to the policy. Use a rclpy Executor / repeated spins for the wait.
+        self._spin_once()
+        raise NotImplementedError(
+            "Ros2FrankaClient.get_state() is a rig stub — wire FrankaRobotState + gripper "
+            "+ jacobian/vel sources and msg->dict conversion at the robot PC (see the "
+            "detailed TODO(rig) above; NOT a flat wrench, jacobian/gripper are separate)."
+        )
+
+    # A quaternion below this norm carries no usable orientation -> reject (degenerate).
+    # Anything above it is NORMALIZED, not rejected: `interpolate_move` builds its path with
+    # np.linspace over raw quaternion components (component-wise LERP, not slerp), so every
+    # intermediate quaternion is legitimately sub-unit — a 20 deg reset dips to |q|~0.9962.
+    # Rejecting those would abort every orientation-changing reset/regrasp on the rig.
+    QUAT_MIN_NORM = 1e-6
+
+    def send_pos(self, arr) -> None:
+        """Publish an absolute Cartesian target [x,y,z,qx,qy,qz,qw] to the controller.
+
+        Validated before publishing: wrong-length, non-finite, or degenerate-quaternion
+        targets must NOT reach the arm. A merely non-unit quaternion is NORMALIZED (the
+        intent is unambiguous — see QUAT_MIN_NORM) rather than rejected.
+        """
+        arr = np.asarray(arr, dtype=np.float64).ravel()
+        if arr.shape != (7,):
+            raise ValueError(
+                f"send_pos expects a 7-vec [x,y,z,qx,qy,qz,qw], got shape {arr.shape}")
+        if not np.all(np.isfinite(arr)):
+            raise ValueError(f"send_pos got non-finite values: {arr}")
+        qnorm = float(np.linalg.norm(arr[3:]))
+        if qnorm < self.QUAT_MIN_NORM:
+            raise ValueError(
+                f"send_pos quaternion is degenerate (|q|={qnorm:.3e}); refusing to command "
+                "the arm with no usable orientation.")
+        arr = arr.copy()
+        arr[3:] /= qnorm  # normalize (LERP-interpolated resets are sub-unit by construction)
+        msg = self._Float64MultiArray()
+        msg.data = arr.tolist()
+        self._cmd_pub.publish(msg)
+
+    def recover(self) -> None:
+        # Called EVERY _send_pos_command (~10Hz), so it must be CHEAP. The stock HTTP
+        # `clearerr` is fire-and-forget. Do NOT implement this as a blocking action call
+        # per step — that would enqueue/await an error-recovery action at control rate.
+        # TODO(rig): make this a no-op in the nominal case; only trigger the franka_ros2
+        # error-recovery action when the robot is actually in an error/reflex state (read
+        # that flag from the robot-state and gate on it). For now = no-op (safe: the
+        # controller itself is compliant; recovery is only needed after a reflex).
+        pass
+
+    # Robot-control methods below are NOT wired yet. They fail LOUDLY (fail-CLOSED) rather
+    # than silently succeeding — otherwise, once get_state() is filled in, motion could
+    # proceed while compliance switching / recovery / gripper are silent no-ops. Implement
+    # each at the rig, then it stops raising. (recover() above is the one exception: it must
+    # stay cheap because it is called every step.)
+    _NOT_WIRED = (
+        "Ros2FrankaClient.{name}() is not wired yet (TODO(rig)). Fail-closed on purpose so "
+        "a half-wired backend cannot move the arm with compliance/recovery/gripper as "
+        "silent no-ops. Implement it (and confirm the topic/action name) before use."
+    )
+
+    def update_param(self, params: dict) -> None:
+        # TODO(rig): set impedance stiffness on cartesian_impedance_control. Maps
+        # COMPLIANCE/PRECISION/RESET (translational_stiffness / rotational_stiffness).
+        # FR3 range: transl 10-3000 N/m, rot 1-300 Nm/rad.
+        raise NotImplementedError(self._NOT_WIRED.format(name="update_param"))
+
+    def joint_reset(self) -> None:
+        # TODO(rig): command the nominal joint configuration (joint-space controller switch,
+        # or MoveIt day-1 convenience only, NOT in the RL loop).
+        raise NotImplementedError(self._NOT_WIRED.format(name="joint_reset"))
+
+    def open_gripper(self) -> None:
+        # TODO(rig): Franka Hand Move (width=max) via GRIPPER_MOVE_ACTION.
+        raise NotImplementedError(self._NOT_WIRED.format(name="open_gripper"))
+
+    def close_gripper(self) -> None:
+        # TODO(rig): Franka Hand Grasp via GRIPPER_GRASP_ACTION.
+        raise NotImplementedError(self._NOT_WIRED.format(name="close_gripper"))
+
+    def close_gripper_slow(self) -> None:
+        # TODO(rig): Grasp with a low speed (regrasp). Same action, slow speed.
+        raise NotImplementedError(self._NOT_WIRED.format(name="close_gripper_slow"))
+
+    def set_load(self, params: dict) -> None:
+        # TODO(rig): set the EE load via franka_ros2 (set_load service) if needed.
+        raise NotImplementedError(self._NOT_WIRED.format(name="set_load"))
+
+    def close(self) -> None:
+        try:
+            self.node.destroy_node()
+        except Exception:
+            pass
+        # Only shut down the context if this client created it (see _owns_context).
+        if getattr(self, "_owns_context", False):
+            try:
+                self._rclpy.shutdown()
+            except Exception:
+                pass
+
+
+def make_robot_client(config, url: str) -> RobotClient:
+    """Factory: pick the backend from ``config.ROBOT_CLIENT`` (default "http")."""
+    backend = getattr(config, "ROBOT_CLIENT", "http")
+    if backend == "http":
+        return HttpFrankaClient(url)
+    elif backend == "ros2":
+        return Ros2FrankaClient(url=url, config=config)
+    else:
+        raise ValueError(
+            f"Unknown ROBOT_CLIENT={backend!r}; expected 'http' or 'ros2'."
+        )
