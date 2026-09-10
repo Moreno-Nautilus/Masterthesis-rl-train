@@ -437,7 +437,7 @@ class ForgeTaskCoolingInsertIiwaE2EVisionCfg(ForgeTaskCoolingInsertIiwaCameraCfg
     # real velocity estimate; the LSTM otherwise infers velocity from the per-step goal delta, so this tests
     # whether an explicit velocity channel helps near-contact damping. Default False (baseline unchanged).
     e2e_use_velocity_obs: bool = False
-    e2e_velocity_obs_noise: float = 0.01   # std of gaussian obs noise on the EE-frame velocity (m/s, rad/s)
+    e2e_velocity_obs_noise: float = 0.001  # MINIMAL-NOISE DIAGNOSTIC 2026-09-09 (was 0.01); EE-frame vel obs noise
     # PER-STEP angular obs noise (deg) on the goal-axis estimate (supervisor 2026-08-22), resampled every
     # step, distinct from the per-episode tilt bias. 0 => off. ~0.5deg models a live perception-jitter.
     e2e_goal_ang_obs_noise_deg: float = 0.0
@@ -613,15 +613,15 @@ class ForgeTaskCoolingInsertIiwaE2EVisionCfg(ForgeTaskCoolingInsertIiwaCameraCfg
         # the 30deg cap (vector sum; smoke-verified worst ~30), ramping from ~0 over ~1000it. This SUBSUMES
         # the old standalone pre-insert tilt (0->10deg). Curriculum ~128000 control steps (128*1000). Tuning
         # knob (§4): drop this below 25 if the policy stalls on orientation.
-        self.task.pre_insert_tilt_max_deg = 25.0
+        self.task.pre_insert_tilt_max_deg = 3.0   # MINIMAL-NOISE DIAGNOSTIC 2026-09-09 (was 25.0)
         self.task.pre_insert_tilt_start_deg = 0.0
         self.task.pre_insert_tilt_curriculum_steps = 128000
         self.task.pre_insert_tilt_halfnormal = True
         # §4 GOAL/ANCHOR lateral+z estimate error, injected PHYSICALLY at reset (peg starts off the true
         # hole; obs delta-to-noisy-G ~ 0). Radial xy <= 1.75cm, z <= 0.8cm, both ramp 0 -> max over ~1000it.
-        self.task.goal_anchor_injection = True
-        self.task.goal_anchor_lat_max = 0.0175
-        self.task.goal_anchor_z_max = 0.008
+        self.task.goal_anchor_injection = False  # MINIMAL-NOISE DIAGNOSTIC 2026-09-09: nominal goal pose, no anchor noise
+        self.task.goal_anchor_lat_max = 0.0     # MINIMAL-NOISE DIAGNOSTIC 2026-09-09 (was 0.0175)
+        self.task.goal_anchor_z_max = 0.0       # MINIMAL-NOISE DIAGNOSTIC 2026-09-09 (was 0.008)
         self.task.goal_anchor_curriculum_steps = 128000
         # §4/§6 WRIST YAW start = half-normal (biased to 0) about vertical, +-45deg, injected in the reset
         # re-pose (Factory's uniform hover yaw is turned OFF below). Yaw-symmetric -> rotates the image only.
@@ -662,7 +662,7 @@ class ForgeTaskCoolingInsertIiwaE2EVisionCfg(ForgeTaskCoolingInsertIiwaCameraCfg
         # the tilt curriculum (~205k) if the early gains feel too soft/hard.
         self.e2e_dynamics_dr_curriculum_steps = 150000
         # PER-STEP angular obs noise on the goal-axis estimate (supervisor: ~0.5deg/step live jitter).
-        self.e2e_goal_ang_obs_noise_deg = 0.5
+        self.e2e_goal_ang_obs_noise_deg = 0.1   # MINIMAL-NOISE DIAGNOSTIC 2026-09-09 (was 0.5)
         # §10/§4: keep the BAKED grasp misalign SMALL (3deg) so baked + the curriculumed injected angular
         # (0->27deg) stays <= the 30deg total start-misalignment budget. Secondary out-of-plane -> 0.
         self.task.grasp_misalign_max_deg = 3.0
@@ -688,7 +688,7 @@ class ForgeTaskCoolingInsertIiwaE2EVisionCfg(ForgeTaskCoolingInsertIiwaCameraCfg
         # is now injected physically by the goal anchor (above), so the peg starts OFF the true hole and the
         # obs delta-to-noisy-G ~ 0. This 0.3cm is just the residual servo settling about that estimate. z
         # noise +-0.01 = the rim+0.04+-0.01 height band (tip 4cm above rim).
-        self.task.hand_init_pos_noise = [0.003, 0.003, 0.010]
+        self.task.hand_init_pos_noise = [0.005, 0.005, 0.005]  # MINIMAL-NOISE DIAGNOSTIC 2026-09-09: 5mm exact (was [3,3,10]mm)
         # §6 WRIST YAW START is now injected as a HALF-NORMAL in the reset re-pose (wrist_yaw_halfnormal
         # above), so turn OFF Factory's uniform hover yaw here to avoid double-applying it.
         self.task.hand_init_orn_noise = [0.0, 0.0, 0.0]
@@ -730,7 +730,7 @@ class ForgeTaskCoolingInsertIiwaE2EVisionCfg(ForgeTaskCoolingInsertIiwaCameraCfg
         # corners (0.65,+-0.40) before the full run to confirm hover-IK.
         self.task.fixed_asset_xy_ranges = [0.40, 0.65, -0.40, 0.40]
         self.task.fixed_asset_z_center = -0.005   # U[-0.02, +0.01] centre (nominal ~ -0.01)
-        self.task.fixed_asset_z_noise = 0.015
+        self.task.fixed_asset_z_noise = 0.005   # MINIMAL-NOISE DIAGNOSTIC 2026-09-09 (was 0.015)
         self.task.fixed_asset_reach_radius = 0.72
         self.task.fixed_asset_yaw_nominal_deg = 90.0  # holes along world-Y [VERIFY vs USD default + mesh frame]
         self.task.fixed_asset_yaw_nominal_halfwidth_deg = 3.0
@@ -766,12 +766,12 @@ class ForgeTaskCoolingInsertIiwaE2EVisionCfg(ForgeTaskCoolingInsertIiwaCameraCfg
         # does NOT collapse when the image is unreliable: raise dropout 0.10->0.20 and start the ramp earlier
         # (ep500 vs ep800) so a meaningful fraction of episodes train blind for longer. Anchor-dropout stays
         # mutually exclusive, so the policy always keeps >=1 localisation channel (force+anchor, or vision).
-        self.image_dropout_prob = 0.20
+        self.image_dropout_prob = 0.05          # MINIMAL-NOISE DIAGNOSTIC 2026-09-09 (was 0.20)
         self.image_dropout_start_steps = 64000       # ~ep500 (128*500)
         self.image_dropout_curriculum_steps = 120000  # ramp to full over ~940 epochs
         # §8/§4 ANCHOR DROPOUT: corrupt the goal G in the obs only (30% of episodes at full), same ~ep800
         # ramp, MUTUALLY EXCLUSIVE with image-dropout -> the policy always keeps >=1 localisation channel.
-        self.anchor_dropout_prob = 0.30
+        self.anchor_dropout_prob = 0.0          # MINIMAL-NOISE DIAGNOSTIC 2026-09-09 (was 0.30)
         self.anchor_dropout_noise = 0.05   # m; std of the big obs-only goal-G corruption on dropout episodes
         self.anchor_dropout_start_steps = 102400
         self.anchor_dropout_curriculum_steps = 90000
@@ -793,7 +793,7 @@ class ForgeTaskCoolingInsertIiwaE2EVisionCfg(ForgeTaskCoolingInsertIiwaCameraCfg
         self.backdrop_size = (1.6, 1.6, 0.01)
         self.backdrop_pos = (0.525, 0.0, 0.001)
         # HEAVY APPEARANCE DR (base is vivid BLUE; explicit-estimator over-trusted a clean look):
-        self.rgb_noise_std = 0.03
+        self.rgb_noise_std = 0.005              # MINIMAL-NOISE DIAGNOSTIC 2026-09-09 (was 0.03)
         self.photo_gain_rgb = 0.30            # per-channel gain in [0.7,1.3]
         self.photo_brightness = 0.10          # additive exposure in [-0.1,0.1]
         # LIGHT COLOUR-TEMPERATURE DR (plan/deploy-hardening: warm 3000K -> cool 8000K). Was None (off) =

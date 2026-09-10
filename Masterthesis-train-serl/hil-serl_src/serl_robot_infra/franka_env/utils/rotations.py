@@ -9,28 +9,20 @@ def quat_2_euler(quat):
 
 
 def euler_2_quat(xyz):
-    yaw, pitch, roll = xyz
-    yaw = np.pi - yaw
-    yaw_matrix = np.array(
-        [
-            [np.cos(yaw), -np.sin(yaw), 0.0],
-            [np.sin(yaw), np.cos(yaw), 0.0],
-            [0, 0, 1.0],
-        ]
-    )
-    pitch_matrix = np.array(
-        [
-            [np.cos(pitch), 0.0, np.sin(pitch)],
-            [0.0, 1.0, 0.0],
-            [-np.sin(pitch), 0, np.cos(pitch)],
-        ]
-    )
-    roll_matrix = np.array(
-        [
-            [1.0, 0, 0],
-            [0, np.cos(roll), -np.sin(roll)],
-            [0, np.sin(roll), np.cos(roll)],
-        ]
-    )
-    rot_mat = yaw_matrix.dot(pitch_matrix.dot(roll_matrix))
-    return Quaternion(matrix=rot_mat).elements
+    """Inverse of quat_2_euler: XYZ euler (rad) -> quaternion (x, y, z, w).
+
+    REWRITTEN 2026-09-10. The upstream implementation was NOT the inverse of
+    quat_2_euler and disagreed with it by up to 149 degrees:
+      * it read the input as (yaw, pitch, roll) while quat_2_euler returns (x, y, z);
+      * it applied `yaw = pi - yaw`;
+      * it composed Z*Y*X where scipy's "xyz" is intrinsic X*Y*Z;
+      * it returned pyquaternion's (w, x, y, z) while the rest of the codebase (and
+        scipy) uses (x, y, z, w).
+    On the rig this made RESET_POSE's stored pitch of +74.6 deg come back as -74.6 deg,
+    so a reset that should have been an 82 deg move swept ~150 deg — the arm made a wild
+    turn into a joint torque limit. Insert 0 only escaped because its orientation
+    (roll ~ pi, pitch ~ 0) sat near a symmetric point where the errors cancelled.
+
+    Verified round-trip exact against quat_2_euler over random orientations.
+    """
+    return R.from_euler("xyz", np.asarray(xyz, dtype=float)).as_quat()

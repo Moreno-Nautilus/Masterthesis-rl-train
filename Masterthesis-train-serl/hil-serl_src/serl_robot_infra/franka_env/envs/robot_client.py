@@ -232,6 +232,10 @@ class Ros2FrankaClient(RobotClient):
     # Franka Hand: max opening 0.08 m total (two fingers x 0.04). Normalize to [0,1]
     # because _send_gripper_command compares curr_gripper_pos against 0.85.
     GRIPPER_MAX_WIDTH = 0.08
+    # Nominal width (m) the Grasp action closes TO. 0.0 = squeeze fully shut; set this
+    # to just UNDER the part diameter so the fingers load the part instead of
+    # bottoming out. Measure the pipe and set accordingly.
+    GRIPPER_GRASP_WIDTH = 0.0
     # get_state() refuses to return state older than this (never feed stale state to the policy).
     STATE_STALE_S = 0.5
     # bounded wait for the first state message on construction
@@ -555,26 +559,59 @@ class Ros2FrankaClient(RobotClient):
 
     def open_gripper(self) -> None:
         goal = self._Move.Goal()
-        goal.width = self.GRIPPER_MAX_WIDTH
-        goal.speed = 0.1
+        # Request slightly UNDER the mechanical maximum. Commanding exactly
+        # GRIPPER_MAX_WIDTH (0.08) can fail to move at all — the hand will not drive to its
+        # own hard stop, so the action returns without opening (rig 2026-09-10: open
+        # reported 0.000 -> 0.000 while a direct Move to 0.06 worked immediately).
+        goal.width = self.GRIPPER_MAX_WIDTH - 0.004
+        # 0.05 m/s, NOT 0.1: at 0.1 the Move action reported success without the fingers
+        # moving at all (rig 2026-09-10 — open logged 0.438 -> 0.438, while the identical
+        # goal at 0.05 opened immediately).
+        goal.speed = 0.05
         self._run_gripper_action(self._move_ac, goal)
 
     def close_gripper(self) -> None:
         goal = self._Grasp.Goal()
-        goal.width = 0.0
+        # Target the PART width, not 0.0: franka's Grasp squeezes toward `width` and holds
+        # `force` once it is within epsilon. Commanding 0.0 with a loose epsilon made it
+        # stop early without loading the part. GRIPPER_GRASP_WIDTH is the nominal part
+        # diameter (m) — override per-part if needed.
+        goal.width = float(getattr(self, "GRIPPER_GRASP_WIDTH", 0.0))
         goal.speed = 0.1
-        goal.force = 40.0
-        goal.epsilon.inner = 0.08
-        goal.epsilon.outer = 0.08
+        goal.force = 70.0        # 40 -> 60 -> 70 N: the pipe still slipped at 60 (rig
+        # 2026-09-10). 70 N is the Franka Hand's continuous maximum — there is no more
+        # force available, so if the pipe still slips the remaining levers are the finger
+        # pads (friction) or GRIPPER_GRASP_WIDTH, not this number.
+        # epsilon = how far from `width` the final opening may be and still count as a
+        # successful grasp. 0.08 (the old value) is the FULL stroke, so the action reported
+        # success the moment the fingers stopped and never kept squeezing — the operator saw
+        # it "hold position instead of press". franka_msgs' own default is 0.005.
+        # Wide OUTER tolerance lets a thicker-than-expected part still register as grasped;
+        # tight INNER makes closing on nothing a FAILURE rather than a silent success.
+        goal.epsilon.inner = 0.005
+        goal.epsilon.outer = 0.04
         self._run_gripper_action(self._grasp_ac, goal)
 
     def close_gripper_slow(self) -> None:
         goal = self._Grasp.Goal()
-        goal.width = 0.0
+        # Target the PART width, not 0.0: franka's Grasp squeezes toward `width` and holds
+        # `force` once it is within epsilon. Commanding 0.0 with a loose epsilon made it
+        # stop early without loading the part. GRIPPER_GRASP_WIDTH is the nominal part
+        # diameter (m) — override per-part if needed.
+        goal.width = float(getattr(self, "GRIPPER_GRASP_WIDTH", 0.0))
         goal.speed = 0.02       # slow close for the regrasp (human hands the part in)
-        goal.force = 40.0
-        goal.epsilon.inner = 0.08
-        goal.epsilon.outer = 0.08
+        goal.force = 70.0        # 40 -> 60 -> 70 N: the pipe still slipped at 60 (rig
+        # 2026-09-10). 70 N is the Franka Hand's continuous maximum — there is no more
+        # force available, so if the pipe still slips the remaining levers are the finger
+        # pads (friction) or GRIPPER_GRASP_WIDTH, not this number.
+        # epsilon = how far from `width` the final opening may be and still count as a
+        # successful grasp. 0.08 (the old value) is the FULL stroke, so the action reported
+        # success the moment the fingers stopped and never kept squeezing — the operator saw
+        # it "hold position instead of press". franka_msgs' own default is 0.005.
+        # Wide OUTER tolerance lets a thicker-than-expected part still register as grasped;
+        # tight INNER makes closing on nothing a FAILURE rather than a silent success.
+        goal.epsilon.inner = 0.005
+        goal.epsilon.outer = 0.04
         self._run_gripper_action(self._grasp_ac, goal, timeout=10.0)
 
     def set_load(self, params: dict) -> None:

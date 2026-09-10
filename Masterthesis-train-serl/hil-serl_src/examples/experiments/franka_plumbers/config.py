@@ -73,6 +73,7 @@ class FrankaPlumbersConfigBase(DefaultEnvConfig):
     # each episode instead of relying on this jitter.)
     RANDOM_RESET = False    # start OFF (day 1: fixed reset); turn ON once insert 0 learns
     RANDOM_XY_RANGE = 0.01  # ±1cm in X/Y
+    RANDOM_Z_RANGE = 0.0    # z jitter OFF by default (stock jitters the xy plane only)
     RANDOM_RZ_RANGE = 0.0   # no yaw jitter (grasp variation supplies rotation)
     # Reduced from the stock (0.01, 0.06, 1) at the rig 2026-09-09: 1 cm and 0.06 rad
     # (3.4 deg) per unit action was too coarse for a 7 cm screw insert — it drove the arm
@@ -282,11 +283,151 @@ class EnvConfigInsert0(FrankaPlumbersConfigBase):
 
 
 class EnvConfigInsert1(FrankaPlumbersConfigBase):
-    pass
+    """Insert 1 — HORIZONTAL insert along -Y (tool points sideways, pitch ~1.3 rad).
+
+    Captured at the rig 2026-09-10. Unlike insert 0 (vertical descent), the approach here
+    is 111 mm along -Y (96% of the motion), so RETRACT_DIR and the Z-specific guards differ.
+    RESET takes x and z from the GOAL and only y from the measured start, so the approach
+    is a pure -Y translation with no lateral component in the nominal path.
+    """
+
+    # MEASURED seated pose [x, y, z, roll, pitch, yaw] (m, XYZ-Euler rad)
+    # RE-CAPTURED 2026-09-10 under control_mode 2 (compliant rotation), i.e. the attitude
+    # the wrist actually settles at with a soft rotational loop — not the stiff-mode
+    # reading, which the arm could not hold during the approach.
+    TARGET_POSE = np.array([0.44826, 0.17034, 0.06129, -3.06513, 1.24848, -1.49364])
+    # x, z, and ORIENTATION from the goal; y backed off 100 mm along the approach axis.
+    RESET_POSE = np.array([0.44826, 0.07034, 0.06129, -3.06513, 1.24848, -1.49364])
+
+    # normalize(RESET[:3] - TARGET[:3]) = (0, -1, 0): OUT of the socket is -Y.
+    # The +Z default would drag the part sideways into the socket wall.
+    RETRACT_DIR = (0.0, -1.0, 0.0)
+
+    # Safety box: +/-15 cm around the work volume in x/z, y spanning the full approach plus
+    # room for the 4 cm reset / 8 cm regrasp retraction along -y, with margin so the arm's
+    # parked pose is never marginally outside (that refused a reset on insert 0).
+    # Rotation bounds are WIDE on purpose. Built tightly around the captured insert
+    # orientation they rejected the very first reset: the arm was parked at pitch -0.19 /
+    # yaw -0.67, outside the window, and clip_safety_box would have ROTATED the retract
+    # target — which _retract_target refuses (correctly). Orientation is hard-locked by
+    # LOCK_ORIENTATION anyway, so these bounds only need to not fight the parked pose.
+    # z floor 0.035: a HARD table/fixture guard. Reset and seated both sit at z=0.063,
+    # so this leaves 28 mm of downward room for corrections while making it impossible
+    # for the policy or a mis-set target to drive the pipe into the table.
+    # y low: -0.0494 -> -0.1202 -> -0.0300 (2026-09-10, twice in one day).
+    # The first widening fixed a retract that would not fit, but it handed the POLICY 191 mm
+    # of empty space BEHIND the reset pose to wander into, when the task only needs the
+    # 100 mm between RESET (+0.070) and TARGET (+0.170). The actor then repeatedly drove to
+    # the box edge and stalled the reset. A tighter floor is the actual fix: it keeps the
+    # policy in the region where the task lives, and 100 mm below RESET is still ample for
+    # the 40 mm retract plus margin. Retract shortening + retract-skip (see wrapper.py)
+    # handle the edge cases; this stops them arising in the first place.
+    ABS_POSE_LIMIT_LOW = np.array([0.2984, -0.0300, 0.0350, -np.pi, -np.pi/2, -np.pi])
+    ABS_POSE_LIMIT_HIGH = np.array([0.5984, 0.2506, 0.2100, np.pi, np.pi/2, np.pi])
+
+    # ORIENTATION LOCKED (2026-09-10, after trying the unlocked version on the rig).
+    # Unlocked, ONE number (ACTION_SCALE rot) has to serve two masters: the operator's
+    # counter-steer needs it LARGE, the untrained policy needs it SMALL. At 0.10 the agent
+    # tumbled the wrist into its 12 Nm joint-torque limit on nearly every episode; at 0.05
+    # the operator could no longer rescue an episode. There is no value that satisfies both.
+    # Locking removes rotation from the ACTION SPACE entirely: the policy cannot tumble the
+    # wrist, and control_mode 2's soft wrist lets the BORE do the aligning mechanically —
+    # which is the whole point of the compliant controller. This is what insert 0 used.
+    # COST: the demos contain the operator's rotation corrections (13.3% of steps at full
+    # stick); locked, that part of the demo data is unlearnable and the policy must seat the
+    # pipe on translation + mechanical compliance alone. If the bore cannot absorb the
+    # misalignment this will fail, and the honest next move is re-fixturing, not more gains.
+    #
+    # WARMUP LOCK: an INT means "locked for the first N episodes, then released". Locked
+    # while the policy is still random (that is when it tumbles the wrist into the torque
+    # limit); released once it has some experience, so it can still learn the rotation
+    # corrections the demos contain. True = lock forever, False = never lock.
+    LOCK_ORIENTATION = 6
+
+    # Rotation authority for this insert: 0.04 (stock) was too weak to counter-steer by
+    # hand against the soft wrist of control_mode 2; 0.10 was fine for a HUMAN jogging but
+    # far too much for the POLICY — the same number is the agent's per-step rotation budget,
+    # and an untrained agent sampling +/-0.10 rad at 10 Hz tumbles the wrist straight into
+    # its 12 Nm joint-torque limit on almost every episode (observed 2026-09-10).
+    # Back to 0.10 (2026-09-10): 0.05 made the operator's counter-steer too slow to rescue
+    # an episode, and an operator who cannot intervene is worse than a twitchy policy —
+    # HIL-SERL learns from the interventions. It also MATCHES THE DEMOS, which were recorded
+    # at 0.10: at 0.05 every demo action meant 2x the rotation it would at execution.
+    ACTION_SCALE = (0.01, 0.10, 1)
+
+    RANDOM_RESET = True
+    RANDOM_XY_RANGE = 0.01
+    RANDOM_RZ_RANGE = 0.0
+
+    # Guards act along the INSERTION AXIS, which FrankaEnv derives from RETRACT_DIR — so
+    # for this insert they apply to Y, not Z. Same protection as insert 0, right axis:
+    #   - refuse further motion INTO the bore once the y contact force exceeds the limit
+    #   - cap the per-step motion INTO the bore (4 mm/step = 4 cm/s at 10 Hz)
+    # Motion OUT (+y) is never limited, so the arm can always retreat.
+    INSERT_FORCE_LIMIT_N = 15.0
+    MAX_INSERT_STEP = 0.004
+    # legacy z-named knobs off: superseded by the two above
+    Z_FORCE_LIMIT_N = 0.0
+    MAX_Z_DOWN_STEP = 0.0
 
 
 class EnvConfigInsert2(FrankaPlumbersConfigBase):
-    pass
+    """Insert 2 — COOLING BASE, vertical -Z descent (tool points straight down).
+
+    Captured at the rig 2026-09-10. Same geometry family as insert 0 (vertical descent),
+    NOT insert 1 (horizontal -Y), so the guards act on Z again.
+    """
+
+    # MEASURED seated pose [x, y, z, roll, pitch, yaw] (m, XYZ-Euler rad).
+    # Orientation SNAPPED to exactly vertical: the capture read roll -3.1360 / pitch +0.0160,
+    # i.e. 0.3 deg and 0.9 deg off straight-down. That is hand-placement noise, not a needed
+    # DoF — the operator asked for "completely upright" — so it is pinned to roll = -pi,
+    # pitch = 0 and LOCK_ORIENTATION holds it there for the whole episode.
+    TARGET_POSE = np.array([0.46300, -0.32180, 0.05840, -np.pi, 0.0, -1.56300])
+    # Same x, y and orientation; 65 mm of clearance straight up.
+    RESET_POSE = np.array([0.46300, -0.32180, 0.12340, -np.pi, 0.0, -1.56300])
+
+    # OUT of the socket is +Z (a pure vertical extraction), as for insert 0.
+    RETRACT_DIR = (0.0, 0.0, 1.0)
+
+    # Safety box: +/-15 cm around the work volume in x/y; z from a hard floor 18 mm below
+    # the seated pose up to ~16 cm above it (room for the 4 cm reset / 8 cm regrasp retract
+    # plus margin). Rotation bounds WIDE on purpose — orientation is hard-locked, so these
+    # only need to not fight the parked pose (a tight window rejected the first reset on
+    # inserts 0 and 1).
+    # z floor 0.0400 -> 0.0250 (2026-09-10). 0.0400 was a GUESS ("18 mm below seated"), not
+    # a measurement, and it was too tight: with +/-1 cm of reset noise on top of approach
+    # variation the operator could not descend far enough to seat the part on some runs.
+    # 0.0250 leaves 33 mm below the seated pose. The real protection against driving the
+    # part into the base is the Z FORCE CAP (INSERT_FORCE_LIMIT_N), which reacts to contact;
+    # a hard floor set from a single capture cannot know how deep any given approach needs.
+    ABS_POSE_LIMIT_LOW = np.array([0.3130, -0.4718, 0.0250, -np.pi, -np.pi/2, -np.pi])
+    ABS_POSE_LIMIT_HIGH = np.array([0.6130, -0.1718, 0.2184, np.pi, np.pi/2, np.pi])
+
+    # Orientation hard-locked to RESET_POSE's (straight down). This is a pure vertical
+    # descent, so rotation is not a DoF the task needs — same call as insert 0, which
+    # trained to 96%. (Insert 1 needed it unlocked only because the horizontal pipe could
+    # not be seated without counter-steering.)
+    LOCK_ORIENTATION = True
+
+    RANDOM_RESET = True
+    # +/-2 cm (vs 1 cm on inserts 0/1) — requested 2026-09-10 for a wider start
+    # distribution. The demos were recorded at the 1 cm setting, so the policy sees start
+    # states outside the demo distribution; that is the point (more generalisation) but it
+    # makes early episodes harder, so do not read a slow start as a broken run.
+    RANDOM_XY_RANGE = 0.02
+    RANDOM_Z_RANGE = 0.02      # noise in ALL directions, not just the xy plane
+    RANDOM_RZ_RANGE = 0.0
+
+    # Guards act along the INSERTION AXIS, derived from RETRACT_DIR -> Z for this insert:
+    #   - refuse further DOWNWARD motion once the z contact force exceeds the limit
+    #   - cap the per-step descent (4 mm/step = 4 cm/s at 10 Hz)
+    # Motion UP (+z) is never limited, so the arm can always retreat.
+    INSERT_FORCE_LIMIT_N = 15.0
+    MAX_INSERT_STEP = 0.004
+    # legacy z-named knobs kept in sync (this insert IS the z case)
+    Z_FORCE_LIMIT_N = 15.0
+    MAX_Z_DOWN_STEP = 0.004
 
 
 class EnvConfigInsert3(FrankaPlumbersConfigBase):

@@ -172,3 +172,20 @@ MUJOCO_LOG.TXT
 _METADATA
 checkpoint
 wandb/
+
+# --- HIL-SERL training checkpoints (2026-09-10) -----------------------------
+# A run writes a ~198 MB orbax checkpoint every 1000 steps, so the intermediate
+# ones are ignored. The FINAL trained policy per insert IS tracked (via git-lfs,
+# since each is a single 197 MB file and GitHub's hard limit is 100 MB).
+# NOTE: `checkpoint` earlier in this file only matches a FILE named "checkpoint",
+# which is why the numbered dirs and their metadata leaked in before.
+checkpoints/**
+!checkpoints/
+!checkpoints/*/
+# the keepers — one trained policy per insert
+!checkpoints/franka_plumbers_insert0/checkpoint_136000/
+!checkpoints/franka_plumbers_insert0/checkpoint_136000/**
+!checkpoints/franka_plumbers_insert1/checkpoint_192000/
+!checkpoints/franka_plumbers_insert1/checkpoint_192000/**
+!checkpoints/franka_plumbers_insert2/checkpoint_67000/
+!checkpoints/franka_plumbers_insert2/checkpoint_67000/**

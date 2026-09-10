@@ -1,4 +1,5 @@
 import datetime
+import os
 import tempfile
 from copy import copy
 from socket import gethostname
@@ -65,7 +66,11 @@ class WandBLogger(object):
         if debug:
             mode = "disabled"
         else:
-            mode = "online"
+            # Respect WANDB_MODE. Upstream hardcoded "online", which OVERRIDES the env
+            # var, so a rig machine without valid wandb credentials could not start a run
+            # at all: wandb.init() raised 401 and took the learner down with it, even
+            # after choosing "don't visualize" at the prompt.
+            mode = os.environ.get("WANDB_MODE", "online")
 
         self.run = wandb.init(
             config=self._variant,

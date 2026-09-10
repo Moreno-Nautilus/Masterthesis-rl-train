@@ -96,6 +96,14 @@ JOINT_TORQUE_LIMITS = np.array([87.0, 87.0, 87.0, 87.0, 12.0, 12.0, 12.0])
 # the budget before the robot's own reflex fires, so the guard reacts long before a fault.
 JOINT_TORQUE_FRACTION = 0.40
 
+# RESET SPEED LIMITS (see interpolate_move). A reset's `timeout` sets its DURATION, so a
+# long move would otherwise just be executed faster and trip the wrist torque limit. These
+# stretch the move instead. 5 cm/s and ~35 deg/s are close to the speeds a reset from near
+# the socket already ran at, so short resets are unchanged; only long ones slow down.
+RESET_MAX_SPEED_MPS = 0.05    # m/s
+RESET_MAX_SPEED_RPS = 0.60    # rad/s
+RESET_MAX_TIMEOUT_S = 8.0     # never stretch a single reset beyond this
+
 
 class FrankaEnv(gym.Env):
     JOINT_TORQUE_LIMITS = JOINT_TORQUE_LIMITS
@@ -269,7 +277,17 @@ class FrankaEnv(gym.Env):
         # bottoms out — that overload is what tripped the JOINT TORQUE LIMITS during demo
         # recording (rig 2026-09-09). Upward motion is always allowed so the arm (or the
         # operator) can always back out. Set Z_FORCE_LIMIT_N = 0 to disable.
-        z_limit = float(getattr(self.config, "Z_FORCE_LIMIT_N", 0.0))
+        # INSERTION-AXIS force limit. Generalised from the original z-only guard: the axis
+        # is derived from RETRACT_DIR (which points OUT of the socket), so the same config
+        # works for insert 0's vertical -Z descent AND insert 1's horizontal -Y approach.
+        # "Into the socket" = -RETRACT_DIR; motion OUT is always allowed so the arm can
+        # retreat. INSERT_FORCE_LIMIT_N falls back to the legacy Z_FORCE_LIMIT_N name.
+        ins_axis = int(np.argmax(np.abs(np.asarray(
+            getattr(self.config, "RETRACT_DIR", (0.0, 0.0, 1.0)), dtype=float))))
+        ins_sign = float(np.sign(np.asarray(
+            getattr(self.config, "RETRACT_DIR", (0.0, 0.0, 1.0)), dtype=float)[ins_axis]))
+        z_limit = float(getattr(self.config, "INSERT_FORCE_LIMIT_N",
+                                getattr(self.config, "Z_FORCE_LIMIT_N", 0.0)))
         if z_limit > 0.0:
             # Use a FRESH force reading: self.currforce is from the previous step, which is
             # a whole control period stale — long enough for the force to spike past the
@@ -280,9 +298,12 @@ class FrankaEnv(gym.Env):
                 pass
             fz = float(self.currforce[2])
 
-            # (a) stop pushing DOWN once the z contact force is over the limit
-            if xyz_delta[2] < 0.0 and abs(fz) > z_limit:
-                xyz_delta[2] = 0.0
+            # (a) stop pushing INTO the socket once the contact force on that axis is over
+            #     the limit. Moving OUT (along +RETRACT_DIR) stays allowed.
+            f_ins = float(self.currforce[ins_axis])
+            into = xyz_delta[ins_axis] * ins_sign < 0.0     # commanded toward the socket
+            if into and abs(f_ins) > z_limit:
+                xyz_delta[ins_axis] = 0.0
 
             # (b) JOINT-TORQUE guard — this is what actually faults the robot.
             # The "joint torque limit" reflex is per-joint tau_J against the FR3's limits
@@ -297,8 +318,15 @@ class FrankaEnv(gym.Env):
             if tau is not None and tau.size == 7:
                 util = float(np.max(tau / self.JOINT_TORQUE_LIMITS))
                 if util > self.JOINT_TORQUE_FRACTION:
+                    # Back off ALONG THE RETRACT AXIS, not hardcoded +z.
+                    # BUG FIXED 2026-09-10: this was `xyz_delta[2] = 0.5`, which is only
+                    # "out of the socket" for a VERTICAL insert (insert 0). For insert 1 the
+                    # approach is -Y, so the guard pushed the arm UP instead of OUT — the
+                    # joint never unloaded, so the guard stayed tripped and translation
+                    # stayed blocked. That is a hard stall: the operator cannot insert and
+                    # cannot recover without a reset.
                     xyz_delta = np.zeros(3)
-                    xyz_delta[2] = 0.5      # back off, scaled by ACTION_SCALE[0]
+                    xyz_delta[ins_axis] = 0.5 * ins_sign   # scaled by ACTION_SCALE[0]
                     j = int(np.argmax(tau / self.JOINT_TORQUE_LIMITS))
                     if not getattr(self, "_torque_warned", False):
                         self._torque_warned = True
@@ -340,9 +368,14 @@ class FrankaEnv(gym.Env):
         # filtered tau_j read 9.6% while the robot was already faulted). Capping only the
         # DESCENT keeps x/y and lifting at full speed, so the arm stays responsive while
         # approaching contact gently. Set MAX_Z_DOWN_STEP = 0 to disable.
-        max_down = float(getattr(self.config, "MAX_Z_DOWN_STEP", 0.0))
-        if max_down > 0.0 and step_xyz[2] < -max_down:
-            step_xyz[2] = -max_down
+        # Same generalisation for the step cap: limit motion INTO the socket along the
+        # insertion axis. MAX_INSERT_STEP falls back to the legacy MAX_Z_DOWN_STEP name.
+        max_down = float(getattr(self.config, "MAX_INSERT_STEP",
+                                 getattr(self.config, "MAX_Z_DOWN_STEP", 0.0)))
+        if max_down > 0.0:
+            comp = step_xyz[ins_axis] * ins_sign          # <0 means heading into the socket
+            if comp < -max_down:
+                step_xyz[ins_axis] = -max_down * ins_sign
 
         self.nextpos[:3] = self.nextpos[:3] + step_xyz
 
@@ -391,13 +424,78 @@ class FrankaEnv(gym.Env):
         # failed on the real robot. The insert is a pure vertical descent, so orientation
         # is not a DoF the task needs: locking it REMOVES the coupling instead of fighting
         # it, and the arm cannot tilt away from vertical during a demo.
-        if getattr(self.config, "LOCK_ORIENTATION", False):
+        # WARMUP LOCK (2026-09-10): LOCK_ORIENTATION may be an INT instead of a bool, in
+        # which case it means "lock for the first N episodes, then release". A freshly
+        # initialised policy samples rotation randomly and tumbles the wrist into its 12 Nm
+        # joint-torque limit before it has learned anything; once it has a few episodes of
+        # experience the rotation DoF is worth having (and the demos contain the operator's
+        # rotation corrections, which are only learnable while it is unlocked).
+        #   True / False -> lock always / never
+        #   N (int)      -> locked for the first N episodes
+        _lock = getattr(self.config, "LOCK_ORIENTATION", False)
+        if isinstance(_lock, bool):
+            lock_now = _lock
+        else:
+            lock_now = int(getattr(self, "episode_count", 0)) < int(_lock)
+            # THE WARMUP LOCK IS FOR THE POLICY ONLY. The operator must keep rotation
+            # authority at all times: this insert needs the human to counter-steer the
+            # controller's attitude error, and an operator who cannot steer cannot rescue
+            # an episode (and HIL-SERL learns from exactly those rescues).
+            if getattr(self, "_human_action", False):
+                lock_now = False
+            if not lock_now and not getattr(self, "_lock_released", False):
+                self._lock_released = True
+                print(f"[franka_env] ORIENTATION LOCK RELEASED after {int(_lock)} episodes "
+                      "— the policy can now command rotation.")
+        if lock_now:
             self.nextpos[3:] = self.resetpos[3:]
 
         gripper_action = action[6] * self.action_scale[2]
 
         self._send_gripper_command(gripper_action)
-        self._send_pos_command(self.clip_safety_box(self.nextpos))
+        _cmd = self.clip_safety_box(self.nextpos)
+
+        # Z-FLOOR TELEMETRY (2026-09-10). The arm was found 2.3 mm BELOW the z floor even
+        # though clip_safety_box clamps every commanded pose to it. Two candidate causes:
+        # a command sneaking past the clip, or the measured TCP simply sitting below its
+        # reference (this is an IMPEDANCE controller — _send_pos_command sets a spring
+        # SETPOINT, and under load the TCP settles wherever force balances, which can be
+        # past the target). Log both so the next occurrence names the cause instead of
+        # being guessed at.
+        _zf = float(self.xyz_bounding_box.low[2])
+        if float(_cmd[2]) < _zf - 1e-9:
+            print(f"[franka_env] Z-FLOOR: COMMAND below floor ({_cmd[2]:.4f} < {_zf:.4f}) "
+                  "— a path is bypassing clip_safety_box.")
+        elif float(self.currpos[2]) < _zf - 5e-4 and not getattr(self, "_zsag_warned", False):
+            self._zsag_warned = True
+            print(f"[franka_env] Z-FLOOR: measured TCP {self.currpos[2]:.4f} is below the "
+                  f"floor {_zf:.4f} while the COMMAND was {_cmd[2]:.4f} — impedance sag, "
+                  "not a clip bug. (Further hits are silent.)")
+
+        # ORIENTATION-LOCK TELEMETRY (2026-09-10). LOCK_ORIENTATION pins the COMMANDED
+        # orientation, but this is an impedance controller: the measured TCP is a spring
+        # settling under load, so pressing the part into the socket generates a moment that
+        # tilts the wrist regardless of the command. Report the worst deviation once per
+        # episode so "the hand was not straight down" becomes a number instead of an
+        # impression — and so we can tell a genuine lock failure (command drifts) from
+        # ordinary sag (command pinned, measurement drifts).
+        if lock_now:
+            try:
+                _dot = abs(float(np.dot(
+                    np.asarray(_cmd[3:], dtype=float) / np.linalg.norm(_cmd[3:]),
+                    np.asarray(self.currpos[3:], dtype=float) / np.linalg.norm(self.currpos[3:]))))
+                _err = float(np.degrees(2.0 * np.arccos(np.clip(_dot, -1.0, 1.0))))
+                if _err > float(getattr(self, "_ori_worst", 0.0)):
+                    self._ori_worst = _err
+                if _err > 5.0 and not getattr(self, "_ori_warned", False):
+                    self._ori_warned = True
+                    print(f"[franka_env] ORIENTATION: measured is {_err:.1f} deg off the "
+                          "LOCKED command (impedance sag under contact load, not a lock "
+                          "failure). Worst-per-episode reported at reset.")
+            except Exception:
+                pass
+
+        self._send_pos_command(_cmd)
 
         self.curr_path_length += 1
         dt = time.time() - start_time
@@ -462,8 +560,41 @@ class FrankaEnv(gym.Env):
             goal = np.concatenate([goal[:3], euler_2_quat(goal[3:])])
         steps = int(timeout * self.hz)
         self._update_currpos()
+
+        # QUATERNION DOUBLE COVER: q and -q are the SAME orientation, but component-wise
+        # LERP between opposite-hemisphere quaternions takes the LONG way round. On the rig
+        # (2026-09-10) a reset that should have been an 82 deg move swept ~150 deg — the arm
+        # made a wild turn and hit a joint torque limit. Flip the goal into the same
+        # hemisphere as the current pose so the interpolation takes the SHORT path.
+        goal = np.asarray(goal, dtype=float).copy()
+        if float(np.dot(goal[3:], self.currpos[3:])) < 0.0:
+            goal[3:] = -goal[3:]
+
+        # SPEED-LIMIT THE RESET (2026-09-10). `timeout` alone sets the DURATION, not the
+        # speed, so a long move is simply executed faster. During demo recording the arm
+        # always ended near the socket and the 1 s reset was a short, gentle move; during
+        # TRAINING the policy can wander far, and the same 1 s then demands a high commanded
+        # velocity. The stiff controller chases it, and the wrist (12 Nm budget on joints
+        # 5-7) trips its joint-torque limit on the reset — observed on insert 1.
+        # Stretch the move so it never exceeds RESET_MAX_SPEED translation / rotation.
+        d_trans = float(np.linalg.norm(goal[:3] - self.currpos[:3]))
+        dot = abs(float(np.dot(goal[3:], self.currpos[3:])))
+        d_rot = 2.0 * np.arccos(np.clip(dot, -1.0, 1.0))          # rad, short path
+        need = max(d_trans / RESET_MAX_SPEED_MPS, d_rot / RESET_MAX_SPEED_RPS)
+        if need > timeout:
+            timeout = min(need, RESET_MAX_TIMEOUT_S)
+            steps = int(timeout * self.hz)
+
+        steps = max(steps, 2)
         path = np.linspace(self.currpos, goal, steps)
         for p in path:
+            # CLAMP EVERY WAYPOINT to the safety box (2026-09-10). A straight line in
+            # Cartesian space between two in-bounds poses is NOT itself in-bounds: on the
+            # rig the reset path from where the policy left the arm passed BELOW THE TABLE
+            # and the arm drove into the ground. The box (incl. the z floor) has to hold
+            # for the whole path, not just its endpoints.
+            p = p.copy()
+            p[:3] = np.clip(p[:3], self.xyz_bounding_box.low, self.xyz_bounding_box.high)
             self._send_pos_command(p)
             time.sleep(1 / self.hz)
         self.nextpos = p
@@ -514,6 +645,11 @@ class FrankaEnv(gym.Env):
         self.robot.update_param(self.config.COMPLIANCE_PARAM)
         if self.save_video:
             self.save_video_recording()
+
+        # MONOTONIC episode counter. cycle_count is NOT usable for "first N episodes": it is
+        # zeroed every JOINT_RESET_PERIOD below, so it wraps. The warmup orientation lock
+        # needs a count that only ever grows.
+        self.episode_count = getattr(self, "episode_count", 0) + 1
 
         self.cycle_count += 1
         if self.joint_reset_cycle!=0 and self.cycle_count % self.joint_reset_cycle == 0:

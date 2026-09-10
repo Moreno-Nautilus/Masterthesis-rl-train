@@ -111,11 +111,14 @@ def actor(agent, data_store, intvn_data_store, env, sampling_rng):
         print(f"average time: {np.mean(time_list)}")
         return  # after done eval, return and exit
     
-    start_step = (
-        int(os.path.basename(natsorted(glob.glob(os.path.join(FLAGS.checkpoint_path, "buffer/*.pkl")))[-1])[12:-4]) + 1
+    # Same trap as in learner(): the directory can exist with an EMPTY buffer/, in which
+    # case [-1] raises IndexError. Resume only from an actual dump.
+    _buffers = (
+        natsorted(glob.glob(os.path.join(FLAGS.checkpoint_path, "buffer/*.pkl")))
         if FLAGS.checkpoint_path and os.path.exists(FLAGS.checkpoint_path)
-        else 0
+        else []
     )
+    start_step = (int(os.path.basename(_buffers[-1])[12:-4]) + 1) if _buffers else 0
 
     datastore_dict = {
         "actor_env": data_store,
@@ -262,12 +265,16 @@ def learner(rng, agent, replay_buffer, demo_buffer, wandb_logger=None):
     """
     The learner loop, which runs when "--learner" is set to True.
     """
-    start_step = (
-        int(os.path.basename(checkpoints.latest_checkpoint(os.path.abspath(FLAGS.checkpoint_path)))[11:])
-        + 1
+    # os.path.exists(checkpoint_path) is NOT enough: the ACTOR creates this directory to
+    # dump buffer/ and demo_buffer/ long before the learner writes its first agent
+    # checkpoint. latest_checkpoint() then returns None and basename(None) raises.
+    # Only resume when an actual checkpoint is present.
+    _latest = (
+        checkpoints.latest_checkpoint(os.path.abspath(FLAGS.checkpoint_path))
         if FLAGS.checkpoint_path and os.path.exists(FLAGS.checkpoint_path)
-        else 0
+        else None
     )
+    start_step = (int(os.path.basename(_latest)[11:]) + 1) if _latest else 0
     step = start_step
 
     def stats_callback(type: str, payload: dict) -> dict:

@@ -52,10 +52,24 @@ SINGLE_AXIS_LOCK = True
 # A stick axis counts as "commanded" above this (post-deadzone) magnitude.
 AXIS_ACTIVE = 0.05
 
-# Z FORCE CAP: refuse further DOWNWARD z motion once the measured contact force exceeds
-# this. Protects the part/socket while hand-jogging into contact. Upward motion is always
-# allowed so the operator can always retreat.
-Z_FORCE_LIMIT_N = 15.0
+# INSERTION-AXIS FORCE CAP: refuse further motion INTO the socket once the measured
+# contact force exceeds this. Protects the part/socket while hand-jogging into contact.
+# Motion OUT is always allowed so the operator can always retreat.
+#
+# Which axis is "into the socket" depends on the insert, so set it here to match the
+# EnvConfig you are capturing for (INS_SIGN mirrors RETRACT_DIR: OUT of the socket).
+#   insert 0 (vertical descent): INS_AXIS = 2, INS_SIGN = +1.0   -> guards -Z
+#   insert 1 (horizontal, -Y)  : INS_AXIS = 1, INS_SIGN = -1.0   -> guards +Y
+#   insert 2 (cooling base, vertical descent): INS_AXIS = 2, INS_SIGN = +1.0
+INS_AXIS = 2
+INS_SIGN = +1.0
+INS_NAME = "XYZ"[INS_AXIS]
+INSERT_FORCE_LIMIT_N = 15.0
+Z_FORCE_LIMIT_N = INSERT_FORCE_LIMIT_N  # legacy alias
+
+# FR3 per-joint torque limits — joints 5-7 (wrist) have only a 12 Nm budget and are what
+# actually trips the robot's joint-torque reflex. Shown live in the status line.
+_JOINT_TORQUE_LIMITS = np.array([87.0, 87.0, 87.0, 87.0, 12.0, 12.0, 12.0])
 # The commanded target legitimately leads the measured TCP under a compliant controller
 # (that lead IS the spring force). Clamp only enough to stop a runaway, not enough to fight
 # normal tracking lag — 3cm was too tight and made z jogging feel like it sprang back.
@@ -228,15 +242,18 @@ def main():
                     else:
                         a = np.zeros(6)
 
-                # ---- Z FORCE CAP ------------------------------------------------------
-                # Refuse further DOWNWARD z once contact force exceeds the limit. Upward
-                # motion stays available so the operator can always back out.
-                fz = float(st["force"][2])
-                if a[2] < 0.0 and abs(fz) > Z_FORCE_LIMIT_N:
-                    a[2] = 0.0
+                # ---- INSERTION-AXIS FORCE CAP -----------------------------------------
+                # Refuse further motion INTO the socket once contact force exceeds the
+                # limit; motion OUT stays available so the operator can always back out.
+                # 2026-09-10: was hardcoded to -z (correct only for a VERTICAL insert).
+                # Insert 1 approaches along -Y, so the Y contact force was UNGUARDED here
+                # while the Z guard watched an axis nothing was pushing on.
+                f_ins = float(st["force"][INS_AXIS])
+                if a[INS_AXIS] * INS_SIGN < 0.0 and abs(f_ins) > INSERT_FORCE_LIMIT_N:
+                    a[INS_AXIS] = 0.0
                     if now_warn():
-                        print(f"\n  [jog] Z BLOCKED — contact force {fz:+.1f} N exceeds "
-                              f"{Z_FORCE_LIMIT_N:.0f} N. Move UP to release.")
+                        print(f"\n  [jog] {INS_NAME} BLOCKED — contact force {f_ins:+.1f} N "
+                              f"exceeds {INSERT_FORCE_LIMIT_N:.0f} N. Back out to release.")
 
                 target[:3] = target[:3] + a[:3] * TRANS_STEP
                 # Only touch the orientation target when rotation is ACTUALLY commanded.
@@ -280,9 +297,21 @@ def main():
                 e = _fmt_pose(cur)
                 f = st["force"]
                 grip = st.get("gripper_pos", [0.0])[0]
+                # Wrist-torque utilisation: joints 5-7 have only a 12 Nm budget and are
+                # what actually trips the FR3's joint-torque reflex (the EE wrench does
+                # NOT capture it). FrankaEnv's torque guard fires at 40% — showing the
+                # live number here tells the operator whether the torque guard or the
+                # force cap is the thing refusing to let the part go in.
+                tau_j = st.get("tau_j", None)
+                if tau_j is not None and len(tau_j) == 7:
+                    _u = np.abs(np.asarray(tau_j, dtype=float)) / _JOINT_TORQUE_LIMITS
+                    _j = int(np.argmax(_u))
+                    tau_s = "j%d %3.0f%%" % (_j + 1, 100.0 * _u[_j])
+                else:
+                    tau_s = "tau n/a"
                 sys.stdout.write(
-                    "\r  xyz %+.4f %+.4f %+.4f | rpy %+.3f %+.3f %+.3f | F %+5.1f %+5.1f | grip %.2f | R1 %s | [%s%s]   "
-                    % (e[0], e[1], e[2], e[3], e[4], e[5], f[0], f[2], grip,
+                    "\r  xyz %+.4f %+.4f %+.4f | rpy %+.3f %+.3f %+.3f | Fx%+5.1f Fy%+5.1f Fz%+5.1f | %s | grip %.2f | R1 %s | [%s%s]   "
+                    % (e[0], e[1], e[2], e[3], e[4], e[5], f[0], f[1], f[2], tau_s, grip,
                        "HELD" if held else "--  ",
                        "R" if reset_pose is not None else "-",
                        "T" if target_pose is not None else "-"))

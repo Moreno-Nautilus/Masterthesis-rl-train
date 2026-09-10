@@ -203,9 +203,9 @@ class ForgeTaskCoolingInsertCfg(ForgeEnvCfg):
     # the noisy fingertip pose). F/T is the genuinely noisy channel, so its noise is the largest.
     # Shared by both tasks (the vision cfg subclasses this). Re-tune from measured hardware noise later.
     obs_rand: ForgeObsRandCfg = ForgeObsRandCfg(
-        fingertip_pos=0.0005,    # 0.5 mm stddev (was 0.25 mm)
-        fingertip_rot_deg=0.5,   # 0.5 deg stddev (was 0.1 deg)
-        ft_force=2.0,            # larger force-sensor noise (was 1.0)
+        fingertip_pos=0.0001,    # MINIMAL-NOISE DIAGNOSTIC 2026-09-09: 0.1mm (was 0.5mm)
+        fingertip_rot_deg=0.1,   # MINIMAL-NOISE DIAGNOSTIC 2026-09-09: 0.1deg (was 0.5deg)
+        ft_force=0.01,           # MINIMAL-NOISE DIAGNOSTIC 2026-09-09: 0.01N (was 2.0)
     )
 
     # Actor-side socket/goal observation error. Factory's inherited fixed_asset_pos noise is Gaussian
@@ -215,11 +215,11 @@ class ForgeTaskCoolingInsertCfg(ForgeEnvCfg):
     # pose-estimation/table-height/calibration error. Bounded PER-EPISODE (fixed within an episode) ->
     # models the real INIT socket-pose estimate (base is static during a seat, so no per-step tracking
     # needed); set to the real init-estimator accuracy (~1cm per user, 2026-08-04).
-    fixed_asset_pos_obs_noise_bound: list = [0.025, 0.025, 0.005]
+    fixed_asset_pos_obs_noise_bound: list = [0.003, 0.003, 0.003]  # MINIMAL-NOISE DIAGNOSTIC 2026-09-09: 3mm (was 25/25/5mm)
     # Anchor-noise CURRICULUM (hydra: env.fixed_asset_pos_obs_noise_curriculum_steps=N + _start=[...]).
     # Ramp the socket-anchor obs noise from _start -> _bound over N control steps; 0 => constant at _bound.
     # 2.5cm from scratch is uncrackable (s192=29%), so learn at 1cm first and extend.
-    fixed_asset_pos_obs_noise_start: list = [0.010, 0.010, 0.002]
+    fixed_asset_pos_obs_noise_start: list = [0.003, 0.003, 0.003]  # MINIMAL-NOISE DIAGNOSTIC 2026-09-09: flat 3mm, no ramp
     fixed_asset_pos_obs_noise_curriculum_steps: int = 0
     # GRAVITY COMP: subtract the pre-contact gravity wrench from ft_force so the policy's force obs is pure
     # CONTACT, matching the real robot's gravity-compensated F/T (hydra: env.use_gravity_comp=True).
@@ -237,7 +237,7 @@ class ForgeTaskCoolingInsertCfg(ForgeEnvCfg):
     # force channels. Kept a SEPARATE knob because torque (N*m) and force (N) have different units and
     # magnitudes -- coupling them 1:1 could swamp the (small) torque signal. Default matches the bumped
     # force noise (2.0); re-tune once the smoke prints the realized force-vs-torque magnitudes.
-    torque_obs_noise: float = 2.0
+    torque_obs_noise: float = 0.01  # MINIMAL-NOISE DIAGNOSTIC 2026-09-09 (was 2.0)
 
 
 @configclass

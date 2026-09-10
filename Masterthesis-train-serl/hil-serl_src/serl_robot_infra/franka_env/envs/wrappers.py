@@ -399,9 +399,12 @@ class SpacemouseIntervention(gym.ActionWrapper):
         self._axis_active = float(os.environ.get("PS4_AXIS_ACTIVE", 0.05))
         # Mirror the env's orientation lock so the operator's rotation input is dropped
         # here too (see action()). Read off the unwrapped env's config.
+        # Keep the RAW value: True/False = lock for everyone / no lock, an INT = warmup lock
+        # that applies to the POLICY ONLY. bool()-ing it here turned the warmup int into a
+        # permanent operator lockout.
         try:
-            self._lock_orientation = bool(
-                getattr(self.env.unwrapped.config, "LOCK_ORIENTATION", False))
+            _lo = getattr(self.env.unwrapped.config, "LOCK_ORIENTATION", False)
+            self._lock_orientation = _lo if isinstance(_lo, bool) else int(_lo)
         except Exception:
             self._lock_orientation = False
 
@@ -423,10 +426,15 @@ class SpacemouseIntervention(gym.ActionWrapper):
         # controller's rotational loop lags translation), and a mixed stick input made
         # every correction ambiguous. Applies ONLY to the human action, never to the
         # policy's, so training stays stock.
-        # When the env hard-locks orientation (config.LOCK_ORIENTATION), drop the operator's
-        # rotation input too: it would otherwise be recorded as an intervention the env then
-        # ignores, i.e. demo actions that do not match what the arm did.
-        if getattr(self, "_lock_orientation", False):
+        # When the env hard-locks orientation for EVERYONE (LOCK_ORIENTATION is True), drop
+        # the operator's rotation input too: it would otherwise be recorded as an
+        # intervention the env then ignores, i.e. demo actions that do not match what the
+        # arm did.
+        # BUT NOT for the WARMUP lock (LOCK_ORIENTATION = N, an int): that one is
+        # POLICY-ONLY, and the operator keeps full rotation authority throughout. This line
+        # previously did bool(N) -> True and silently killed the operator's rotation for
+        # the whole run, which is precisely the authority the human needs to counter-steer.
+        if self._lock_orientation is True:
             expert_a = np.asarray(expert_a, dtype=float).copy()
             expert_a[3:6] = 0.0
 
@@ -477,6 +485,15 @@ class SpacemouseIntervention(gym.ActionWrapper):
         if self.deadman_gates_policy and not self.expert.deadman_held():
             new_action = np.zeros_like(np.asarray(new_action, dtype=np.float32))
             replaced = False
+
+        # Tell the env whether this action came from the HUMAN. The orientation warmup lock
+        # must apply to the POLICY ONLY: the operator still has to be able to counter-steer
+        # the controller's attitude error, which is the whole reason rotation is in the
+        # action space for this insert.
+        try:
+            self.unwrapped._human_action = bool(replaced)
+        except Exception:
+            pass
 
         obs, rew, done, truncated, info = self.env.step(new_action)
         if replaced:

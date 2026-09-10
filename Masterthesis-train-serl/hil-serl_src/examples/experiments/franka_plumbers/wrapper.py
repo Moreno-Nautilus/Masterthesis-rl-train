@@ -58,21 +58,60 @@ class FrankaPlumbersEnv(FrankaEnv):
                 or not np.isclose(np.linalg.norm(direction), 1.0)
                 or not np.isfinite(distance) or distance <= 0):
             raise ValueError("Retraction requires a finite unit 3-vector and positive distance")
+        # TOLERANCE on the "is the arm in the box" check (2026-09-10). The MEASURED TCP can
+        # sit a couple of mm outside the box even when every COMMAND was clipped to it: this
+        # is an impedance controller, so the commanded pose is a spring setpoint and the arm
+        # settles wherever force balances. A strict check turned a 2.3 mm overshoot into a
+        # hard RuntimeError that killed an 8-minute training run mid-episode. Being slightly
+        # outside is not a safety event — the retract itself is still clipped below, and a
+        # GROSS excursion (> 2 cm) still aborts.
+        _slack = 0.02
         if (not np.all(np.isfinite(self.currpos))
-                or np.any(self.currpos[:3] < self.xyz_bounding_box.low)
-                or np.any(self.currpos[:3] > self.xyz_bounding_box.high)):
+                or np.any(self.currpos[:3] < self.xyz_bounding_box.low - _slack)
+                or np.any(self.currpos[:3] > self.xyz_bounding_box.high + _slack)):
             raise RuntimeError("Current pose is invalid/outside the safety box; reset refused")
         target = copy.deepcopy(self.currpos)
-        target[:3] = target[:3] + direction * distance
+        # Pull the START of the retract back inside the box, so a few mm of impedance sag
+        # does not propagate into a retract target that the clip check then rejects.
+        target[:3] = np.clip(target[:3], self.xyz_bounding_box.low, self.xyz_bounding_box.high)
+        # SHRINK THE RETRACT TO FIT (2026-09-10). Previously this demanded the FULL
+        # `distance` and raised if the box would shorten it — which killed the actor
+        # repeatedly during insert-1 training: the policy legitimately drives deep into -Y,
+        # ends an episode ~2 cm from the box floor, and the 4 cm retract then does not fit.
+        # A SHORTENED retract along the same direction is perfectly safe (it still moves OUT
+        # of the socket, just less far); what is NOT safe is a retract that gets ROTATED or
+        # deflected onto another axis, and that is still refused below.
+        # Compute how far we can actually travel along `direction` before leaving the box.
+        room = np.inf
+        for i in range(3):
+            d = float(direction[i])
+            if abs(d) < 1e-9:
+                continue
+            bound = self.xyz_bounding_box.high[i] if d > 0 else self.xyz_bounding_box.low[i]
+            room = min(room, (bound - target[i]) / d)
+        room = float(max(0.0, room))
+
+        usable = min(float(distance), room)
+        _MIN_RETRACT = 0.005          # below this the move is pointless — surface the problem
+        if usable < _MIN_RETRACT:
+            raise RuntimeError(
+                f"No room to retract: only {room*1000:.1f} mm available along {tuple(direction)} "
+                f"before the safety box (wanted {distance*1000:.0f} mm). The arm is jammed "
+                "against the box edge — jog it back toward RESET_POSE before resuming.")
+        if usable < float(distance) - 1e-9:
+            print(f"[franka_plumbers] retract shortened {distance*1000:.0f} -> "
+                  f"{usable*1000:.0f} mm (box edge); still along the extraction axis.")
+
+        target[:3] = target[:3] + direction * usable
         clipped = self.clip_safety_box(target.copy())
-        same_position = np.allclose(clipped[:3], target[:3], rtol=0, atol=1e-8)
+        # Position is guaranteed in-box by construction now; the ORIENTATION check stays —
+        # a rotated retract would drag the part sideways through the socket wall.
         q = target[3:] / np.linalg.norm(target[3:])
         same_orientation = np.isclose(abs(np.dot(q, clipped[3:])), 1.0, rtol=0, atol=1e-8)
-        if not same_position or not same_orientation:
+        if not same_orientation:
             raise RuntimeError(
-                "Safety box would shorten or rotate the retract; reset/regrasp refused. "
-                "Verify full extraction clearance and bounds at the rig before retrying. "
-                "Do not widen bounds without checking the physical workspace.")
+                "Safety box would ROTATE the retract; reset/regrasp refused. "
+                "Verify the rotation bounds cover the parked orientation.")
         return target
 
     def set_reset_from_base_pose(self, base_pose_xyz_euler):
@@ -103,7 +142,16 @@ class FrankaPlumbersEnv(FrankaEnv):
         # NOT hardcoded +Z: a horizontally-seated part (e.g. the pb_pipe insert) would be
         # shoved sideways into the socket wall by a vertical pull-up. RETRACT_DIR is a unit
         # vector in base frame pointing OUT of the socket (default +Z = vertical inserts).
-        self.interpolate_move(self._retract_target(self.retract_dist), timeout=1)
+        # The retract is a NICETY, not a precondition for resetting (2026-09-10). During
+        # training the policy can park hard against the box edge with ~0 mm of extraction
+        # room; refusing to reset there killed the actor repeatedly. If there is no room to
+        # retract, skip it and go straight to the reset move — interpolate_move clips every
+        # waypoint to the box, so driving back toward RESET_POSE from the wall is safe and
+        # is exactly what un-jams the arm.
+        try:
+            self.interpolate_move(self._retract_target(self.retract_dist), timeout=1)
+        except RuntimeError as e:
+            print(f"[franka_plumbers] retract skipped ({e}); going straight to RESET_POSE.")
 
         # perform joint reset if needed
         if joint_reset:
@@ -112,20 +160,39 @@ class FrankaPlumbersEnv(FrankaEnv):
             time.sleep(0.5)
 
         # perform Cartesian reset
-        if self.randomreset:  # randomize reset position in xy plane
+        if self.randomreset:  # randomize reset position
             reset_pose = self.resetpos.copy()
+            # x/y always; z too when RANDOM_Z_RANGE is set (2026-09-10 — asked for noise in
+            # ALL directions on insert 2). Stock upstream only ever jittered the xy plane.
             reset_pose[:2] += np.random.uniform(
                 -self.random_xy_range, self.random_xy_range, (2,)
             )
+            _rz = float(getattr(self.config, "RANDOM_Z_RANGE", 0.0))
+            if _rz > 0.0:
+                reset_pose[2] += np.random.uniform(-_rz, _rz)
+                # never let the jitter push the start below the safety-box floor
+                reset_pose[2] = float(np.clip(
+                    reset_pose[2],
+                    self.xyz_bounding_box.low[2],
+                    self.xyz_bounding_box.high[2]))
             euler_random = self._RESET_POSE[3:].copy()
             euler_random[-1] += np.random.uniform(
                 -self.random_rz_range, self.random_rz_range
             )
             reset_pose[3:] = euler_2_quat(euler_random)
-            self._send_pos_command(reset_pose)
         else:
             reset_pose = self.resetpos.copy()
-            self._send_pos_command(reset_pose)
+
+        # INTERPOLATE the Cartesian reset (2026-09-10). This was a bare
+        # _send_pos_command(reset_pose): a SINGLE step that teleports the reference to the
+        # reset pose, so the controller lunges at it in a straight line at whatever speed
+        # the stiffness produces. Two failures on the rig during insert-1 training:
+        #   * the straight line from wherever the policy left the arm to RESET can pass
+        #     BELOW THE TABLE -> the arm drove into the ground;
+        #   * the lunge trips the wrist joint-torque limit.
+        # interpolate_move walks a bounded path AND speed-limits it (see franka_env), and
+        # clip_safety_box keeps every waypoint (including the z floor) inside the box.
+        self.interpolate_move(reset_pose, timeout=1)
         time.sleep(0.5)
 
         # Change to compliance mode
