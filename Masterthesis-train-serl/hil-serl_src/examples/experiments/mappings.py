@@ -26,6 +26,10 @@ try:
         TrainConfigInsert1 as _FrankaPlumbers1,
         TrainConfigInsert2 as _FrankaPlumbers2,
         TrainConfigInsert3 as _FrankaPlumbers3,
+        TrainConfigInsert2Moved as _FrankaPlumbers2Moved,
+        TrainConfigInsert2MovedC as _FrankaPlumbers2MovedC,
+        TrainConfigInsert2MovedD as _FrankaPlumbers2MovedD,
+        TrainConfigInsert2MovedE as _FrankaPlumbers2MovedE,
     )
 
     CONFIG_MAPPING.update({
@@ -33,6 +37,14 @@ try:
         "franka_plumbers_insert1": _FrankaPlumbers1,
         "franka_plumbers_insert2": _FrankaPlumbers2,
         "franka_plumbers_insert3": _FrankaPlumbers3,
+        # robustness level 1: insert 2 policy, fixture moved to a new table spot
+        "franka_plumbers_insert2_moved": _FrankaPlumbers2Moved,
+        # robustness position C: third table spot, ~181 deg of yaw from the trained pose
+        "franka_plumbers_insert2_moved_c": _FrankaPlumbers2MovedC,
+        # robustness position D: TRANSLATION-ONLY control (200 mm, yaw unchanged)
+        "franka_plumbers_insert2_moved_d": _FrankaPlumbers2MovedD,
+        # robustness position E: D rotated 45 deg in place -> isolates ROTATION
+        "franka_plumbers_insert2_moved_e": _FrankaPlumbers2MovedE,
     })
 except ImportError as _exc:  # expected in a KUKA-only env (franka_env/pygame absent) — benign
     print(f"[mappings] franka_plumbers configs unavailable (missing dep: {_exc!r}); "

@@ -45,7 +45,8 @@ _build
 /renders
 /logs
 /outputs
-/diagnostics
+# Diagnostic/scratch output (plots, probe CSVs, renders) in EITHER tree.
+diagnostics/
 .claude
 .codex
 .agents
@@ -63,7 +64,9 @@ CLAUDE.md
 **/configuration/
 *.txt
 *.md
-# Franka pivot docs must be committable despite the blanket *.md ignore above.
-!Masterthesis-train-serl/FRANKA_PIVOT_PLAN.md
-!Masterthesis-train-serl/FRANKA_RIG_CHECKLIST.md
-!Masterthesis-train-serl/TOMORROW_COMMANDS.md
+# Docs that must be committable despite the blanket *.md ignore above.
+!Masterthesis-train-serl/README_HILSERL.md
+!Masterthesis-train-serl/RESULTS_FRANKA_HILSERL.md
+# Dependency pins the install guide (README_HILSERL.md §3.4) tells you to install from.
+!Masterthesis-train-serl/iiwa_serl/requirements-serl-cpu.txt
+!Masterthesis-train-serl/hil-serl_src/serl_launcher/requirements.txt

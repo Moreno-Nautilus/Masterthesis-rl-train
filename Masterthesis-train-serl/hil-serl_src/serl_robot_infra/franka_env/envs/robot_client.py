@@ -203,7 +203,7 @@ class Ros2FrankaClient(RobotClient):
     Topic/action names below are the DOCUMENTED ones (student's PS4 teleop drives
     ``/cartesian_position_controller/commands``). Anything marked ``TODO(rig)`` must be
     confirmed with ``ros2 topic list`` / ``ros2 action list`` on the robot PC before
-    autonomous motion (see FRANKA_RIG_CHECKLIST.md).
+    autonomous motion (see README_HILSERL.md).
 
     NOTE: import of rclpy is deferred to __init__ so this module imports fine at home
     (no ROS2 in the offline dry-run; learner uses fake_env and never constructs this).

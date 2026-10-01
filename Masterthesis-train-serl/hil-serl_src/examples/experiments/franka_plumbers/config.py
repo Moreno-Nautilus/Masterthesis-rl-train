@@ -11,7 +11,7 @@ Franka pivot (2026-09-08). Copied from ram_insertion/config.py, adapted per the 
 
 Inserts 0..3 share one base config (FrankaPlumbersConfigBase / FrankaPlumbersTrainBase);
 each insert only overrides its per-insert poses + image crop. ALL pose/crop numbers below
-are PLACEHOLDERS — capture them at the rig by jogging (see FRANKA_RIG_CHECKLIST.md), then
+are PLACEHOLDERS — capture them at the rig by jogging (see README_HILSERL.md), then
 fill per insert. Compliance/precision params are the FR3-range starting points.
 """
 
@@ -431,7 +431,53 @@ class EnvConfigInsert2(FrankaPlumbersConfigBase):
 
 
 class EnvConfigInsert3(FrankaPlumbersConfigBase):
-    pass
+    """Insert 3 — COOLING BASE (2nd part), vertical -Z descent.
+
+    Captured at the rig 2026-09-11. Same family as inserts 0 and 2 (vertical descent with
+    the tool pointing straight down), so the guards act on Z and orientation is locked.
+    """
+
+    # MEASURED seated pose [x, y, z, roll, pitch, yaw] (m, XYZ-Euler rad).
+    # Orientation SNAPPED to exactly vertical: the capture read roll +3.1320 / pitch -0.0330,
+    # i.e. 0.55 deg and 1.9 deg off straight-down — hand-placement noise, not a needed DoF.
+    # NOTE roll is +pi here where insert 2 was -pi. Those are the SAME orientation (quaternion
+    # double cover); keep the sign that was measured so interpolate_move does not slerp the
+    # long way round on the first reset.
+    # YAW is task-specific (-0.670 = -38.4 deg) and kept exactly as measured.
+    TARGET_POSE = np.array([0.41550, -0.29630, 0.04050, np.pi, 0.0, -0.67000])
+    # Same x, y and orientation; 60 mm of clearance straight up.
+    RESET_POSE = np.array([0.41550, -0.29630, 0.10050, np.pi, 0.0, -0.67000])
+
+    # OUT of the socket is +Z (pure vertical extraction).
+    RETRACT_DIR = (0.0, 0.0, 1.0)
+
+    # Safety box: +/-15 cm around the work volume in x/y.
+    # z floor 0.0150 — this seat is LOWER than insert 2's (0.0405 vs 0.0584), so the same
+    # 0.0250 floor would leave only 16 mm of downward room. On insert 2 an 18 mm margin was
+    # already too tight and blocked the descent on some runs; 0.0150 leaves 26 mm. The real
+    # contact protection is the Z FORCE CAP below, not the floor.
+    # Rotation bounds WIDE on purpose — orientation is hard-locked, so these only need to
+    # not fight the parked pose.
+    ABS_POSE_LIMIT_LOW = np.array([0.2655, -0.4463, 0.0150, -np.pi, -np.pi/2, -np.pi])
+    ABS_POSE_LIMIT_HIGH = np.array([0.5655, -0.1463, 0.2005, np.pi, np.pi/2, np.pi])
+
+    # Pure vertical descent -> rotation is not a DoF the task needs. Same call as inserts
+    # 0 and 2, both of which reached 10/10 with orientation locked.
+    LOCK_ORIENTATION = True
+
+    RANDOM_RESET = True
+    RANDOM_XY_RANGE = 0.02
+    RANDOM_Z_RANGE = 0.02      # noise in ALL directions, as on insert 2
+    RANDOM_RZ_RANGE = 0.0
+
+    # Guards act along the INSERTION AXIS (Z here, via RETRACT_DIR):
+    #   - refuse further DOWNWARD motion once the z contact force exceeds the limit
+    #   - cap the per-step descent (4 mm/step = 4 cm/s at 10 Hz)
+    # Motion UP (+z) is never limited, so the arm can always retreat.
+    INSERT_FORCE_LIMIT_N = 15.0
+    MAX_INSERT_STEP = 0.004
+    Z_FORCE_LIMIT_N = 15.0
+    MAX_Z_DOWN_STEP = 0.004
 
 
 class TrainConfigInsert0(FrankaPlumbersTrainBase):
@@ -442,8 +488,178 @@ class TrainConfigInsert1(FrankaPlumbersTrainBase):
     env_config_cls = EnvConfigInsert1
 
 
+class EnvConfigInsert2Moved(EnvConfigInsert2):
+    """ROBUSTNESS TEST (level 1) — insert 2's policy, base MOVED to a new table spot.
+
+    Captured 2026-09-11. Everything about the task is unchanged; only the fixture moved,
+    by 276 mm (x +84, y +262, z +3). The point is to ask whether the policy's visual
+    servoing generalises to a socket at a new absolute position, so ONLY the things that
+    describe WHERE the socket is are changed:
+      - RESET_POSE   : where the arm is driven to start (same 65 mm standoff as training)
+      - safety box   : re-centred on the new spot, same 300 x 300 mm extent
+    Everything else (LOCK_ORIENTATION, reset noise, force/step guards, RETRACT_DIR) is
+    inherited unchanged from EnvConfigInsert2.
+
+    TARGET_POSE is inherited and DELIBERATELY not updated: it is dead code on this rig.
+    PS4RewardWrapper forces reward to 0 unless X is pressed, so the pose-threshold reward
+    in FrankaEnv.compute_reward — TARGET_POSE's only consumer — never fires. It documents
+    where the socket was at capture time, nothing more.
+
+    Orientation is UNCHANGED on purpose: the base was translated, not rotated. With
+    LOCK_ORIENTATION the policy has no rotation in its action space at all, so a rotated
+    fixture would fail by construction rather than by any failure of generalisation.
+    """
+
+    # measured seated pose at the new spot: [0.5472, -0.0594, 0.0612] rpy [-3.140, 0.010, 0.002]
+    # reset = same x/y and ORIENTATION, +65 mm in z (the standoff the policy was trained with).
+    # YAW IS THE MEASURED ONE (+0.002), not insert 2's trained yaw (-1.5630): the part was
+    # re-placed by hand at the new spot and sits at a different yaw. Inheriting the old yaw
+    # would start the tool 89.7 deg rotated from how the part actually lies — and with
+    # LOCK_ORIENTATION the policy cannot rotate, so it could never recover.
+    # Roll/pitch snapped to exactly straight-down (capture was 0.09 / 0.57 deg off).
+    RESET_POSE = np.array([0.54720, -0.05940, 0.12620, -np.pi, 0.0, 0.00200])
+
+    # box re-centred on the new socket, same 300 x 300 mm extent as training.
+    # z floor 0.0280 keeps ~33 mm below the seat, as in training.
+    ABS_POSE_LIMIT_LOW = np.array([0.3972, -0.2094, 0.0280, -np.pi, -np.pi/2, -np.pi])
+    ABS_POSE_LIMIT_HIGH = np.array([0.6972, 0.0906, 0.2212, np.pi, np.pi/2, np.pi])
+
+
+class EnvConfigInsert2MovedC(EnvConfigInsert2):
+    """ROBUSTNESS TEST, position C — insert 2's policy, fixture at a THIRD table spot.
+
+    Captured 2026-09-11. Seated pose measured [0.4935, 0.1623, 0.0533] rpy [3.107, 0.059, 1.599].
+
+    Relative to the two earlier positions:
+        A (trained)    xyz [ 0.4630, -0.3218, 0.0584]  yaw  -89.6 deg
+        B (fine-tuned) xyz [ 0.5472, -0.0594, 0.0612]  yaw   +0.1 deg
+        C (this one)   xyz [ 0.4935,  0.1623, 0.0533]  yaw  +91.6 deg
+    C is 485 mm and ~181 deg of yaw from A — i.e. approached from essentially the OPPOSITE
+    orientation to anything the policy trained on.
+
+    WHY THAT IS INTERESTING RATHER THAN HOPELESS: the part and socket are 180-deg
+    symmetric, so at C the PART GEOMETRY in the wrist image looks the same as at A. What
+    differs is the absolute table position and the surrounding scene (table, fixture
+    surroundings, lighting all rotate with the approach). So C asks a sharper question than
+    B did: is the policy keying on the PART, or on the BACKGROUND? If symmetry holds it
+    should do better zero-shot than B (90 deg, symmetry broken); if it fails just as hard,
+    the policy is keying on absolute scene appearance.
+
+    CAVEAT: tcp_force / tcp_torque are in the BASE frame, so a 180 deg rotation flips the
+    sign of their x/y components relative to the approach. The force signature of an
+    insertion is therefore NOT symmetric even where the geometry is.
+
+    As with B, only RESET_POSE and the safety box change; everything else is inherited.
+    """
+
+    # reset = measured x/y and orientation, +65 mm in z (the standoff used in training).
+    # Roll/pitch snapped to exactly straight-down (capture was 2.0 / 3.4 deg off);
+    # YAW is the measured one (+1.599), since the part was re-placed by hand at this spot.
+    RESET_POSE = np.array([0.49350, 0.16230, 0.11830, np.pi, 0.0, 1.59900])
+
+    # box re-centred on C, same 300 x 300 mm extent; z floor 33 mm below the seat.
+    ABS_POSE_LIMIT_LOW = np.array([0.3435, 0.0123, 0.0203, -np.pi, -np.pi/2, -np.pi])
+    ABS_POSE_LIMIT_HIGH = np.array([0.6435, 0.3123, 0.2133, np.pi, np.pi/2, np.pi])
+
+
+class EnvConfigInsert2MovedD(EnvConfigInsert2):
+    """ROBUSTNESS TEST, position D — TRANSLATION-ONLY control.
+
+    Captured 2026-09-11. Seated pose [0.3548, -0.4904, 0.0594] rpy [3.127, -0.070, -1.508].
+
+        A (trained)    xyz [ 0.4630, -0.3218, 0.0584]  yaw -89.6 deg
+        B (rotated)    xyz [ 0.5472, -0.0594, 0.0612]  yaw  +0.1 deg  -> 276 mm + 90 deg
+        D (this one)   xyz [ 0.3548, -0.4904, 0.0594]  yaw -86.4 deg  -> 200 mm +  3 deg
+
+    THIS IS THE CONTROL EXPERIMENT the A->B test was missing. B changed position AND
+    orientation at once, so its cost (7 500 transitions to re-converge, after ~5 000 spent
+    going backwards) could not be attributed to either. D moves a comparable distance with
+    the yaw essentially UNCHANGED, so whatever it costs is the price of TRANSLATION alone.
+
+    Expectation: RelativeFrame makes proprioception reset-relative, so translation is
+    invisible to the state branch; only the wrist image changes (different background, same
+    part orientation). If D transfers far better than B, rotation — not position — is what
+    breaks the policy.
+
+    Replaces position C, which was abandoned: at y=+0.16 the arm ran into a JOINT LIMIT
+    mid-run, so that pose was a bad rig placement rather than a clean experiment.
+
+    As with B, only RESET_POSE and the safety box change; everything else is inherited.
+    """
+
+    # reset = measured x/y and yaw, +65 mm in z (the standoff used in training).
+    # Roll/pitch snapped to straight-down. NOTE the capture was 0.8 deg / 4.0 deg off —
+    # the pitch error is larger than at A or B (0.5-1.9 deg). If the part turns out to need
+    # that tilt to seat, restore the measured values instead of snapping.
+    RESET_POSE = np.array([0.35480, -0.49040, 0.12440, np.pi, 0.0, -1.50800])
+
+    # box re-centred on D, same 300 x 300 mm extent; z floor 33 mm below the seat.
+    ABS_POSE_LIMIT_LOW = np.array([0.2048, -0.6404, 0.0264, -np.pi, -np.pi/2, -np.pi])
+    ABS_POSE_LIMIT_HIGH = np.array([0.5048, -0.3404, 0.2194, np.pi, np.pi/2, np.pi])
+
+
+class EnvConfigInsert2MovedE(EnvConfigInsert2):
+    """ROBUSTNESS TEST, position E — ROTATION isolated against D.
+
+    Captured 2026-09-11. Seated pose [0.3242, -0.5046, 0.0589] rpy [3.122, -0.007, -0.719].
+
+        A (trained)  xyz [ 0.4630, -0.3218, 0.0584]  yaw -89.6 deg
+        D            xyz [ 0.3548, -0.4904, 0.0594]  yaw -86.4 deg  -> 200 mm, + 3 deg
+        E (this one) xyz [ 0.3242, -0.5046, 0.0589]  yaw -41.2 deg  -> 230 mm, +48 deg
+
+    E is the fixture ROTATED 45 deg IN PLACE from D (it moved only 34 mm). Both are
+    fine-tuned from the SAME warm start (insert 2's `checkpoint_67000`, trained at A), so
+    with the translation from A nearly matched (200 vs 230 mm) the only material difference
+    between D and E is ~45 deg of yaw.
+
+    That makes the pair a single-variable test of the question the A->B run could not
+    answer, because B changed position AND orientation at once:
+
+        A -> D   200 mm, + 3 deg  ->  ~2 000 transitions
+        A -> B   276 mm, +90 deg  ->   7 500 transitions
+        A -> E   230 mm, +48 deg  ->   ???
+
+    If E lands near D's cost, rotation is cheap and B's expense came from something else.
+    If E lands near B's, rotation is the dominant axis and the cost scales with the angle.
+
+    WHY ROTATION SHOULD BE THE EXPENSIVE ONE (the hypothesis under test): RelativeFrame
+    makes tcp_pose reset-relative, so a pure translation is INVISIBLE to the state branch
+    and actions (which are in the EE frame) keep their learned meaning. Neither holds under
+    rotation: the wrist camera is rigidly mounted, so every image rotates, and
+    tcp_force/tcp_torque are in the BASE frame, so the force signature of an insertion
+    rotates too.
+
+    As with B and D, only RESET_POSE and the safety box change; everything else inherited.
+    """
+
+    # reset = measured x/y and yaw, +65 mm in z (the standoff used in training).
+    # Roll/pitch snapped to straight-down; the capture was only 1.1 / 0.4 deg off, the
+    # cleanest of the session.
+    RESET_POSE = np.array([0.32420, -0.50460, 0.12390, np.pi, 0.0, -0.71900])
+
+    # box re-centred on E, same 300 x 300 mm extent; z floor 33 mm below the seat.
+    ABS_POSE_LIMIT_LOW = np.array([0.1742, -0.6546, 0.0259, -np.pi, -np.pi/2, -np.pi])
+    ABS_POSE_LIMIT_HIGH = np.array([0.4742, -0.3546, 0.2189, np.pi, np.pi/2, np.pi])
+
+
 class TrainConfigInsert2(FrankaPlumbersTrainBase):
     env_config_cls = EnvConfigInsert2
+
+
+class TrainConfigInsert2MovedE(FrankaPlumbersTrainBase):
+    env_config_cls = EnvConfigInsert2MovedE
+
+
+class TrainConfigInsert2MovedD(FrankaPlumbersTrainBase):
+    env_config_cls = EnvConfigInsert2MovedD
+
+
+class TrainConfigInsert2MovedC(FrankaPlumbersTrainBase):
+    env_config_cls = EnvConfigInsert2MovedC
+
+
+class TrainConfigInsert2Moved(FrankaPlumbersTrainBase):
+    env_config_cls = EnvConfigInsert2Moved
 
 
 class TrainConfigInsert3(FrankaPlumbersTrainBase):

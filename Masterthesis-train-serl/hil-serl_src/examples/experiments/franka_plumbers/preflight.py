@@ -18,7 +18,7 @@ import sys
 from franka_env.envs.robot_client import Ros2FrankaClient
 
 # Topics/actions the ROS backend needs (mirrors Ros2FrankaClient's names). Confirm/adjust
-# with `ros2 topic list` / `ros2 action list` (see FRANKA_RIG_CHECKLIST.md).
+# with `ros2 topic list` / `ros2 action list` (see README_HILSERL.md).
 REQUIRED_TOPICS = [
     Ros2FrankaClient.CMD_POSE_TOPIC,
     Ros2FrankaClient.ROBOT_STATE_TOPIC,
@@ -210,7 +210,7 @@ def main():
         sys.exit(2)
     print(f"{GREEN}Static/interface preflight passed — NOT clearance for autonomous motion.{RST}")
     print("Verify live state conversion, compliance, E-stop, teleop, and full reset clearance "
-          "using FRANKA_RIG_CHECKLIST.md before demos/training.")
+          "using README_HILSERL.md before demos/training.")
 
 
 if __name__ == "__main__":

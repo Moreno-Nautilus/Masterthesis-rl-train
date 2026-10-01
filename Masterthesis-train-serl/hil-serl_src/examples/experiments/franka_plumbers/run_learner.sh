@@ -9,7 +9,7 @@
 # overwrite, so rm -rf the checkpoint dir for a fresh run (wipes the replay buffer).
 # --debug disables wandb. Wait for "sent initial network to actor" before the actor.
 #
-# NEVER auto-launched: the user starts every training run (see FRANKA_RIG_CHECKLIST.md).
+# NEVER auto-launched: the user starts every training run (see README_HILSERL.md).
 set -euo pipefail
 : "${FRANKA_EXP_NAME:?set FRANKA_EXP_NAME=franka_plumbers_insertN first}"
 

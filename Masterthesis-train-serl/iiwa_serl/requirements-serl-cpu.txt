@@ -1,0 +1,43 @@
+# Working dependency pins for the `serl` conda env (CPU-only), verified 2026-08-26.
+#
+# SERL/serl_launcher was written against the JAX 0.4.x ecosystem; the upstream
+# requirements.txt uses `>=` pins that now resolve to JAX 0.6 / flax 0.10 / TF 2.21,
+# which break serl_launcher (jax.tree_map removed in 0.6; ml_dtypes/protobuf clashes).
+# These pins are the compatible window that makes the full async DrQ+RLPD loop run.
+#
+# Setup:
+#   conda create -n serl python=3.10
+#   conda activate serl
+#   pip install -e serl_launcher            # pulls agentlace (pinned git commit)
+#   pip install -r serl_launcher/requirements.txt
+#   pip install -e iiwa_serl
+#   pip install -r iiwa_serl/requirements-serl-cpu.txt   # <-- this file (pins fix)
+#   pip install gymnasium pygame
+#
+# GPU note: keep CPU-only while the PPO training/deploy is live (no GPU contention).
+# For real training later, swap jax to: pip install "jax[cuda12_pip]==0.4.35" -f \
+#   https://storage.googleapis.com/jax-releases/jax_cuda_releases.html
+# (self-contained CUDA wheels, do NOT modify the system NVIDIA driver.)
+
+# IMPORTANT: after install, remove the bogus stdlib-shadowing backport that serl_launcher's
+# setup.py pulls in — it crashes under system python3 when the env is used via PYTHONPATH
+# (the ROS2 rig pattern in serl_env.sh). Harmless inside conda, fatal on PYTHONPATH:
+#   pip uninstall -y typing
+jax==0.4.35
+jaxlib==0.4.35
+flax==0.8.5
+optax==0.2.3
+orbax-checkpoint==0.5.20
+chex==0.1.86
+distrax==0.1.5
+ml_dtypes==0.4.1
+numpy==1.26.4
+scipy==1.11.4
+opencv-python==4.9.0.80
+tensorflow==2.15.1
+tensorflow-probability==0.23.0
+tensorflow-datasets==4.9.2
+tensorflow-metadata==1.13.1
+tf_keras==2.15.1
+wandb==0.16.6
+protobuf==4.25.9

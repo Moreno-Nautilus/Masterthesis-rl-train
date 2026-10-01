@@ -127,7 +127,7 @@ class FrankaPlumbersEnv(FrankaEnv):
         """
         raise NotImplementedError(
             "Moving-base reset localization is a deferred feature — implement only if the "
-            "base is not glued at a fixed spot (see FRANKA_PIVOT_PLAN / RIG_CHECKLIST)."
+            "base is not glued at a fixed spot (see README_HILSERL.md)."
         )
 
     def go_to_reset(self, joint_reset=False):

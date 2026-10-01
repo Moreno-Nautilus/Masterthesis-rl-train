@@ -4,6 +4,18 @@
 [![Isaac Lab](https://img.shields.io/badge/IsaacLab-2.3.2-silver)](https://isaac-sim.github.io/IsaacLab)
 [![Python](https://img.shields.io/badge/python-3.10-blue.svg)](https://docs.python.org/3/whatsnew/3.10.html)
 
+> ### 👉 Real-robot RL (HIL-SERL on the Franka FR3) — start here
+>
+> This README covers the **simulation** half of the thesis (Isaac Lab + PPO residual policies).
+> The **real-robot** half — recording human demonstrations and training insertion policies
+> directly on hardware with HIL-SERL — lives in
+> **[`Masterthesis-train-serl/README_HILSERL.md`](Masterthesis-train-serl/README_HILSERL.md)**.
+>
+> That document is the complete, self-contained guide: install on a new machine, hardware
+> bring-up, capturing task poses, **recording demos**, **training a policy**, evaluating it,
+> and every tuned config knob — with all commands. Start there if you want to reproduce the
+> trained insertion policies on a robot.
+
 Master-thesis RL environment for the **last ~1–5 cm of a part insertion** on a **KUKA LBR iiwa**.
 The policy is a **pure residual corrector**: the upstream pipeline (pose estimation → grasping →
 path planning) hands over a *pre-insert pose* and a *goal (seated) pose*, and the policy only

@@ -69,7 +69,7 @@ def _now() -> float:
 
 # --- axis / button indices (defaults match ps4_publisher.py's declared parameters) ----
 # Common Linux SDL2 DualShock 4 layout. Override via the PS4_* env vars if `jstest` on
-# the rig shows a different mapping (see FRANKA_RIG_CHECKLIST.md).
+# the rig shows a different mapping (see README_HILSERL.md).
 AXIS_LEFT_X = int(os.environ.get("PS4_AXIS_LEFT_X", 0))
 AXIS_LEFT_Y = int(os.environ.get("PS4_AXIS_LEFT_Y", 1))
 AXIS_L2 = int(os.environ.get("PS4_AXIS_L2", 2))
@@ -180,7 +180,7 @@ class PS4Expert:
             raise RuntimeError(
                 f"PS4Expert reader failed to start: {err}" if err else
                 "PS4Expert reader did not produce a heartbeat within 5s — controller "
-                "not detected / reader stuck (see FRANKA_RIG_CHECKLIST.md)."
+                "not detected / reader stuck (see README_HILSERL.md)."
             )
 
     def _init_joystick(self):
@@ -192,7 +192,7 @@ class PS4Expert:
             raise RuntimeError(
                 f"No PS4 joystick at index {JOYSTICK_INDEX} "
                 f"({pygame.joystick.get_count()} detected). Check connection/pairing and "
-                "read permission on /dev/input/js* (see FRANKA_RIG_CHECKLIST.md)."
+                "read permission on /dev/input/js* (see README_HILSERL.md)."
             )
         js = pygame.joystick.Joystick(JOYSTICK_INDEX)
         js.init()

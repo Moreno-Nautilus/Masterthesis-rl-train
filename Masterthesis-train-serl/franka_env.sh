@@ -38,7 +38,7 @@ else
   echo "[franka_env] NOTE: /opt/ros/${_ros_distro}/setup.bash not found — ROS2 not sourced "\
        "(fine for the offline learner dry-run; required for the actor/robot)." >&2
 fi
-# The Franka controller workspace overlay (built at the rig per FRANKA_RIG_CHECKLIST.md).
+# The Franka controller workspace overlay (built at the rig per README_HILSERL.md).
 # NOTE: on the home box ~/franka_ros2_ws is the OLD LBR/ZED workspace (misnomer) with NO
 # Franka packages — sourcing it is harmless but does NOT provide the FR3 controller. On the
 # robot PC, build franka_ros2 v0.1.15 + cartesian_impedance_control here (set FRANKA_ROS2_WS
